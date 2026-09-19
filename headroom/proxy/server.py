@@ -146,6 +146,7 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
+from headroom.proxy.jev import JevConfig, JevPlanner
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.malloc_trim import trim_periodically
@@ -838,6 +839,10 @@ class HeadroomProxy(
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.config.mode = normalize_proxy_mode(self.config.mode)
+        self.jev_config = JevConfig.from_proxy_config(config)
+        if self.jev_config.mode != "off":
+            self.jev_config.validate()
+        self.jev_planner = JevPlanner(self.jev_config)
         # Record process-wide stateless mode so module-level persisters
         # (output-savings recorder, etc.) can skip workspace writes.
         from headroom import paths as _hr_paths
@@ -4350,6 +4355,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Get feedback loop stats
         feedback = get_compression_feedback()
         feedback_stats = feedback.get_stats()
+        jev_stats = proxy.jev_planner.stats.snapshot(proxy.jev_config)
 
         # Build prefix cache stats once (used in both prefix_cache and cost)
         prefix_cache_stats = _build_prefix_cache_stats(m, proxy.cost_tracker)
@@ -4577,6 +4583,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "by_model": dict(m.requests_by_model),
                 "by_stack": dict(m.requests_by_stack),
             },
+            "jev": jev_stats,
             "tokens": {
                 "input": m.tokens_input_total,
                 "output": m.tokens_output_total,
@@ -5709,6 +5716,15 @@ def _proxy_config_from_env() -> ProxyConfig:
         # posture (compress_user, protect_recent, min_tokens). HEADROOM_SAVINGS_PROFILE
         # overrides.
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
+        jev_mode=cast(Literal["off", "shadow", "active"], _get_env_str("HEADROOM_JEV_MODE", "off")),
+        jev_endpoint=_get_env_str("HEADROOM_JEV_ENDPOINT", "https://api.typesafe.ai/v1/systemone"),
+        jev_model=_get_env_str("HEADROOM_JEV_MODEL", "jev-latest"),
+        jev_timeout_ms=_get_env_int("HEADROOM_JEV_TIMEOUT_MS", 500),
+        jev_trigger=_get_env_str("HEADROOM_JEV_TRIGGER", "soft_threshold"),
+        jev_threshold_percent=_get_env_int("HEADROOM_JEV_THRESHOLD_PERCENT", 80),
+        jev_cooldown_turns=_get_env_int("HEADROOM_JEV_COOLDOWN_TURNS", 5),
+        jev_max_candidate_tokens=_get_env_int("HEADROOM_JEV_MAX_CANDIDATE_TOKENS", 20_000),
+        jev_ccr_lease_seconds=_get_env_int("HEADROOM_JEV_CCR_LEASE_SECONDS", 1800),
         read_maturation=rollout.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),

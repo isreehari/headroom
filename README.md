@@ -151,6 +151,35 @@ lines clear 90% in `benchmarks/bench_latency.py`; prose and already-dense output
 compress very little. Run `headroom savings` against your own traffic for the
 number that applies to you.
 
+### Jev shadow comparison
+
+The optional Jev comparison reuses the same seeded scenarios while keeping
+local compression savings, Jev projections, and applied savings separate:
+
+```bash
+uv run python benchmarks/jev_proof_table.py --seed 20260902 --live
+```
+
+`--live` is required before the script can make Jev requests. It always uses
+Jev shadow mode, so the request is not changed. `Jev est.` is Jev's bounded
+planner estimate, `Jev incr.` is the provider-token projection after Headroom
+compression, and `Applied` is the isolated projection from the benchmark copy.
+Projected Jev savings are never added to the actual Headroom savings total.
+
+Experimental active mode is a separate request-level opt-in: use
+`HEADROOM_JEV_MODE=active` together with `/v1/compress` `config.mode="ccr"`, a
+stable `config.session_id`, and `config.jev_compaction_boundary=true`. The
+current metadata-only policy preserves all unseen results; even a confident
+answer cannot authorize their removal. Production CCR and cache-lineage
+validation remains outstanding. See the
+[TypeSafe hardening notes](docs/superpowers/plans/2026-09-19-jev-typesafe-guidance.md)
+for usage accounting, cooldown limits and remaining work.
+
+For an active benchmark simulation that applies the decisions only to an
+isolated in-memory copy, add `--apply-projection`. This measures the resulting
+token count without changing the running proxy or sending the modified copy
+to a model provider.
+
 Compression costs **well under a millisecond** — 0.21 ms p50 on a 10K-token JSON
 search result, 1.4 ms at 100K tokens — so it does not show up in agent latency.
 

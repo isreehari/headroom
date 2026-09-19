@@ -1,0 +1,102 @@
+<mxfile host="app.diagrams.net" modified="2026-09-19T00:00:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="headroom-jev-flow" name="Headroom + Jev flow">
+    <mxGraphModel dx="900" dy="2200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="900" pageHeight="2300" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Headroom + Jev proactive retention" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=24;fontStyle=1;fontColor=#17202A;" vertex="1" parent="1">
+          <mxGeometry x="40" y="24" width="820" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="Current baseline and approved PR1 shadow-only flow" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=14;fontColor=#566573;" vertex="1" parent="1">
+          <mxGeometry x="42" y="62" width="820" height="28" as="geometry" />
+        </mxCell>
+
+        <mxCell id="baselineLane" value="CURRENT HEADROOM PATH" style="swimlane;html=1;rounded=0;horizontal=0;startSize=32;fillColor=#F4F8FB;strokeColor=#7F8C8D;fontStyle=1;fontColor=#34495E;" vertex="1" parent="1">
+          <mxGeometry x="40" y="115" width="820" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="currentRequest" value="Developer request" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EAF8;strokeColor=#2E86C1;fontColor=#1B4F72;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="75" y="195" width="160" height="58" as="geometry" />
+        </mxCell>
+        <mxCell id="currentCompress" value="Headroom&lt;br&gt;local compression" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EAF8;strokeColor=#2E86C1;fontColor=#1B4F72;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="285" y="185" width="180" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="currentCcr" value="CCR&lt;br&gt;store originals + marker" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5F5E3;strokeColor=#239B56;fontColor=#145A32;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="515" y="185" width="155" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="currentModel" value="Target model&lt;br&gt;receives final context" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EAF8;strokeColor=#2E86C1;fontColor=#1B4F72;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="720" y="185" width="125" height="78" as="geometry" />
+        </mxCell>
+
+        <mxCell id="proposedLane" value="PROPOSED OPT-IN JEV PATH" style="swimlane;html=1;rounded=0;horizontal=0;startSize=32;fillColor=#FBF7FF;strokeColor=#8E6BBE;fontStyle=1;fontColor=#5B2C6F;" vertex="1" parent="1">
+          <mxGeometry x="40" y="385" width="820" height="1515" as="geometry" />
+        </mxCell>
+        <mxCell id="request" value="1. Developer request&lt;br&gt;parse and protect cache-frozen ranges" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8DAEF;strokeColor=#8E44AD;fontColor=#512E5F;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="250" y="455" width="500" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="compress" value="2. Existing local live-zone compression" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EAF8;strokeColor=#2E86C1;fontColor=#1B4F72;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="250" y="550" width="500" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="threshold" value="3. Post-compression soft threshold reached?&lt;br&gt;Below: forward normally. At/above: continue." style="rhombus;whiteSpace=wrap;html=1;fillColor=#FCF3CF;strokeColor=#D4AC0D;fontColor=#7D6608;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="645" width="500" height="82" as="geometry" />
+        </mxCell>
+        <mxCell id="admission" value="4. Shared Jev-trigger admission&lt;br&gt;per-session/branch sequence + provider gate" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8DAEF;strokeColor=#8E44AD;fontColor=#512E5F;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="765" width="500" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="identity" value="5. Durable session / branch / revision available?&lt;br&gt;No: fallback. Yes: continue." style="rhombus;whiteSpace=wrap;html=1;fillColor=#FCF3CF;strokeColor=#D4AC0D;fontColor=#7D6608;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="870" width="500" height="82" as="geometry" />
+        </mxCell>
+        <mxCell id="candidates" value="6. Eligible candidates present?&lt;br&gt;No: record no_eligible_candidates and make no remote call." style="rhombus;whiteSpace=wrap;html=1;fillColor=#FCF3CF;strokeColor=#D4AC0D;fontColor=#7D6608;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="987" width="500" height="82" as="geometry" />
+        </mxCell>
+        <mxCell id="fallback" value="Fallback lane&lt;br&gt;normal Headroom path for any skip, timeout, invalid response, or unsupported provider" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FDEDEC;strokeColor=#CB4335;fontColor=#78281F;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="55" y="1095" width="190" height="86" as="geometry" />
+        </mxCell>
+        <mxCell id="view" value="7. Build bounded PR1 decision view&lt;br&gt;candidate hashes and allowed fields only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8DAEF;strokeColor=#8E44AD;fontColor=#512E5F;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="1100" width="500" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="api" value="8. Jev API call&lt;br&gt;keep / truncate / drop proposal with bounded timeout" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5EEF8;strokeColor=#8E44AD;fontColor=#512E5F;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="1195" width="500" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="validate" value="9. Validate locally&lt;br&gt;revision, branch, hashes, protected ranges, actions, deadline" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FCF3CF;strokeColor=#D4AC0D;fontColor=#7D6608;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="1290" width="500" height="86" as="geometry" />
+        </mxCell>
+        <mxCell id="ledger" value="10. Atomic freshness check + deduplicated projection ledger&lt;br&gt;A becomes superseded after newer B; retries do not double count" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EAF8;strokeColor=#2E86C1;fontColor=#1B4F72;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="1405" width="500" height="74" as="geometry" />
+        </mxCell>
+        <mxCell id="shadow" value="PR1 SHADOW&lt;br&gt;record projection only; no Jev-triggered CCR writes; keep original byte-identical context" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FDEBD0;strokeColor=#CA6F1E;fontColor=#784212;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="1510" width="500" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="active" value="PR2 ACTIVE ONLY — DEFERRED&lt;br&gt;compaction boundary + acknowledged CCR lease + safe cache-lineage replacement" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FADBD8;strokeColor=#C0392B;fontColor=#78281F;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="1735" width="500" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="final" value="Final context sent to the target model" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5F5E3;strokeColor=#239B56;fontColor=#145A32;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="250" y="1625" width="500" height="64" as="geometry" />
+        </mxCell>
+
+        <mxCell id="statusPanel" value="WHERE WE STAND" style="swimlane;html=1;rounded=0;horizontal=0;startSize=32;fillColor=#F8F9F9;strokeColor=#566573;fontStyle=1;fontColor=#34495E;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1945" width="820" height="260" as="geometry" />
+        </mxCell>
+        <mxCell id="status" value="&lt;b&gt;Jev PR1 status&lt;/b&gt;&lt;br&gt;GPT Astra approved the shadow-only implementation.&lt;br&gt;Default: off. Active is rejected before key validation.&lt;br&gt;No production code changed yet.&lt;br&gt;&lt;br&gt;Claude Fable review was unavailable because the account required usage credits.&lt;br&gt;&lt;br&gt;CCR leases, active retention, compaction boundaries, and context replacement remain PR2 work." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#AAB7B8;align=left;verticalAlign=top;spacing=12;fontColor=#2C3E50;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1990" width="780" height="190" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2E86C1;" edge="1" parent="1" source="currentRequest" target="currentCompress"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2E86C1;" edge="1" parent="1" source="currentCompress" target="currentCcr"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2E86C1;" edge="1" parent="1" source="currentCcr" target="currentModel"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8E44AD;" edge="1" parent="1" source="request" target="compress"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8E44AD;" edge="1" parent="1" source="compress" target="threshold"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e6" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8E44AD;fontColor=#512E5F;" edge="1" parent="1" source="threshold" target="admission"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e7" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8E44AD;fontColor=#512E5F;" edge="1" parent="1" source="admission" target="identity"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e8" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8E44AD;fontColor=#512E5F;" edge="1" parent="1" source="identity" target="candidates"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e9" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8E44AD;fontColor=#512E5F;" edge="1" parent="1" source="candidates" target="view"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8E44AD;" edge="1" parent="1" source="view" target="api"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8E44AD;" edge="1" parent="1" source="api" target="validate"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e12" value="Valid" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2E86C1;fontColor=#1B4F72;" edge="1" parent="1" source="validate" target="ledger"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e13" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#CA6F1E;fontColor=#784212;" edge="1" parent="1" source="ledger" target="shadow"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e15" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#239B56;" edge="1" parent="1" source="shadow" target="final"><mxGeometry relative="1" as="geometry" /></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

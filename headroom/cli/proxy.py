@@ -1338,6 +1338,18 @@ def proxy(
         tool_profiles=_parse_tool_profiles([]) or None,
         smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
+        jev_mode=cast(
+            Literal["off", "shadow", "active"], os.environ.get("HEADROOM_JEV_MODE", "off")
+        ),
+        jev_endpoint=os.environ.get(
+            "HEADROOM_JEV_ENDPOINT", "https://api.typesafe.ai/v1/systemone"
+        ),
+        jev_model=os.environ.get("HEADROOM_JEV_MODEL", "jev-latest"),
+        jev_timeout_ms=_get_env_int("HEADROOM_JEV_TIMEOUT_MS", 500),
+        jev_trigger=os.environ.get("HEADROOM_JEV_TRIGGER", "soft_threshold"),
+        jev_threshold_percent=_get_env_int("HEADROOM_JEV_THRESHOLD_PERCENT", 80),
+        jev_cooldown_turns=_get_env_int("HEADROOM_JEV_COOLDOWN_TURNS", 5),
+        jev_max_candidate_tokens=_get_env_int("HEADROOM_JEV_MAX_CANDIDATE_TOKENS", 20_000),
         target_ratio=target_ratio,
         compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),

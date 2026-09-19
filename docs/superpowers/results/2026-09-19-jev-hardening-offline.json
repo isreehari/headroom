@@ -1,0 +1,98 @@
+[
+  {
+    "scenario": "Code search (100 results)",
+    "before_tokens": 17199,
+    "after_tokens": 13597,
+    "headroom_saved": 3602,
+    "jev_projected_saved": 0,
+    "jev_projected_provider_saved": 0,
+    "jev_latency_ms": null,
+    "jev_called": false,
+    "jev_fallback_reason": "disabled",
+    "decision_counts": {
+      "keep": 0,
+      "drop_result": 0,
+      "drop_call": 0
+    },
+    "jev_applied_saved": 0,
+    "jev_input_tokens": null,
+    "jev_output_tokens": null,
+    "jev_response_model": null,
+    "jev_policy_version": "metadata-keep-v2",
+    "jev_abstentions": {},
+    "jev_planning_latency_ms": 0.132082961499691,
+    "actual_total_saved": 3602
+  },
+  {
+    "scenario": "SRE incident debugging",
+    "before_tokens": 55957,
+    "after_tokens": 24340,
+    "headroom_saved": 31617,
+    "jev_projected_saved": 0,
+    "jev_projected_provider_saved": 0,
+    "jev_latency_ms": null,
+    "jev_called": false,
+    "jev_fallback_reason": "disabled",
+    "decision_counts": {
+      "keep": 0,
+      "drop_result": 0,
+      "drop_call": 0
+    },
+    "jev_applied_saved": 0,
+    "jev_input_tokens": null,
+    "jev_output_tokens": null,
+    "jev_response_model": null,
+    "jev_policy_version": "metadata-keep-v2",
+    "jev_abstentions": {},
+    "jev_planning_latency_ms": 0.3232499584555626,
+    "actual_total_saved": 31617
+  },
+  {
+    "scenario": "Codebase exploration",
+    "before_tokens": 58801,
+    "after_tokens": 33895,
+    "headroom_saved": 24906,
+    "jev_projected_saved": 0,
+    "jev_projected_provider_saved": 0,
+    "jev_latency_ms": null,
+    "jev_called": false,
+    "jev_fallback_reason": "disabled",
+    "decision_counts": {
+      "keep": 0,
+      "drop_result": 0,
+      "drop_call": 0
+    },
+    "jev_applied_saved": 0,
+    "jev_input_tokens": null,
+    "jev_output_tokens": null,
+    "jev_response_model": null,
+    "jev_policy_version": "metadata-keep-v2",
+    "jev_abstentions": {},
+    "jev_planning_latency_ms": 0.3426671028137207,
+    "actual_total_saved": 24906
+  },
+  {
+    "scenario": "GitHub issue triage",
+    "before_tokens": 46067,
+    "after_tokens": 32429,
+    "headroom_saved": 13638,
+    "jev_projected_saved": 0,
+    "jev_projected_provider_saved": 0,
+    "jev_latency_ms": null,
+    "jev_called": false,
+    "jev_fallback_reason": "disabled",
+    "decision_counts": {
+      "keep": 0,
+      "drop_result": 0,
+      "drop_call": 0
+    },
+    "jev_applied_saved": 0,
+    "jev_input_tokens": null,
+    "jev_output_tokens": null,
+    "jev_response_model": null,
+    "jev_policy_version": "metadata-keep-v2",
+    "jev_abstentions": {},
+    "jev_planning_latency_ms": 0.2622092142701149,
+    "actual_total_saved": 13638
+  }
+]

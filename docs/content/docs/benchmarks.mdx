@@ -25,6 +25,60 @@ Measured on Apple M-series (CPU), Headroom 0.37.0, via `python benchmarks/bench_
 Python source shows 0% compression: SmartCrusher only compresses JSON arrays, and code passes through to preserve correctness (verified: `headroom/transforms/smart_crusher.py:242`).
 </Callout>
 
+## Jev Retention Measurements
+
+These runs use the same seeded MCP-shaped corpus as the proof table, the
+`gpt-5.6` provider tokenizer, and the live Jev endpoint configured through
+`HEADROOM_JEV_API_KEY`. They were run on 2026-09-19 from the `origin/main`
+based development checkout with seed `20260902`.
+
+**Historical policy:** The figures below predate `metadata-keep-v2`. That earlier
+policy allowed removal despite not sending tool-result contents to Jev. The
+current policy preserves those results and reports zero incremental Jev savings
+until sufficient evidence can support removal. These historical figures are not
+validated quality-preserving savings and are not expected from a current rerun.
+
+```bash
+source ~/.zshrc
+uv run python benchmarks/jev_proof_table.py --seed 20260902 --live
+uv run python benchmarks/jev_proof_table.py \
+  --seed 20260902 \
+  --live \
+  --apply-projection \
+  --json-output /tmp/headroom-jev-active-simulation-20260902.json
+```
+
+The first command measures real Jev decisions and latency in shadow mode. The
+second applies those decisions to an isolated copy of the already-compressed
+messages. It does not enable production proxy active mode and does not send the
+modified copy to a model provider.
+
+| Scenario | Before | After Headroom | Headroom Saved | Jev Applied (isolated) | Final Simulated |
+|---|---:|---:|---:|---:|---:|
+| Code search (100 results) | 17,199 | 13,597 | 3,602 | 13,522 | 75 |
+| SRE incident debugging | 55,957 | 24,340 | 31,617 | 14,463 | 9,877 |
+| Codebase exploration | 58,801 | 33,895 | 24,906 | 19,072 | 14,823 |
+| GitHub issue triage | 46,067 | 32,429 | 13,638 | 12,333 | 20,096 |
+| **Total** | **178,024** | **104,261** | **73,763** | **59,390** | **44,871** |
+
+Jev made four successful decisions, all `drop_result`, with 273--644 ms
+latency per call in this run. `Jev Applied` is an isolated benchmark result,
+not a production savings claim. The reference Jev behavior keeps the call and
+deterministic result head for `drop_result`, and removes both sides for
+`drop_call`; the benchmark follows those semantics.
+
+Experimental active mode is intentionally narrower than the benchmark projection.
+It is enabled with `HEADROOM_JEV_MODE=active` only for `/v1/compress` requests
+that opt into `config.mode="ccr"`, provide a stable `config.session_id`, and
+set `config.jev_compaction_boundary=true`. The implementation protects the
+frozen prefix, acknowledges CCR writes before mutation, preserves tool-call
+pairs, and fails open on storage, token-recount, or session-revision
+uncertainty, but these guards still need production validation. The current
+metadata-only planner issues no removal decisions. Other proxy paths do not yet
+invoke Jev. Benchmark JSON now includes API input/output tokens (null when
+unknown), response model, policy version and abstentions; these are not dollar
+savings or an end-to-end task-quality evaluation.
+
 ## Accuracy Benchmarks
 
 ### HTML Extraction

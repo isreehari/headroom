@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     hash TEXT PRIMARY KEY,
     entry_json TEXT NOT NULL,
     created_at REAL NOT NULL,
-    ttl INTEGER NOT NULL
+    ttl INTEGER NOT NULL,
+    lease_until REAL
 );
 CREATE INDEX IF NOT EXISTS idx_ccr_expiry_deadline ON ccr_entries (created_at + ttl);
 -- Superseded by idx_ccr_expiry_deadline: no query searches or orders by bare
@@ -92,13 +93,20 @@ class SQLiteBackend:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        try:
+            conn.execute("ALTER TABLE ccr_entries ADD COLUMN lease_until REAL")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error).lower():
+                raise
         # Startup hygiene: expired rows are only purged opportunistically
         # on writes, so a quiet store could otherwise hold expired
         # originals (which may contain sensitive tool output) on disk
         # indefinitely. Sweep them on every open.
+        now = time.time()
         conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (time.time(),),
+            "DELETE FROM ccr_entries "
+            "WHERE created_at + ttl < ? AND (lease_until IS NULL OR lease_until < ?)",
+            (now, now),
         )
         conn.commit()
         # Originals can contain sensitive tool output (file contents,
@@ -159,8 +167,9 @@ class SQLiteBackend:
     def _purge_expired(self, now: float) -> int:
         """Delete expired rows using metadata; caller holds ``_lock``."""
         cursor = self._conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (now,),
+            "DELETE FROM ccr_entries "
+            "WHERE created_at + ttl < ? AND (lease_until IS NULL OR lease_until < ?)",
+            (now, now),
         )
         self._conn.commit()
         self._last_purge = now
@@ -202,8 +211,8 @@ class SQLiteBackend:
             try:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO ccr_entries "
-                    "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
-                    (hash_key, payload, entry.created_at, entry.ttl),
+                    "(hash, entry_json, created_at, ttl, lease_until) VALUES (?, ?, ?, ?, ?)",
+                    (hash_key, payload, entry.created_at, entry.ttl, entry.lease_until),
                 )
                 self._conn.commit()
                 self._maybe_purge()

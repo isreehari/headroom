@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="2360" viewBox="0 0 800 2360" role="img" aria-labelledby="title desc">
+  <title id="title">Headroom and Jev proactive retention flow</title>
+  <desc id="desc">Mobile-friendly vertical flow showing the current Headroom path, the PR1 Jev shadow path, and PR2 active retention boundary.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#566573" />
+    </marker>
+    <style>
+      .title { font: 700 30px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #17202A; }
+      .subtitle { font: 400 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #566573; }
+      .section { font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 1px; }
+      .label { font: 600 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1B4F72; }
+      .body { font: 400 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #2C3E50; }
+      .small { font: 400 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #566573; }
+      .box { fill: #D6EAF8; stroke: #2E86C1; stroke-width: 2; }
+      .purple { fill: #E8DAEF; stroke: #8E44AD; stroke-width: 2; }
+      .green { fill: #D5F5E3; stroke: #239B56; stroke-width: 2; }
+      .yellow { fill: #FCF3CF; stroke: #D4AC0D; stroke-width: 2; }
+      .orange { fill: #FDEBD0; stroke: #CA6F1E; stroke-width: 2; }
+      .red { fill: #FADBD8; stroke: #C0392B; stroke-width: 2; }
+      .skip { fill: #FDEDEC; stroke: #CB4335; stroke-width: 2; }
+      .panel { fill: #F8F9F9; stroke: #566573; stroke-width: 2; }
+      .line { stroke: #566573; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #CB4335; stroke-width: 2; stroke-dasharray: 8 6; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="800" height="2360" fill="#FFFFFF" />
+  <text class="title" x="50" y="58">Headroom + Jev</text>
+  <text class="title" x="50" y="96">proactive retention flow</text>
+  <text class="subtitle" x="50" y="128">Mobile view of the approved PR1 shadow-only design</text>
+
+  <rect x="35" y="165" width="730" height="270" rx="10" fill="#F4F8FB" stroke="#7F8C8D" stroke-width="2" />
+  <text class="section" x="58" y="198" fill="#34495E">CURRENT HEADROOM PATH</text>
+  <rect class="box" x="75" y="225" width="650" height="52" rx="8" />
+  <text class="label" x="400" y="257" text-anchor="middle">Developer request</text>
+  <path class="line" d="M400 277 L400 300" />
+  <rect class="box" x="75" y="302" width="650" height="52" rx="8" />
+  <text class="label" x="400" y="334" text-anchor="middle">Headroom local live-zone compression</text>
+  <path class="line" d="M400 354 L400 377" />
+  <rect class="green" x="75" y="379" width="650" height="52" rx="8" />
+  <text class="label" x="400" y="411" text-anchor="middle">CCR stores originals and markers, then target model receives final context</text>
+
+  <rect x="35" y="475" width="730" height="1700" rx="10" fill="#FBF7FF" stroke="#8E6BBE" stroke-width="2" />
+  <text class="section" x="58" y="508" fill="#5B2C6F">PROPOSED OPT-IN JEV PATH</text>
+
+  <rect class="purple" x="75" y="535" width="650" height="54" rx="8" />
+  <text class="label" x="400" y="568" text-anchor="middle">1. Developer request and protected-range parsing</text>
+  <path class="line" d="M400 589 L400 612" />
+  <rect class="box" x="75" y="614" width="650" height="54" rx="8" />
+  <text class="label" x="400" y="647" text-anchor="middle">2. Existing local live-zone compression</text>
+  <path class="line" d="M400 668 L400 691" />
+  <rect class="yellow" x="75" y="693" width="650" height="74" rx="8" />
+  <text class="label" x="400" y="723" text-anchor="middle">3. Post-compression occupancy</text>
+  <text class="body" x="400" y="747" text-anchor="middle">Below threshold: forward normally. At or above threshold: continue.</text>
+  <path class="line" d="M400 767 L400 790" />
+
+  <rect class="purple" x="75" y="792" width="650" height="76" rx="8" />
+  <text class="label" x="400" y="823" text-anchor="middle">4. Shared Jev-trigger admission</text>
+  <text class="body" x="400" y="847" text-anchor="middle">Per-session/branch sequence and supported-provider gate.</text>
+  <text class="small" x="400" y="889" text-anchor="middle">Skip Jev when shared coordination is unavailable or provider is unsupported.</text>
+  <path class="line" d="M400 868 L400 910" />
+
+  <rect class="yellow" x="75" y="912" width="650" height="70" rx="8" />
+  <text class="label" x="400" y="942" text-anchor="middle">5. Durable session / branch / revision available?</text>
+  <text class="body" x="400" y="966" text-anchor="middle">No: skip and use normal Headroom behavior.</text>
+  <path class="line" d="M400 982 L400 1005" />
+
+  <rect class="yellow" x="75" y="1007" width="650" height="70" rx="8" />
+  <text class="label" x="400" y="1037" text-anchor="middle">6. Eligible candidates present?</text>
+  <text class="body" x="400" y="1061" text-anchor="middle">No: record no_eligible_candidates and make no remote call.</text>
+  <path class="line" d="M400 1077 L400 1100" />
+
+  <rect class="purple" x="75" y="1102" width="650" height="64" rx="8" />
+  <text class="label" x="400" y="1130" text-anchor="middle">7. Build bounded PR1 decision view</text>
+  <text class="body" x="400" y="1153" text-anchor="middle">Candidate hashes and allowed fields only; no credentials or protected ranges.</text>
+  <path class="line" d="M400 1166 L400 1189" />
+
+  <rect class="purple" x="75" y="1191" width="650" height="64" rx="8" />
+  <text class="label" x="400" y="1219" text-anchor="middle">8. Jev API call</text>
+  <text class="body" x="400" y="1242" text-anchor="middle">Keep, truncate, or drop proposal; bounded timeout and one in-flight call.</text>
+  <path class="line" d="M400 1255 L400 1278" />
+
+  <rect class="yellow" x="75" y="1280" width="650" height="72" rx="8" />
+  <text class="label" x="400" y="1310" text-anchor="middle">9. Validate locally</text>
+  <text class="body" x="400" y="1334" text-anchor="middle">Revision, branch, candidate hashes, protected ranges, actions, deadline.</text>
+  <path class="line" d="M400 1352 L400 1375" />
+
+  <rect class="box" x="75" y="1377" width="650" height="72" rx="8" />
+  <text class="label" x="400" y="1407" text-anchor="middle">10. Atomic freshness check + projection ledger</text>
+  <text class="body" x="400" y="1431" text-anchor="middle">Reject stale A after newer B; deduplicate exact retries before counting.</text>
+  <path class="line" d="M400 1449 L400 1472" />
+
+  <rect class="orange" x="75" y="1474" width="650" height="86" rx="8" />
+  <text class="label" x="400" y="1505" text-anchor="middle">PR1 SHADOW</text>
+  <text class="body" x="400" y="1529" text-anchor="middle">Record combined projection T0 - TP and incremental projection TH - TP.</text>
+  <text class="body" x="400" y="1552" text-anchor="middle">No Jev CCR writes. Keep the original byte-identical Headroom context.</text>
+  <path class="line" d="M400 1560 L400 1583" />
+
+  <rect class="red" x="75" y="1585" width="650" height="86" rx="8" />
+  <text class="label" x="400" y="1616" text-anchor="middle">PR2 ACTIVE ONLY</text>
+  <text class="body" x="400" y="1640" text-anchor="middle">Requires explicit compaction boundary, acknowledged CCR write,</text>
+  <text class="body" x="400" y="1663" text-anchor="middle">retention lease, and safe provider cache-lineage replacement.</text>
+  <path class="line" d="M400 1671 L400 1694" />
+
+  <rect class="green" x="75" y="1696" width="650" height="60" rx="8" />
+  <text class="label" x="400" y="1732" text-anchor="middle">Final context sent to the target model</text>
+
+  <rect class="panel" x="75" y="1800" width="650" height="300" rx="8" />
+  <text class="label" x="100" y="1835">WHERE WE STAND</text>
+  <text class="body" x="100" y="1870">Astra: APPROVED for PR1 shadow-only implementation.</text>
+  <text class="body" x="100" y="1902">Default: off. Active: rejected in PR1.</text>
+  <text class="body" x="100" y="1934">No production code changed yet.</text>
+  <text class="body" x="100" y="1980">Fable review: unavailable because the account</text>
+  <text class="body" x="100" y="2004">requires usage credits.</text>
+  <text class="small" x="100" y="2050">CCR leases, active retention, compaction boundaries,</text>
+  <text class="small" x="100" y="2074">and context replacement are deferred to PR2.</text>
+
+  <text class="small" x="50" y="2240">Editable source: headroom-jev-proactive-flow.drawio</text>
+  <text class="small" x="50" y="2266">This SVG is a mobile-friendly visual export of the same approved flow.</text>
+</svg>

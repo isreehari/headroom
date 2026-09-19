@@ -296,6 +296,64 @@ included in any extra or Docker image — see
 | `HEADROOM_TELEMETRY` | `off` | Set to `on` for local-only usage stats (nothing is sent externally) |
 | `HEADROOM_REQUEST_TIMEOUT` | `300` | Request timeout in seconds |
 
+### Optional Jev retention planning
+
+Jev is disabled by default. Shadow mode sends only a bounded retention view to
+the configured Jev endpoint and records a projection without changing the
+request sent to the target model. On macOS, Headroom's persistent environment
+block lives in `~/.zshrc`; add the values there so every new shell inherits
+them.
+
+```bash
+# >>> headroom persistent env >>>
+export HEADROOM_JEV_MODE=shadow
+export HEADROOM_JEV_API_KEY="your-typesafe-key"
+# <<< headroom persistent env <<<
+```
+
+Run `source ~/.zshrc` or open a new terminal after editing it, then restart
+Headroom. Keep the real key out of documentation, commits, and chat. The
+file-backed settings UI is also supported, but shell startup configuration is
+the recommended path when Headroom already manages a persistent env block.
+
+The supported knobs are `HEADROOM_JEV_ENDPOINT`, `HEADROOM_JEV_MODEL`,
+`HEADROOM_JEV_TIMEOUT_MS`, `HEADROOM_JEV_THRESHOLD_PERCENT`,
+`HEADROOM_JEV_COOLDOWN_TURNS`, `HEADROOM_JEV_MAX_CANDIDATE_TOKENS`, and
+`HEADROOM_JEV_CCR_LEASE_SECONDS`.
+
+Active mode is experimental and available only on the explicit `/v1/compress` CCR path. The
+caller must send `config.mode="ccr"`, a stable `config.session_id`, and
+`config.jev_compaction_boundary=true`. Headroom protects the frozen prefix,
+stores the original tool result in CCR, and replaces only eligible tool
+results with retrievable markers. Any missing boundary, stale session, failed
+CCR write, or Jev error is intended to keep the normal request unchanged. These
+guards still require production validation. Other proxy routes do not currently
+invoke the Jev planner. The metadata-only policy currently keeps all unseen
+results, even in active mode; the flag alone does not authorize removal.
+
+Cooldown skips new eligible revisions after a call; exact retries do not consume
+cooldown or repeat calls. This protection is process-local, not durable across
+workers or restarts. The request budget is conservatively enforced on serialized
+bytes, including state and questions, capped at 30,000 bytes. `/stats.jev` reports
+API usage (null when unknown), abstentions, skipped calls and policy version.
+
+For Jev question design and probability interpretation, consult TypeSafe's
+[primitives](https://docs.typesafe.ai/primitives) and
+[confidence guidance](https://docs.typesafe.ai/confidence). Token reductions alone
+do not demonstrate preserved task quality or net cost savings.
+
+```json
+{
+  "messages": [],
+  "model": "gpt-5",
+  "config": {
+    "mode": "ccr",
+    "session_id": "agent-session-1",
+    "jev_compaction_boundary": true
+  }
+}
+```
+
 ### TypeScript SDK
 
 | Variable | Default | Description |

@@ -15,6 +15,7 @@ from typing import Any, Literal
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
+from headroom.proxy.jev import DEFAULT_JEV_ENDPOINT, DEFAULT_JEV_MODEL, JevMode
 from headroom.proxy.model_router import ModelRouterConfig
 from headroom.rollout import RolloutSnapshot, resolve_rollout
 
@@ -274,6 +275,21 @@ class ProxyConfig:
     # Named savings policy shared across Claude/Codex/Cursor proxy handlers.
     # CLI/env: HEADROOM_SAVINGS_PROFILE=agent-90.
     savings_profile: str | None = None
+
+    # Optional Jev retention planning. Active mode is restricted to the
+    # explicit /v1/compress CCR compaction-boundary contract; provider proxy
+    # paths remain fail-open unless they establish that contract.
+    # The API key is intentionally read from the process environment by the
+    # Jev client and is never part of ProxyConfig serialization.
+    jev_mode: JevMode = "off"
+    jev_endpoint: str = DEFAULT_JEV_ENDPOINT
+    jev_model: str = DEFAULT_JEV_MODEL
+    jev_timeout_ms: int = 500
+    jev_trigger: str = "soft_threshold"
+    jev_threshold_percent: int = 80
+    jev_cooldown_turns: int = 5
+    jev_max_candidate_tokens: int = 20_000
+    jev_ccr_lease_seconds: int = 1800
     target_ratio: float | None = None
     compress_system_messages: bool | None = None
     protect_recent: int | None = None

@@ -168,6 +168,7 @@ class CompressionEntry:
     query_context: str | None
     created_at: float
     ttl: int = DEFAULT_CCR_TTL_SECONDS
+    lease_until: float | None = None
 
     # TOIN integration: Store the tool signature hash for retrieval correlation
     # This MUST match the hash used by SmartCrusher when recording compression
@@ -181,7 +182,14 @@ class CompressionEntry:
 
     def is_expired(self) -> bool:
         """Check if this entry has expired."""
-        return time.time() - self.created_at > self.ttl
+        now = time.time()
+        if self.lease_until is not None and now < self.lease_until:
+            return False
+        return now - self.created_at > self.ttl
+
+    def is_leased(self) -> bool:
+        """Return True while active retention protects this entry."""
+        return self.lease_until is not None and time.time() < self.lease_until
 
     def record_access(self, query: str | None = None) -> None:
         """Record an access to this entry for feedback tracking."""
@@ -288,6 +296,7 @@ class CompressionStore:
         compression_strategy: str | None = None,
         ttl: int | None = None,
         explicit_hash: str | None = None,
+        lease_seconds: int | None = None,
     ) -> str:
         """Store compressed content and return hash for retrieval.
 
@@ -312,6 +321,8 @@ class CompressionStore:
                 string, raises ``ValueError``. The marker hash and the
                 store key MUST match — otherwise ``/v1/retrieve/{hash}``
                 returns 404 even though the data is present.
+            lease_seconds: Optional minimum retention lease. While the lease
+                is active, the entry cannot expire or be evicted.
 
         Returns:
             Hash key for retrieving this content.
@@ -376,6 +387,14 @@ class CompressionStore:
             )
             return hash_key
 
+        if lease_seconds is not None and lease_seconds <= 0:
+            raise ValueError("lease_seconds must be greater than 0")
+        created_at = time.time()
+        effective_ttl = ttl if ttl is not None else self._default_ttl
+        lease_until = created_at + lease_seconds if lease_seconds is not None else None
+        if lease_seconds is not None:
+            effective_ttl = max(effective_ttl, lease_seconds)
+
         entry = CompressionEntry(
             hash=hash_key,
             original_content=original,
@@ -387,8 +406,9 @@ class CompressionStore:
             tool_name=tool_name,
             tool_call_id=tool_call_id,
             query_context=query_context,
-            created_at=time.time(),
-            ttl=ttl if ttl is not None else self._default_ttl,
+            created_at=created_at,
+            ttl=effective_ttl,
+            lease_until=lease_until,
             tool_signature_hash=tool_signature_hash,
             compression_strategy=compression_strategy,
         )
@@ -535,6 +555,7 @@ class CompressionStore:
                 "original_content_preview": entry.original_content[:2000],
                 "created_at": entry.created_at,
                 "ttl": entry.ttl,
+                "lease_until": entry.lease_until,
             }
 
     def _log_retrieval_payload(
@@ -742,6 +763,7 @@ class CompressionStore:
                 self._rebuild_heap()
 
         # If still at capacity, remove oldest entries using heap
+        protected: list[tuple[float, str]] = []
         while self._backend.count() >= self._max_entries and self._eviction_heap:
             # Pop oldest from heap (O(log n))
             created_at, hash_key = heapq.heappop(self._eviction_heap)
@@ -750,6 +772,9 @@ class CompressionStore:
             # (entry might have been deleted or replaced)
             entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
+                if entry.is_leased():
+                    protected.append((created_at, hash_key))
+                    continue
                 # HIGH FIX: Track eviction as "successful compression" if never retrieved
                 # This prevents state divergence between store and feedback loop
                 if self._enable_feedback and entry.retrieval_count == 0:
@@ -762,6 +787,8 @@ class CompressionStore:
                 # (we already popped it, so the stale entry is now gone)
                 if self._stale_heap_entries > 0:
                     self._stale_heap_entries -= 1
+        for item in protected:
+            heapq.heappush(self._eviction_heap, item)
 
     def _clean_expired(self) -> None:
         """Remove expired entries. Must be called with lock held.

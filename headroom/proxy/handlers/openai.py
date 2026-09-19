@@ -83,6 +83,11 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.image_isolation import run_image_compression_isolated
+from headroom.proxy.jev import (
+    apply_active_decisions,
+    extract_openai_candidates,
+    revision_for_messages,
+)
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
 from headroom.proxy.passthrough import (
@@ -9912,6 +9917,20 @@ class OpenAIHandlerMixin:
                         }
                     },
                 )
+            jev_compaction_boundary = compress_config.get("jev_compaction_boundary", False)
+            if not isinstance(jev_compaction_boundary, bool):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                "Invalid config.jev_compaction_boundary: "
+                                f"{jev_compaction_boundary!r}. Expected a boolean."
+                            ),
+                        }
+                    },
+                )
             # Session-aware sidecar mode (opt-in): with a session id the
             # endpoint keeps the byte-replay state ITSELF — the same
             # per-session machinery the proxy path uses (compression cache +
@@ -10202,8 +10221,162 @@ class OpenAIHandlerMixin:
                 timeout=COMPRESSION_TIMEOUT_SECONDS,
             )
 
-            ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
+            jev_projection: dict[str, Any] | None = None
+            if self.jev_config.mode in {"shadow", "active"}:
+                jev_candidates = extract_openai_candidates(messages, preserve_recent_messages=6)
+                at_soft_threshold = bool(
+                    context_limit
+                    and tokens_after * 100 >= int(context_limit) * self.jev_config.threshold_percent
+                )
+                if at_soft_threshold:
+                    jev_session_id = session_id or request.headers.get("x-headroom-session-id", "")
+                    branch_id = request.headers.get("x-headroom-branch-id", "main")
+                    goal = next(
+                        (
+                            str(message.get("content", ""))[:500]
+                            for message in reversed(messages)
+                            if message.get("role") == "user"
+                            and isinstance(message.get("content"), str)
+                            and message.get("content", "").strip()
+                        ),
+                        "",
+                    )
+                    gate_reason = None
+                    if self.jev_config.mode == "active":
+                        if mode != "ccr":
+                            gate_reason = "active_requires_ccr_mode"
+                        elif not jev_compaction_boundary:
+                            gate_reason = "compaction_boundary_required"
+                        elif not session_id:
+                            gate_reason = "session_id_required"
+                    plan = None
+                    if gate_reason is None:
+                        plan = await self.jev_planner.plan(
+                            provider="openai",
+                            model=str(model),
+                            session_id=jev_session_id,
+                            branch_id=branch_id,
+                            revision=revision_for_messages(messages),
+                            goal=goal,
+                            candidates=jev_candidates,
+                            current_tokens=tokens_after,
+                        )
+                    active_result = None
+                    if plan is not None and self.jev_config.mode == "active":
+                        pre_active_messages = copy.deepcopy(final_messages)
+                        pre_active_tokens = tokens_after
+                        from headroom.cache.compression_store import get_compression_store
 
+                        active_result = apply_active_decisions(
+                            messages=final_messages,
+                            source_messages=messages,
+                            candidates=jev_candidates,
+                            plan=plan,
+                            store=get_compression_store(),
+                            frozen_message_count=(
+                                int(session_info.get("frozen_message_count", 0))
+                                if session_info is not None
+                                else int(frozen_message_count or 0)
+                            ),
+                            lease_seconds=self.jev_config.ccr_lease_seconds,
+                        )
+                        if active_result.fallback_reason is None:
+                            try:
+                                from headroom.tokenizers import get_tokenizer
+
+                                tokens_after_active = get_tokenizer(model_name).count_messages(
+                                    active_result.messages
+                                )
+                            except Exception:
+                                tokens_after_active = tokens_after
+                                active_result = replace(
+                                    active_result,
+                                    fallback_reason="active_token_recount_failed",
+                                    failed=max(1, active_result.failed),
+                                )
+                            if (
+                                active_result.fallback_reason is None
+                                and tokens_after_active >= pre_active_tokens
+                            ):
+                                active_result = replace(
+                                    active_result,
+                                    fallback_reason="active_no_token_reduction",
+                                    applied_tokens=0,
+                                )
+                            if active_result.fallback_reason is None and session_id:
+
+                                def _commit_active_session() -> bool:
+                                    if not comp_cache.session_turn_lock.acquire(
+                                        timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
+                                    ):
+                                        return False
+                                    try:
+                                        current_returned = (
+                                            session_tracker.get_last_forwarded_messages()
+                                        )
+                                        if current_returned != pre_active_messages:
+                                            return False
+                                        comp_cache.update_from_result(
+                                            messages, active_result.messages
+                                        )
+                                        session_tracker.record_returned(
+                                            messages, active_result.messages
+                                        )
+                                        return True
+                                    finally:
+                                        comp_cache.session_turn_lock.release()
+
+                                committed = await self._run_compression_in_executor(
+                                    _commit_active_session,
+                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                )
+                                if not committed:
+                                    active_result = replace(
+                                        active_result,
+                                        fallback_reason="session_revision_changed",
+                                        failed=max(1, active_result.failed),
+                                    )
+                            if active_result.fallback_reason is None:
+                                final_messages = active_result.messages
+                                tokens_after = tokens_after_active
+                                active_result = replace(
+                                    active_result,
+                                    applied_tokens=max(0, pre_active_tokens - tokens_after_active),
+                                )
+                        self.jev_planner.stats.record_active(active_result)
+                    if plan is not None:
+                        fallback_reason = (
+                            active_result.fallback_reason
+                            if active_result is not None
+                            else plan.fallback_reason
+                        )
+                        decisions = plan.decisions
+                        called = plan.called
+                        projected_tokens_saved = plan.projected_tokens_saved
+                    else:
+                        fallback_reason = gate_reason
+                        decisions = ()
+                        called = False
+                        projected_tokens_saved = 0
+                    jev_projection = {
+                        "mode": self.jev_config.mode,
+                        "called": called,
+                        "projected_tokens_saved": projected_tokens_saved,
+                        "fallback_reason": fallback_reason,
+                        "input_tokens": plan.input_tokens if plan is not None else None,
+                        "output_tokens": plan.output_tokens if plan is not None else None,
+                        "response_model": plan.response_model if plan is not None else None,
+                        "decisions": [
+                            {
+                                "candidate_id": decision.candidate_id,
+                                "tool_name": decision.tool_name,
+                                "action": decision.action,
+                                "reason": decision.reason,
+                            }
+                            for decision in decisions
+                        ],
+                    }
+            ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
             tokens_saved = max(0, tokens_before - tokens_after)
             latency_ms = (time.time() - start_time) * 1000
             _transforms_applied = list(result.transforms_applied or ())
@@ -10277,6 +10450,8 @@ class OpenAIHandlerMixin:
                 _payload["session"] = session_info
             if _finished is not None and _finished.fields:
                 _payload.update(_finished.fields)
+            if jev_projection is not None:
+                _payload["jev"] = jev_projection
             return JSONResponse(_payload)
         except TimeoutError:
             self.metrics.record_compression_failed("timeout")
