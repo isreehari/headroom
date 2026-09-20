@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import urllib.parse
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 JEV_MODES: tuple[str, ...] = ("off", "shadow", "active")
 
@@ -83,7 +83,10 @@ class JevConfig:
     """Resolved Jev settings. Constructed once at the configuration boundary."""
 
     mode: str = "off"
-    api_key: str = ""
+    # ``repr=False``: the default dataclass repr would print the key verbatim,
+    # so a stray ``logger.debug("%r", config)`` or a traceback frame holding the
+    # config would leak it. Equality still compares it; only display drops it.
+    api_key: str = field(default="", repr=False)
     endpoint: str = DEFAULT_JEV_ENDPOINT
     model: str = DEFAULT_JEV_MODEL
     timeout_ms: int = DEFAULT_JEV_TIMEOUT_MS

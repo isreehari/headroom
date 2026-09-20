@@ -95,6 +95,18 @@ def test_redacted_never_contains_the_api_key() -> None:
     assert "api_key" not in payload
 
 
+def test_repr_never_contains_the_api_key() -> None:
+    # A stray ``logger.debug("%r", config)`` -- or a traceback frame that closes
+    # over the config -- must not be able to leak the key.
+    config = JevConfig(mode="shadow", api_key="sk-super-secret")
+    shown = repr(config)
+    assert "sk-" not in shown
+    assert "sk-super-secret" not in shown
+    assert "sk-super-secret" not in str(config)
+    # The rest of the config stays introspectable.
+    assert "shadow" in shown
+
+
 def test_redact_endpoint_strips_userinfo_and_query() -> None:
     assert (
         redact_endpoint("https://user:pw@api.example.invalid:8443/v1/systemone?token=abc")
