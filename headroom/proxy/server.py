@@ -146,6 +146,7 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
+from headroom.proxy.jev.config import JevConfig
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.malloc_trim import trim_periodically
@@ -5627,6 +5628,13 @@ def _proxy_config_payload(config: ProxyConfig) -> dict[str, Any]:
             assert config.rollout is not None
             payload["_rollout_snapshot"] = config.rollout.to_internal_dict()
             continue
+        if field.name == "jev":
+            # The Jev config carries HEADROOM_JEV_API_KEY, and this payload is
+            # handed to worker processes through an environment variable, which
+            # is readable from the process table on most platforms. Workers
+            # inherit HEADROOM_JEV_* directly, so _proxy_config_from_env rebuilds
+            # the block from env instead of shipping the secret here.
+            continue
         value = _json_ready(getattr(config, field.name))
         try:
             json.dumps(value)
@@ -5648,6 +5656,8 @@ def _proxy_config_from_env() -> ProxyConfig:
                 from headroom.rollout import RolloutSnapshot
 
                 values["rollout"] = RolloutSnapshot.from_internal_dict(rollout_value)
+            # Rebuilt from env, never from the payload — see _proxy_config_payload.
+            values["jev"] = JevConfig.from_env()
             return ProxyConfig(**values)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
@@ -5719,6 +5729,7 @@ def _proxy_config_from_env() -> ProxyConfig:
             os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
             os.environ.get("HEADROOM_MODEL_ROUTES"),
         ),
+        jev=JevConfig.from_env(),
     )
 
 
@@ -6468,6 +6479,7 @@ if __name__ == "__main__":
         force_kompress_all=force_kompress_all,
         lossless=lossless,
         compress_passthrough=compress_passthrough,
+        jev=JevConfig.from_env(),
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
