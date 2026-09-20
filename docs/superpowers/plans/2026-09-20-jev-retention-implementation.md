@@ -2092,8 +2092,8 @@ git commit -m "feat(jev): headroom_jev_events_total lifecycle counter"
 - Produces:
   - `headroom.proxy.jev.shadow.TRUNCATE_CHARS: int` = `400`
   - `headroom.proxy.jev.shadow.apply_decisions_to_copy(messages: list[dict[str, Any]], candidates: list[JevCandidate], decisions: dict[str, str]) -> list[dict[str, Any]]`
-  - `@dataclass(frozen=True) headroom.proxy.jev.shadow.JevShadowResult` with fields `ran: bool`, `reason: str`, `identity: JevTurnIdentity | None = None`, `candidates: int = 0`, `candidates_sent: int = 0`, `keep: int = 0`, `truncate: int = 0`, `drop: int = 0`, `tokens_headroom: int = 0`, `tokens_projected: int = 0`, `latency_ms: float = 0.0`, `error: str | None = None`; property `projected_savings: int`
-  - `headroom.proxy.jev.shadow.JevShadowRunner` with `__init__(self, config: JevConfig, *, client: JevClient | None = None, identity_store: JevIdentityStore | None = None, metrics: Any | None = None)`, property `enabled: bool`, `async maybe_run(self, *, provider: str, model: str, messages: list[dict[str, Any]], frozen_prefix: int, optimized_tokens: int, context_limit: int, session_id: str, count_text: Callable[[str], int], count_messages: Callable[[list[dict[str, Any]]], int], message_shape: str) -> JevShadowResult`, `async aclose(self) -> None`
+  - `@dataclass(frozen=True) headroom.proxy.jev.shadow.JevShadowResult` with fields `ran: bool`, `reason: str`, `identity: JevTurnIdentity | None = None`, `candidates: int = 0`, `candidates_sent: int = 0`, `keep: int = 0`, `truncate: int = 0`, `drop: int = 0`, `tokens_baseline: int = 0`, `tokens_headroom: int = 0`, `tokens_projected: int = 0`, `latency_ms: float = 0.0`, `error: str | None = None`; property `projected_savings: int`
+  - `headroom.proxy.jev.shadow.JevShadowRunner` with `__init__(self, config: JevConfig, *, client: JevClient | None = None, identity_store: JevIdentityStore | None = None, metrics: Any | None = None)`, property `enabled: bool`, `async maybe_run(self, *, provider: str, model: str, messages: list[dict[str, Any]], frozen_prefix: int, optimized_tokens: int, original_tokens: int = 0, context_limit: int, session_id: str, count_text: Callable[[str], int], count_messages: Callable[[list[dict[str, Any]]], int], message_shape: str) -> JevShadowResult`, `async aclose(self) -> None`
   - `headroom.proxy.server.HeadroomProxy.jev_shadow: JevShadowRunner`
 
 - [ ] **Step 1: Write the failing test**
@@ -2166,13 +2166,14 @@ def _messages() -> list[dict[str, object]]:
     ]
 
 
-async def _run(runner: JevShadowRunner, messages=None, optimized_tokens=900):
+async def _run(runner: JevShadowRunner, messages=None, optimized_tokens=900, original_tokens=0):
     return await runner.maybe_run(
         provider="openai",
         model="gpt-5.6",
         messages=_messages() if messages is None else messages,
         frozen_prefix=1,
         optimized_tokens=optimized_tokens,
+        original_tokens=original_tokens,
         context_limit=1000,
         session_id="sess-1",
         count_text=_count_text,
@@ -2218,6 +2219,17 @@ async def test_projection_is_recorded_and_messages_are_never_mutated() -> None:
     assert messages == before  # the forwarded list is untouched
     assert "shadow_call_attempted" in metrics.events
     assert "shadow_projected" in metrics.events
+
+
+async def test_the_pre_headroom_baseline_is_carried_through_for_the_dashboard() -> None:
+    # T0 is measured by the handler, not here; the runner's job is to report it
+    # beside its own TH/TP so /stats can show all three against one turn.
+    runner = JevShadowRunner(CONFIG, client=FakeClient(decision="drop"))
+    result = await _run(runner, original_tokens=4321)
+    assert result.ran is True
+    assert result.tokens_baseline == 4321
+    # It is a passthrough, never a substitute for the runner's own measurement.
+    assert result.tokens_headroom != 4321
 
 
 async def test_cooldown_blocks_the_next_turns_on_the_same_branch() -> None:
@@ -2376,6 +2388,11 @@ class JevShadowResult:
     keep: int = 0
     truncate: int = 0
     drop: int = 0
+    #: T0 -- the caller's pre-Headroom token count for this turn, passed
+    #: straight through so the /stats `jev` block can report Jev's numbers
+    #: against the same baseline the rest of the dashboard uses. 0 when the
+    #: call site could not supply one.
+    tokens_baseline: int = 0
     tokens_headroom: int = 0
     tokens_projected: int = 0
     latency_ms: float = 0.0
@@ -2479,6 +2496,9 @@ class JevShadowRunner:
         messages: list[dict[str, Any]],
         frozen_prefix: int,
         optimized_tokens: int,
+        # T0: the caller's pre-Headroom count, recorded as-is. Keyword-only with
+        # a default so a call site that has no baseline to offer simply omits it.
+        original_tokens: int = 0,
         context_limit: int,
         session_id: str,
         count_text: Callable[[str], int],
@@ -2630,6 +2650,7 @@ class JevShadowRunner:
             keep=tallies["keep"],
             truncate=tallies["truncate"],
             drop=tallies["drop"],
+            tokens_baseline=max(0, int(original_tokens or 0)),
             tokens_headroom=th,
             tokens_projected=tp,
             latency_ms=answer.latency_ms,
@@ -2681,7 +2702,7 @@ git commit -m "feat(jev): shadow lifecycle runner with threshold, cooldown and s
 **Interfaces:**
 - Consumes: `JevShadowRunner` / `JevShadowResult` (Task 8), `PrometheusMetrics.record_jev_event` (Task 7)
 - Produces:
-  - `headroom.proxy.jev.hook.run_jev_shadow_hook(proxy: Any, *, provider: str, model: str, messages: list[dict[str, Any]] | None, frozen_prefix: int, optimized_tokens: int, session_id: str, tokenizer: Any, message_shape: str, request_id: str, context_limit_source: Any) -> JevShadowResult | None` — a coroutine that **never raises**; returns `None` when Jev is off or anything at all goes wrong, recording `shadow_fail_open` in that case
+  - `headroom.proxy.jev.hook.run_jev_shadow_hook(proxy: Any, *, provider: str, model: str, messages: list[dict[str, Any]] | None, frozen_prefix: int, optimized_tokens: int, original_tokens: int = 0, session_id: str, tokenizer: Any, message_shape: str, request_id: str, context_limit_source: Any) -> JevShadowResult | None` — a coroutine that **never raises**; returns `None` when Jev is off or anything at all goes wrong, recording `shadow_fail_open` in that case
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2738,6 +2759,7 @@ async def _call(proxy: FakeProxy, limit_source: Any) -> JevShadowResult | None:
         messages=[{"role": "user", "content": "hi"}],
         frozen_prefix=0,
         optimized_tokens=10,
+        original_tokens=40,
         session_id="sess",
         tokenizer=FakeTokenizer(),
         message_shape="openai",
@@ -2769,6 +2791,27 @@ async def test_a_raising_context_limit_source_fails_open_with_a_metric() -> None
 
     assert await _call(proxy, FakeLimitSource(raises=True)) is None
     assert metrics.events == ["shadow_fail_open"]
+
+
+async def test_the_baseline_reaches_the_runner() -> None:
+    metrics = FakeMetrics()
+
+    class CapturingRunner:
+        enabled = True
+
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        async def maybe_run(self, **kwargs: Any) -> JevShadowResult:
+            self.kwargs = kwargs
+            return JevShadowResult(ran=False, reason="captured")
+
+    runner = CapturingRunner()
+    proxy = FakeProxy(runner, metrics)
+    assert (await _call(proxy, FakeLimitSource())).reason == "captured"
+    # T0 is only measurable at the handler, so the hook has to carry it.
+    assert runner.kwargs["original_tokens"] == 40
+    assert runner.kwargs["optimized_tokens"] == 10
 
 
 async def test_a_raising_runner_fails_open_with_a_metric() -> None:
@@ -2840,6 +2883,7 @@ async def run_jev_shadow_hook(
     messages: list[dict[str, Any]] | None,
     frozen_prefix: int,
     optimized_tokens: int,
+    original_tokens: int = 0,
     session_id: str,
     tokenizer: Any,
     message_shape: str,
@@ -2868,6 +2912,7 @@ async def run_jev_shadow_hook(
             messages=messages,
             frozen_prefix=max(0, int(frozen_prefix or 0)),
             optimized_tokens=max(0, int(optimized_tokens or 0)),
+            original_tokens=max(0, int(original_tokens or 0)),
             context_limit=context_limit,
             session_id=session_id,
             count_text=tokenizer.count_text,
@@ -2938,6 +2983,9 @@ def test_anthropic_messages_calls_the_shadow_hook() -> None:
     assert "run_jev_shadow_hook(" in source
     assert 'message_shape="anthropic"' in source
     assert "messages=optimized_messages" in source
+    # T0 for the /stats `jev` block: the baseline is in scope here and the
+    # hook is the only place it can be joined to Jev's own numbers.
+    assert "original_tokens=original_tokens" in source
 
 
 def test_openai_chat_calls_the_shadow_hook() -> None:
@@ -2945,6 +2993,7 @@ def test_openai_chat_calls_the_shadow_hook() -> None:
     assert "run_jev_shadow_hook(" in source
     assert 'message_shape="openai"' in source
     assert "messages=optimized_messages" in source
+    assert "original_tokens=original_tokens" in source
 
 
 def test_openai_responses_calls_the_shadow_hook_on_the_input_items() -> None:
@@ -2952,6 +3001,7 @@ def test_openai_responses_calls_the_shadow_hook_on_the_input_items() -> None:
     assert "run_jev_shadow_hook(" in source
     assert 'message_shape="openai_responses"' in source
     assert 'body.get("input")' in source
+    assert "original_tokens=original_tokens" in source
 
 
 def test_no_call_site_assigns_from_the_hook() -> None:
@@ -2999,6 +3049,7 @@ with:
                 messages=optimized_messages,
                 frozen_prefix=frozen_message_count,
                 optimized_tokens=optimized_tokens,
+                original_tokens=original_tokens,
                 session_id=session_id,
                 tokenizer=tokenizer,
                 message_shape="anthropic",
@@ -3031,6 +3082,7 @@ with:
             messages=optimized_messages,
             frozen_prefix=int(openai_frozen_count or 0),
             optimized_tokens=optimized_tokens,
+            original_tokens=original_tokens,
             session_id=openai_session_id,
             tokenizer=tokenizer,
             message_shape="openai",
@@ -3071,6 +3123,7 @@ with:
             messages=_jev_input if isinstance(_jev_input, list) else None,
             frozen_prefix=0,
             optimized_tokens=optimized_tokens,
+            original_tokens=original_tokens,
             session_id=_responses_session_id,
             tokenizer=tokenizer,
             message_shape="openai_responses",
@@ -4155,8 +4208,6 @@ git commit -m "feat(jev): apply retention decisions to chat, responses and anthr
   `headroom.tokenizers.get_tokenizer(model) -> TokenCounter` (exposes
   `count_text` / `count_messages`).
 - Produces:
-  - `JEV_ACTIVE_MAX_CANDIDATES: int = 32`
-  - `JEV_ACTIVE_MAX_STATE_TOKENS: int = 60_000`
   - `@dataclass(frozen=True) class JevActiveDecision` with `candidates: list[JevCandidate]`,
     `decisions: dict[str, str]`, `called: bool`, `error: str | None`, `latency_ms: float`
   - `async decide_active_retention(*, config: JevConfig, client: Any, messages: list[dict[str, Any]], frozen_prefix: int, model: str, session_id: str, branch_id: str, provider: str = "compress", message_shape: str = "openai") -> JevActiveDecision`
@@ -4165,6 +4216,14 @@ git commit -m "feat(jev): apply retention decisions to chat, responses and anthr
 No duplicated selection logic: the 6-message tail exclusion, the frozen-prefix rule, the
 `function_call_output` + `custom_tool_call_output` vocabulary and the token-accounting
 fix all stay in Track A's `candidates.py`.
+
+No mode-private request bounds either: `config.max_candidates`
+(`HEADROOM_JEV_MAX_CANDIDATES`) and `config.max_state_tokens`
+(`HEADROOM_JEV_MAX_STATE_TOKENS`) are documented in Task 29 as general operator
+controls, so active mode reads the configured values exactly as shadow mode
+does. An operator who wants a bigger episodic request at a compaction boundary
+raises those two knobs; a hard-coded active-only ceiling would silently discard
+what they configured.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4203,17 +4262,23 @@ class _FakeClient:
         return _FakeAnswer(decisions={cid: self.decision for cid in candidate_ids})
 
 
-def _config() -> JevConfig:
-    return JevConfig(
-        mode="active",
-        api_key="test-key",
-        endpoint="https://jev.example/v1/decide",
-        model="jev-test",
-        timeout_ms=500,
-        threshold_percent=80,
-        cooldown_turns=5,
-        max_candidate_tokens=4000,
-    )
+def _config(**overrides: Any) -> JevConfig:
+    values: dict[str, Any] = {
+        "mode": "active",
+        "api_key": "test-key",
+        "endpoint": "https://jev.example/v1/decide",
+        "model": "jev-test",
+        "timeout_ms": 500,
+        "threshold_percent": 80,
+        "cooldown_turns": 5,
+        "max_candidate_tokens": 4000,
+        # Active mode reads the SAME operator knobs shadow mode reads; these
+        # are set explicitly so the budget never silently trims this fixture.
+        "max_candidates": 12,
+        "max_state_tokens": 100_000,
+    }
+    values.update(overrides)
+    return JevConfig(**values)
 
 
 def _conversation() -> list[dict[str, Any]]:
@@ -4249,6 +4314,39 @@ async def test_candidates_are_selected_and_decided() -> None:
     assert sorted(client.calls[0]["questions"]) == sorted(
         c.candidate_id for c in decision.candidates
     )
+
+
+async def test_the_operator_configured_bounds_are_honored() -> None:
+    # HEADROOM_JEV_MAX_CANDIDATES / HEADROOM_JEV_MAX_STATE_TOKENS are documented
+    # as general operator controls, so active mode must not substitute a
+    # hard-coded ceiling of its own.
+    client = _FakeClient(decision="drop")
+    decision = await decide_active_retention(
+        config=_config(max_candidates=1),
+        client=client,
+        messages=_conversation(),
+        frozen_prefix=0,
+        model="gpt-4o",
+        session_id="s1",
+        branch_id="compress",
+    )
+    assert len(decision.candidates) == 1
+    assert len(client.calls[0]["ids"]) == 1
+
+    # A tiny measured state budget trims the request instead of ignoring it:
+    # nothing fits, so no call is made at all and every candidate is kept.
+    tiny = _FakeClient(decision="drop")
+    trimmed = await decide_active_retention(
+        config=_config(max_state_tokens=1),
+        client=tiny,
+        messages=_conversation(),
+        frozen_prefix=0,
+        model="gpt-4o",
+        session_id="s1",
+        branch_id="compress",
+    )
+    assert trimmed.candidates == []
+    assert tiny.calls == []
 
 
 async def test_no_candidates_makes_no_call() -> None:
@@ -4324,15 +4422,15 @@ from headroom.proxy.jev.request import (
 )
 from headroom.tokenizers import get_tokenizer
 
-#: Per-turn candidate bound. A compaction boundary is episodic, so the request
-#: can be larger than a shadow turn's — but it still has to stay one bounded
-#: call, not a scan of the whole transcript.
-JEV_ACTIVE_MAX_CANDIDATES = 32
-
-#: Hard ceiling on the MEASURED state size (Phase 0a found an estimated budget
-#: could re-trigger the exact `max_tokens_exceeded` error it was meant to
-#: prevent, which is why `enforce_state_budget` measures).
-JEV_ACTIVE_MAX_STATE_TOKENS = 60_000
+# Request bounds are operator configuration, not constants: `max_candidates`
+# (HEADROOM_JEV_MAX_CANDIDATES) and `max_state_tokens`
+# (HEADROOM_JEV_MAX_STATE_TOKENS) are read off `config` here exactly as the
+# shadow runner reads them. A compaction boundary is episodic and can justify a
+# larger request than an ordinary shadow turn -- but that is a decision the
+# operator makes by raising those knobs, not one this module makes by ignoring
+# them. `max_state_tokens` still bounds the MEASURED serialized request (Phase
+# 0a found an estimated budget could re-trigger the exact `max_tokens_exceeded`
+# error it was meant to prevent, which is why `enforce_state_budget` measures).
 
 
 @dataclass(frozen=True)
@@ -4369,7 +4467,7 @@ async def decide_active_retention(
         messages,
         frozen_prefix=frozen_prefix,
         count_text=tokenizer.count_text,
-        max_candidates=JEV_ACTIVE_MAX_CANDIDATES,
+        max_candidates=config.max_candidates,
     )
     if not candidates:
         return empty
@@ -4406,7 +4504,7 @@ async def decide_active_retention(
         count_text=tokenizer.count_text,
         make_payload=_make_payload,
         max_candidate_tokens=config.max_candidate_tokens,
-        max_state_tokens=JEV_ACTIVE_MAX_STATE_TOKENS,
+        max_state_tokens=config.max_state_tokens,
     )
     if not candidates:
         return empty
@@ -5475,17 +5573,22 @@ through, it fails on `assert state["message_shape"] == "anthropic"`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-No new module. This task is the Anthropic-shape coverage the design doc's Track B
-section requires, and it passes on the code Tasks 13-16 already wrote:
-`select_candidates` recognises `tool_result` blocks and records their `block_index`,
-`apply_retention` writes the marker into `blocks[block_index]["content"]` and leaves
-`type` / `tool_use_id` alone, and `run_jev_active_retention` passes `message_shape`
-straight through to `build_retention_state`.
+No new module, and no new production code: this task is the Anthropic-shape
+coverage the design doc's Track B section requires, and it is expected to pass on
+the code Tasks 13-16 already wrote. The three lines it depends on, each of which
+exists as written in this plan:
 
-If the test fails on the `state["message_shape"]` assertion, the fix is in
-`headroom/proxy/jev/active_hook.py`: `run_jev_active_retention` must forward its
-`message_shape` argument into `decide_active_retention(..., message_shape=message_shape)`
-rather than letting the default stand.
+1. `select_candidates` recognises `tool_result` blocks and records their
+   `block_index` (Task 5).
+2. `apply_retention` writes the marker into `blocks[block_index]["content"]` and
+   leaves `type` / `tool_use_id` alone (Task 14).
+3. `run_jev_active_retention` passes `message_shape=message_shape` into
+   `decide_active_retention`, which forwards it to `build_retention_state`
+   (Task 16, in the `decide_active_retention(...)` call inside its `try:` block).
+
+Verify all three before running the test; a failure on
+`assert state["message_shape"] == "anthropic"` means (3) regressed to the
+`"openai"` default and belongs in `headroom/proxy/jev/active_hook.py`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -5534,6 +5637,17 @@ git commit -m "test(jev): prove Anthropic-shaped boundary turns are retained and
 > already been decided in this process, ever" — a claim-once rule, because Codex
 > replays a boundary wholesale after a reconnect and the replayed bytes need not
 > be the bytes already staged in CCR.
+>
+> **The revision claim is process-wide, deliberately not per-connection.** The WS
+> handler mints `session_id = uuid.uuid4().hex` fresh for every accepted socket
+> (`headroom/proxy/handlers/openai.py:6773`), so a reconnect is by construction a
+> *new* session id. Keying the claim by `(session_id, previous_response_id)` would
+> therefore let exactly the case this gate exists for — the reconnect replay —
+> through as a second drop. The claim is keyed by `previous_response_id` alone,
+> which is a provider-assigned response id and unique to the branch point it
+> names, so it is stable across reconnects and cannot collide between unrelated
+> conversations. `session_id` is still required as turn identity (and is what CCR
+> binds to), but it is not part of the claim key.
 
 ### Task 20: Compaction-boundary detection
 
@@ -5545,7 +5659,9 @@ git commit -m "test(jev): prove Anthropic-shaped boundary turns are retained and
 - Consumes: nothing from Track A or B. Pure functions over an already-parsed WS frame dict.
 - Produces:
   - `COMPACTION_TRIGGER_ITEM_TYPE: str = "compaction_trigger"`
-  - `JEV_TOOL_OUTPUT_ITEM_TYPES: frozenset[str]` — `{"function_call_output", "custom_tool_call_output", "local_shell_call_output", "tool_search_output"}`
+  - `ADDITIONAL_TOOLS_ITEM_TYPE: str = "additional_tools"`, `CUSTOM_TOOL_CALL_ITEM_TYPE: str = "custom_tool_call"`
+  - `JEV_TOOL_OUTPUT_ITEM_TYPES: frozenset[str]` — the candidate **allowlist**: `{"function_call_output", "custom_tool_call_output", "local_shell_call_output", "tool_search_output"}`
+  - `JEV_COMPACTION_WIRE_ITEM_TYPES: frozenset[str]` — the full observed wire vocabulary (the allowlist plus `compaction_trigger`, `additional_tools`, `custom_tool_call`). This is the design doc's "item-type vocabulary must include" list, named once and kept **separate** from the allowlist: a type belonging to the vocabulary says Track C recognizes it, not that it may be dropped. `additional_tools` is a tool *carrier* (Task 22 reads the recovery tool out of it) and `custom_tool_call` is the *call* half of a tool pair; neither is ever a retention candidate.
   - `@dataclass(frozen=True) class JevCompactionBoundary` with fields `previous_response_id: str`, `trigger_index: int`, `candidate_index: int`, `item_count: int`
   - `unwrap_response_create(frame: Any) -> tuple[dict[str, Any] | None, bool]` — returns `(inner_response_payload, wrapped)`; `(None, False)` when the frame is not a Responses create frame
   - `detect_compaction_boundary(inner: Any) -> JevCompactionBoundary | None`
@@ -5566,6 +5682,11 @@ from __future__ import annotations
 from typing import Any
 
 from headroom.proxy.jev.compaction import (
+    ADDITIONAL_TOOLS_ITEM_TYPE,
+    COMPACTION_TRIGGER_ITEM_TYPE,
+    CUSTOM_TOOL_CALL_ITEM_TYPE,
+    JEV_COMPACTION_WIRE_ITEM_TYPES,
+    JEV_TOOL_OUTPUT_ITEM_TYPES,
     JevCompactionBoundary,
     detect_compaction_boundary,
     unwrap_response_create,
@@ -5674,6 +5795,22 @@ def test_carrier_and_call_items_do_not_block_detection() -> None:
     boundary = detect_compaction_boundary(inner)
     assert boundary is not None
     assert (boundary.candidate_index, boundary.trigger_index) == (2, 3)
+
+
+def test_the_wire_vocabulary_is_complete_and_wider_than_the_allowlist() -> None:
+    """The design doc names three types the original plan's vocabulary missed.
+
+    They are named here, in the vocabulary set -- and pointedly NOT in the
+    candidate allowlist, which is the set that licenses a drop.
+    """
+    for item_type in ("additional_tools", "custom_tool_call", "custom_tool_call_output"):
+        assert item_type in JEV_COMPACTION_WIRE_ITEM_TYPES
+    assert COMPACTION_TRIGGER_ITEM_TYPE in JEV_COMPACTION_WIRE_ITEM_TYPES
+    assert JEV_TOOL_OUTPUT_ITEM_TYPES < JEV_COMPACTION_WIRE_ITEM_TYPES
+    # A carrier item and a call item are never retention candidates.
+    assert ADDITIONAL_TOOLS_ITEM_TYPE not in JEV_TOOL_OUTPUT_ITEM_TYPES
+    assert CUSTOM_TOOL_CALL_ITEM_TYPE not in JEV_TOOL_OUTPUT_ITEM_TYPES
+    assert COMPACTION_TRIGGER_ITEM_TYPE not in JEV_TOOL_OUTPUT_ITEM_TYPES
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -5704,15 +5841,41 @@ from typing import Any
 
 COMPACTION_TRIGGER_ITEM_TYPE = "compaction_trigger"
 
-# Real wire item types. ``custom_tool_call_output`` is outside the vocabulary
-# the original plan (and its abandoned probe) assumed; Phase 0b observed it as
-# the type the boundary actually carries.
+#: Codex >= 0.149.0 carries tool definitions in an ``input`` item of this type
+#: rather than (only) a top-level ``tools`` array. Read by Task 22's
+#: ``has_recovery_tool``; never a retention candidate.
+ADDITIONAL_TOOLS_ITEM_TYPE = "additional_tools"
+
+#: The *call* half of a custom tool pair. Its output arrives separately as
+#: ``custom_tool_call_output``; the call item itself is never a candidate,
+#: because dropping a call while keeping its output breaks the pairing.
+CUSTOM_TOOL_CALL_ITEM_TYPE = "custom_tool_call"
+
+# Candidate ALLOWLIST: the item types whose body Track C may replace with a
+# retrieval marker. ``custom_tool_call_output`` is outside the vocabulary the
+# original plan (and its abandoned probe) assumed; Phase 0b observed it as the
+# type the boundary actually carries.
 JEV_TOOL_OUTPUT_ITEM_TYPES = frozenset(
     {
         "function_call_output",
         "custom_tool_call_output",
         "local_shell_call_output",
         "tool_search_output",
+    }
+)
+
+# The full wire vocabulary Track C recognizes at a boundary -- deliberately
+# WIDER than the allowlist above and deliberately a separate name. Membership
+# here means "this type is known and accounted for", not "this type may be
+# dropped": `additional_tools` is a tool carrier and `custom_tool_call` is a
+# call item, both of which must survive untouched. Having the two sets named
+# apart is what stops a future consumer from reaching for the allowlist when it
+# means the vocabulary.
+JEV_COMPACTION_WIRE_ITEM_TYPES = JEV_TOOL_OUTPUT_ITEM_TYPES | frozenset(
+    {
+        COMPACTION_TRIGGER_ITEM_TYPE,
+        ADDITIONAL_TOOLS_ITEM_TYPE,
+        CUSTOM_TOOL_CALL_ITEM_TYPE,
     }
 )
 
@@ -5821,7 +5984,7 @@ git commit -m "feat(jev): detect the Codex native compaction boundary on the WS 
 - Produces:
   - `@dataclass(frozen=True) class JevCompactionCandidate` with fields `candidate_id: str`, `item_index: int`, `item_type: str`, `call_id: str`, `output_field: str`, `output_text: str`, `content_sha256: str`, `estimated_tokens: int`
   - `extract_compaction_candidate(inner: Any, boundary: JevCompactionBoundary, *, max_candidate_bytes: int) -> JevCompactionCandidate | None`
-  - `replace_candidate_output(inner: Any, candidate: JevCompactionCandidate, replacement: str) -> bool` — mutates `inner` in place, returns `False` (no mutation) when the item no longer matches the extracted hash
+  - `replace_candidate_output(inner: Any, candidate: JevCompactionCandidate, replacement: str) -> bool` — mutates `inner` in place, returns `False` (no mutation) unless the item at that index still matches the extracted item type, `call_id`, body field and content hash
 
 - [ ] **Step 1: Write the failing test**
 
@@ -5912,6 +6075,24 @@ def test_replace_candidate_output_is_bound_to_the_extracted_hash() -> None:
     # The item no longer hashes to what was staged: refuse to touch it again.
     assert replace_candidate_output(inner, candidate, "[marker2]") is False
     assert inner["input"][0]["output"] == "[marker]"
+
+
+def test_replace_candidate_output_refuses_a_different_call_id() -> None:
+    # Same slot, same type, byte-identical body -- but a different call: the
+    # marker was staged under the first call's identity and must not be written
+    # over the second one's output.
+    inner = _inner()
+    boundary = detect_compaction_boundary(inner)
+    assert boundary is not None
+    candidate = extract_compaction_candidate(inner, boundary, max_candidate_bytes=0)
+    assert candidate is not None
+    inner["input"][0]["call_id"] = "call_10"
+    assert replace_candidate_output(inner, candidate, "[marker]") is False
+    assert inner["input"][0]["output"] == "stdout body"
+
+    inner["input"][0].pop("call_id")
+    assert replace_candidate_output(inner, candidate, "[marker]") is False
+    assert inner["input"][0]["output"] == "stdout body"
 
 
 def test_replace_candidate_output_refuses_a_reshaped_frame() -> None:
@@ -6022,10 +6203,13 @@ def replace_candidate_output(
     """Swap the candidate's body for ``replacement`` in place.
 
     Returns False -- changing nothing -- unless the item still sits at the same
-    index, still has the same type and body field, and still hashes to the
-    content that was staged in CCR. That binding is what stops a rewrite
-    between extraction and commit from replacing content whose original was
-    never stored.
+    index, still has the same type, the same ``call_id`` and the same body
+    field, and still hashes to the content that was staged in CCR. That binding
+    is what stops a rewrite between extraction and commit from replacing content
+    whose original was never stored. ``call_id`` is part of it because content
+    alone is not identity: two calls of the same tool can return byte-identical
+    output, and the marker staged under one call's identity must not land on the
+    other's slot.
     """
     if not isinstance(inner, dict):
         return False
@@ -6036,6 +6220,8 @@ def replace_candidate_output(
         return False
     item = items[candidate.item_index]
     if not isinstance(item, dict) or item.get("type") != candidate.item_type:
+        return False
+    if item.get("call_id") != candidate.call_id:
         return False
     found = _candidate_output_text(item)
     if found is None or found[0] != candidate.output_field:
@@ -6177,7 +6363,7 @@ def has_recovery_tool(inner: Any) -> bool:
     items = inner.get("input")
     if isinstance(items, list):
         for item in items:
-            if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            if not isinstance(item, dict) or item.get("type") != ADDITIONAL_TOOLS_ITEM_TYPE:
                 continue
             if any(_is_recovery_tool_name(name) for name in _tool_names(item.get("tools"))):
                 return True
@@ -6205,7 +6391,7 @@ git commit -m "feat(jev): gate compaction drops on an advertised headroom_retrie
 - Test: `tests/test_jev_compaction_decision.py`
 
 **Interfaces:**
-- Consumes: Track A's `JevClient.decide(state=, questions=, candidate_ids=) -> JevAnswer`. Track C reads **only** `JevAnswer.error` (falsy means usable) and `JevAnswer.decisions: dict[str, str]` mapping candidate id → `"keep" | "truncate" | "drop"`, both via `getattr`, so a Track A field rename degrades to keep instead of raising. Both a coroutine and a plain return from `decide` are accepted.
+- Consumes: Track A's `JevClient.decide(state=, questions=, candidate_ids=) -> JevAnswer`. Track C reads **only** `JevAnswer.error` (falsy means usable) and `JevAnswer.decisions: dict[str, str]` mapping candidate id → `"keep" | "truncate" | "drop"`, both via `getattr`, so a Track A field rename degrades to keep instead of raising. Both a coroutine and a plain return from `decide` are accepted, and `timeout_seconds` bounds **both**: an async `decide` is awaited under `asyncio.wait_for`, and a synchronous one is dispatched to the default executor and waited on under the same bound, so a blocking client can neither evade the timeout nor stall the WebSocket's event loop. (A blocking call cannot be cancelled, so its thread may finish after the bound expires; the result is discarded and the decision is already `keep`.)
 - Produces:
   - `JEV_DECISION_KEEP: str = "keep"`, `JEV_DECISION_DROP: str = "drop"`
   - `build_single_candidate_state(candidate: JevCompactionCandidate, boundary: JevCompactionBoundary, *, session_id: str, model: str | None, max_content_chars: int = 20000) -> dict[str, Any]`
@@ -6348,7 +6534,58 @@ async def test_slow_client_times_out_to_keep() -> None:
         )
         == JEV_DECISION_KEEP
     )
+
+
+async def test_a_slow_SYNCHRONOUS_client_also_times_out_and_never_blocks_the_loop() -> None:
+    # A blocking `decide` is inside the stated interface ("both a coroutine and
+    # a plain return are accepted"), and this runs on the WebSocket relay's
+    # event loop: calling it inline would freeze every other session for its
+    # whole duration and no timeout could fire. It must be offloaded.
+    candidate, boundary = _candidate_and_boundary()
+    started = asyncio.Event()
+
+    class _SlowSync:
+        def decide(self, *, state: Any, questions: Any, candidate_ids: Any) -> Any:
+            started.set()
+            time.sleep(1.0)
+            return _Answer(decisions={candidate.candidate_id: "drop"})
+
+    async def _heartbeat() -> int:
+        beats = 0
+        while not decided.done():
+            await asyncio.sleep(0.01)
+            beats += 1
+        return beats
+
+    decided = asyncio.ensure_future(
+        decide_single_candidate(
+            _SlowSync(), candidate, boundary, session_id="ws1", model=None, timeout_seconds=0.05
+        )
+    )
+    beats = await _heartbeat()
+    assert await decided == JEV_DECISION_KEEP
+    # The loop kept running while the blocking call sat in its worker thread.
+    assert started.is_set()
+    assert beats >= 2
+
+
+async def test_a_fast_synchronous_client_is_still_honored() -> None:
+    candidate, boundary = _candidate_and_boundary()
+
+    class _Sync:
+        def decide(self, *, state: Any, questions: Any, candidate_ids: Any) -> Any:
+            return _Answer(decisions={candidate.candidate_id: "drop"})
+
+    assert (
+        await decide_single_candidate(
+            _Sync(), candidate, boundary, session_id="ws1", model=None, timeout_seconds=5.0
+        )
+        == JEV_DECISION_DROP
+    )
 ```
+
+The new test needs `import time` beside the existing `import asyncio` at the top of
+the file.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -6377,6 +6614,7 @@ with a retrievable CCR marker.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 from typing import Any
@@ -6384,6 +6622,21 @@ from typing import Any
 from headroom.proxy.jev.compaction import JevCompactionBoundary, JevCompactionCandidate
 
 logger = logging.getLogger(__name__)
+
+
+def _returns_awaitable(decide: Any) -> bool:
+    """Whether ``decide`` can be awaited without first blocking the event loop.
+
+    Track A's ``JevClient.decide`` is a coroutine function, but the interface
+    also accepts a plain synchronous ``decide``, and the two have to be told
+    apart BEFORE the call: a blocking implementation gives nothing back to
+    inspect until it has already finished. ``__call__`` is checked too, so a
+    callable object wrapping a coroutine function is still recognized.
+    """
+    if inspect.iscoroutinefunction(decide):
+        return True
+    call = getattr(decide, "__call__", None)
+    return call is not None and inspect.iscoroutinefunction(call)
 
 JEV_DECISION_KEEP = "keep"
 JEV_DECISION_DROP = "drop"
@@ -6490,14 +6743,36 @@ async def decide_single_candidate(
         candidate, boundary, session_id=session_id, model=model
     )
     questions = build_single_candidate_question(candidate)
+    call = functools.partial(
+        client.decide,
+        state=state,
+        questions=questions,
+        candidate_ids=[candidate.candidate_id],
+    )
     try:
-        result = client.decide(
-            state=state,
-            questions=questions,
-            candidate_ids=[candidate.candidate_id],
-        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        if _returns_awaitable(client.decide):
+            # Async client: the call itself is cheap, the await is what waits.
+            result = await asyncio.wait_for(call(), timeout=timeout_seconds)
+        else:
+            # Synchronous client: `decide` blocks until it is finished, so
+            # calling it inline would block this WebSocket's event loop for its
+            # full duration and `timeout_seconds` could never fire. Run it in a
+            # worker thread and bound the WAIT instead. The thread may outlive
+            # the timeout -- a blocking call cannot be cancelled -- but the loop
+            # is free again the moment the bound expires, and this path is
+            # already committed to "keep" by then.
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, call), timeout=timeout_seconds
+            )
+        # A sync `decide` is still allowed to hand back an awaitable (a future
+        # or a coroutine from a wrapper): finish it inside what is LEFT of the
+        # same bound, never a second full timeout.
         if inspect.isawaitable(result):
-            result = await asyncio.wait_for(result, timeout=timeout_seconds)
+            result = await asyncio.wait_for(
+                result, timeout=max(0.0, deadline - loop.time())
+            )
     except (asyncio.TimeoutError, TimeoutError):
         logger.info(
             "jev compaction: decision timed out after %.2fs; keeping candidate",
@@ -6536,9 +6811,11 @@ git commit -m "feat(jev): ask one keep/drop question per Codex compaction bounda
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `class JevCompactionRevisionStore` with `__init__(self, max_entries: int = 512) -> None`, `claim(self, session_id: str, revision: str) -> bool` (True only the first time a `(session_id, revision)` pair is seen), `seen(self, session_id: str, revision: str) -> bool`.
+- Produces: `class JevCompactionRevisionStore` with `__init__(self, max_entries: int = 512) -> None`, `claim(self, revision: str) -> bool` (True only the first time a revision is seen in this process), `seen(self, revision: str) -> bool`.
 
-> **Why this is not Track A's `JevIdentityStore`:** the two answer different questions, so they are deliberately separate rather than duplicated. Track A's store answers *"is this still the latest revision on this branch"* — a newer revision supersedes an older one, which is the right rule for a shadow call that returns after the conversation moved on. The WS boundary needs *"has this `previous_response_id` already been decided in this process, ever"*: Codex replays a compaction wholesale after a reconnect, and the replayed frame's bytes need not be the bytes already staged in CCR, so a claim-once rule is the only safe one. The identities differ too — here the session is the WS connection's `session_id` (assigned at `headroom/proxy/handlers/openai.py:6774`) and the branch is the boundary's `previous_response_id`, neither of which Track A's HTTP-path store ever sees.
+> **Why this is not Track A's `JevIdentityStore`:** the two answer different questions, so they are deliberately separate rather than duplicated. Track A's store answers *"is this still the latest revision on this branch"* — a newer revision supersedes an older one, which is the right rule for a shadow call that returns after the conversation moved on. The WS boundary needs *"has this `previous_response_id` already been decided in this process, ever"*: Codex replays a compaction wholesale after a reconnect, and the replayed frame's bytes need not be the bytes already staged in CCR, so a claim-once rule is the only safe one. The identity differs too — the branch here is the boundary's `previous_response_id`, which Track A's HTTP-path store never sees.
+
+> **Why the key is the revision alone, with no session id in it:** the WS handler assigns `session_id = uuid.uuid4().hex` per accepted socket (`headroom/proxy/handlers/openai.py:6773`), so a reconnect *always* arrives under a new session id. A `(session_id, revision)` key would consequently never recognise a reconnect replay — the single case this store exists to catch. `previous_response_id` is assigned by the provider and names one branch point, so it is both stable across reconnects and unique across unrelated conversations; keying on it alone is what makes the replay stale. The cost of that choice is bounded and safe in one direction only: a false "already claimed" can at worst *skip* a retention opportunity (the original frame is forwarded untouched), never drop content twice.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6555,32 +6832,39 @@ from headroom.proxy.jev.compaction_state import JevCompactionRevisionStore
 
 def test_first_claim_wins_and_the_replay_is_stale() -> None:
     store = JevCompactionRevisionStore()
-    assert store.claim("ws1", "resp_abc") is True
-    assert store.seen("ws1", "resp_abc") is True
-    assert store.claim("ws1", "resp_abc") is False
+    assert store.claim("resp_abc") is True
+    assert store.seen("resp_abc") is True
+    assert store.claim("resp_abc") is False
 
 
-def test_sessions_and_revisions_are_independent() -> None:
+def test_a_reconnect_cannot_reclaim_the_same_revision() -> None:
+    # The WS handler mints a fresh uuid4 session id per socket, so a reconnect
+    # replay carries a NEW session id and the SAME previous_response_id. The
+    # store must still call it stale -- that is the whole point of this gate.
     store = JevCompactionRevisionStore()
-    assert store.claim("ws1", "resp_abc") is True
-    assert store.claim("ws2", "resp_abc") is True
-    assert store.claim("ws1", "resp_def") is True
+    assert store.claim("resp_abc") is True  # first connection
+    assert store.claim("resp_abc") is False  # reconnect replays the boundary
+
+
+def test_distinct_revisions_are_independent() -> None:
+    store = JevCompactionRevisionStore()
+    assert store.claim("resp_abc") is True
+    assert store.claim("resp_def") is True
 
 
 def test_empty_identity_never_claims() -> None:
     store = JevCompactionRevisionStore()
-    assert store.claim("", "resp_abc") is False
-    assert store.claim("ws1", "") is False
+    assert store.claim("") is False
 
 
 def test_store_is_bounded_and_evicts_oldest_first() -> None:
     store = JevCompactionRevisionStore(max_entries=2)
-    assert store.claim("ws1", "r1") is True
-    assert store.claim("ws1", "r2") is True
-    assert store.claim("ws1", "r3") is True
-    assert store.seen("ws1", "r1") is False
-    assert store.seen("ws1", "r2") is True
-    assert store.seen("ws1", "r3") is True
+    assert store.claim("r1") is True
+    assert store.claim("r2") is True
+    assert store.claim("r3") is True
+    assert store.seen("r1") is False
+    assert store.seen("r2") is True
+    assert store.seen("r3") is True
 
 
 def test_max_entries_must_be_positive() -> None:
@@ -6608,17 +6892,26 @@ from collections import OrderedDict
 class JevCompactionRevisionStore:
     """Remembers which compaction revisions this process already decided.
 
-    A boundary's revision is its ``previous_response_id`` within one WebSocket
-    session: it names the branch point the compaction hangs off. Codex retries a
-    turn -- and replays it wholesale after a reconnect -- against the same
-    anchor, so a second boundary carrying a revision already decided here is
-    stale: the candidate bytes it carries need not be the bytes staged in CCR
-    the first time. ``claim`` returns False for those and Track C keeps the
-    original.
+    A boundary's revision is its ``previous_response_id``: the provider-assigned
+    id of the response the compaction hangs off. Codex retries a turn -- and
+    replays it wholesale after a reconnect -- against the same anchor, so a
+    second boundary carrying a revision already decided here is stale: the
+    candidate bytes it carries need not be the bytes staged in CCR the first
+    time. ``claim`` returns False for those and Track C keeps the original.
 
-    In-process, bounded, and keyed by session: the fresh design's single-worker
-    scope means no cross-worker ledger is required. The bound is what keeps a
-    long-lived proxy from growing one entry per compaction forever.
+    The key is the revision ALONE. The WS handler assigns
+    ``session_id = uuid.uuid4().hex`` per accepted socket
+    (``headroom/proxy/handlers/openai.py:6773``), so a reconnect always carries a
+    new session id; including it in the key would make every reconnect replay
+    look fresh and defeat this gate. A provider response id already names one
+    branch point uniquely, so no session scoping is needed to keep unrelated
+    conversations apart.
+
+    In-process and bounded: the fresh design's single-worker scope means no
+    cross-worker ledger is required, and the bound is what keeps a long-lived
+    proxy from growing one entry per compaction forever. Eviction can only lose
+    the memory of an old claim, which costs a skipped-vs-repeated decision on a
+    boundary that is hours stale, never a double drop of live content.
     """
 
     def __init__(self, max_entries: int = 512) -> None:
@@ -6626,26 +6919,25 @@ class JevCompactionRevisionStore:
             raise ValueError("max_entries must be >= 1")
         self._max_entries = max_entries
         self._lock = threading.Lock()
-        self._claimed: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._claimed: OrderedDict[str, None] = OrderedDict()
 
-    def claim(self, session_id: str, revision: str) -> bool:
-        """Claim ``(session_id, revision)``; True only the first time."""
-        if not session_id or not revision:
+    def claim(self, revision: str) -> bool:
+        """Claim ``revision``; True only the first time this process sees it."""
+        if not revision:
             return False
-        key = (session_id, revision)
         with self._lock:
-            if key in self._claimed:
-                self._claimed.move_to_end(key)
+            if revision in self._claimed:
+                self._claimed.move_to_end(revision)
                 return False
-            self._claimed[key] = None
+            self._claimed[revision] = None
             while len(self._claimed) > self._max_entries:
                 self._claimed.popitem(last=False)
             return True
 
-    def seen(self, session_id: str, revision: str) -> bool:
+    def seen(self, revision: str) -> bool:
         """Whether this revision was already claimed (and not yet evicted)."""
         with self._lock:
-            return (session_id, revision) in self._claimed
+            return revision in self._claimed
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -6674,6 +6966,8 @@ git commit -m "feat(jev): add the in-process stale-revision gate for compaction 
   - `DEFAULT_JEV_COMPACTION_TIMEOUT_SECONDS: float = 5.0`
   - `resolve_jev_client(proxy: Any) -> Any | None`
   - `async apply_jev_compaction_boundary(raw_msg: str, *, jev_config: Any, client: Any | None, session_id: str, request_id: str, revisions: JevCompactionRevisionStore, metrics: Any = None, store: Any | None = None) -> tuple[str, str]` — returns `(frame_to_forward, reason)`. The frame is the **unchanged input string** for every reason except `"jev_compaction_dropped"`. Reasons: `jev_compaction_disabled`, `jev_compaction_not_json`, `jev_compaction_not_response_create`, `jev_compaction_no_boundary`, `jev_compaction_missing_identity`, `jev_compaction_stale_revision`, `jev_compaction_missing_recovery_tool`, `jev_compaction_no_candidate`, `jev_compaction_no_client`, `jev_compaction_keep`, `jev_compaction_ccr_failed`, `jev_compaction_dropped`, `jev_compaction_error`. Never raises.
+
+**Revision-claim ordering (the retry contract).** The revision is *checked* (`revisions.seen`) as soon as the boundary is recognized, so a known-stale replay costs nothing, but it is only *claimed* (`revisions.claim`) after the recovery-tool, candidate-size and client-presence gates pass — immediately before the Jev call. Those gates are transient: the same boundary retried a moment later may well advertise the tool or find the client attached, and burning the claim on them would turn a recoverable miss into a permanent one. Everything from the claim onwards is deliberately single-shot: a timeout, an ambiguous answer or a failed CCR commit all forward the original bytes, so a retry that is refused as stale loses an optimisation and never content — whereas a retry *after* a successful commit is exactly the double-drop this gate must prevent.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6813,11 +7107,50 @@ async def test_every_fail_open_gate_forwards_the_original_bytes() -> None:
     assert await _run(_frame(with_tool=False))[1] == "jev_compaction_missing_recovery_tool"
     assert await _run(raw, client=None) == (raw, "jev_compaction_no_client")
 
-    # Stale revision: the same (session, previous_response_id) twice.
+    # Stale revision: the same previous_response_id twice.
     first_out, first_reason = await _run(raw, revisions=revisions)
     assert first_reason == "jev_compaction_dropped"
     assert first_out != raw
     assert await _run(raw, revisions=revisions) == (raw, "jev_compaction_stale_revision")
+
+
+async def test_a_reconnect_replay_is_stale_under_a_new_session_id() -> None:
+    # The WS handler mints a fresh uuid4 session id per socket, so a reconnect
+    # replay of the same boundary arrives with a DIFFERENT session_id and the
+    # same previous_response_id. It must not be dropped a second time.
+    raw = _frame()
+    revisions = JevCompactionRevisionStore()
+    _out, reason = await _run(raw, session_id="ws-connection-1", revisions=revisions)
+    assert reason == "jev_compaction_dropped"
+    assert await _run(raw, session_id="ws-connection-2", revisions=revisions) == (
+        raw,
+        "jev_compaction_stale_revision",
+    )
+
+
+async def test_a_gate_before_the_decision_does_not_burn_the_revision() -> None:
+    # A missing recovery tool, an oversized candidate or a momentarily absent
+    # client are all transient: nothing was decided and nothing reached CCR, so
+    # the same boundary must still be decidable when it is retried.
+    revisions = JevCompactionRevisionStore()
+    raw = _frame()
+
+    assert (await _run(_frame(with_tool=False), revisions=revisions))[1] == (
+        "jev_compaction_missing_recovery_tool"
+    )
+    assert (
+        await _run(raw, jev_config=_Config(max_candidate_tokens=1), revisions=revisions)
+    ) == (raw, "jev_compaction_no_candidate")
+    assert await _run(raw, client=None, revisions=revisions) == (
+        raw,
+        "jev_compaction_no_client",
+    )
+    assert revisions.seen("resp_abc123") is False
+
+    out, reason = await _run(raw, revisions=revisions)
+    assert reason == "jev_compaction_dropped"
+    assert out != raw
+    assert revisions.seen("resp_abc123") is True
 
 
 async def test_candidate_over_the_token_ceiling_keeps() -> None:
@@ -7001,7 +7334,7 @@ async def apply_jev_compaction_boundary(
 
         _record_jev_event(metrics, "compaction_boundary_detected")
 
-        if not revisions.claim(session_id, boundary.previous_response_id):
+        if revisions.seen(boundary.previous_response_id):
             _record_jev_event(metrics, "compaction_stale_revision")
             return raw_msg, "jev_compaction_stale_revision"
 
@@ -7022,6 +7355,22 @@ async def apply_jev_compaction_boundary(
         if client is None:
             _record_jev_event(metrics, "compaction_no_client")
             return raw_msg, "jev_compaction_no_client"
+
+        # Claim the revision HERE: after every static gate, immediately before
+        # the first irreversible step. The gates above are properties of this
+        # frame and this process's current state (is the recovery tool
+        # advertised, does the candidate fit the ceiling, is a client attached),
+        # and every one of them can differ on a legitimate retry of the same
+        # boundary -- burning the claim on them would turn a transient miss into
+        # a permanent one. From this point on the claim IS spent whatever
+        # happens: a timeout, an ambiguous answer or a failed CCR commit all
+        # leave the original content on the wire, so a retry that skips
+        # straight to "keep" loses an optimisation, never content. Retrying a
+        # boundary whose CCR commit already succeeded is the case that must not
+        # happen, and it is on this side of the claim.
+        if not revisions.claim(boundary.previous_response_id):
+            _record_jev_event(metrics, "compaction_stale_revision")
+            return raw_msg, "jev_compaction_stale_revision"
 
         timeout_ms = float(getattr(jev_config, "timeout_ms", 0) or 0)
         decision = await decide_single_candidate(
@@ -7109,7 +7458,7 @@ git commit -m "feat(jev): orchestrate the compaction-boundary decision with fail
 
 **Interfaces:**
 - Consumes: `apply_jev_compaction_boundary`, `resolve_jev_client` (Task 25), `JevCompactionRevisionStore` (Task 24); the WS handler's in-scope `session_id` (`headroom/proxy/handlers/openai.py:6774`), `request_id` (`:6773`), `self.config.jev` (Track A), `self.metrics`.
-- Produces: `_JEV_COMPACTION_REVISIONS: JevCompactionRevisionStore` — module-level, process-wide, keyed by WS `session_id`, so concurrent sessions never share a claim.
+- Produces: `_JEV_COMPACTION_REVISIONS: JevCompactionRevisionStore` — module-level and process-wide, keyed by `previous_response_id` alone, so a boundary replayed on a *new* WebSocket connection (which always has a new `session_id`) is still recognized as already decided.
 
 The insertion point is deliberate: it runs **after** `_prepare_memory_frame` and **before** `_maybe_compress_response_create_frame`, so Jev sees and stages the original candidate body rather than an already-compressed marker, and Headroom's normal compression still runs over whatever survives.
 
@@ -7140,7 +7489,7 @@ def test_relay_loop_calls_the_jev_compaction_hook() -> None:
     assert "resolve_jev_client," in source
     assert re.search(
         r"_JEV_COMPACTION_REVISIONS\s*=\s*JevCompactionRevisionStore\(\)", source
-    ), "the revision store must be a module-level singleton keyed by WS session_id"
+    ), "the revision store must be a process-wide module-level singleton"
     assert source.count("await apply_jev_compaction_boundary(") >= 1
 
 
@@ -7193,9 +7542,11 @@ from headroom.proxy.jev.compaction_state import JevCompactionRevisionStore
 Add the singleton immediately after `_CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0` (line 110):
 
 ```python
-# Track C: compaction revisions already decided, keyed by (WS session_id,
-# previous_response_id). Module-level so it survives across frames of one
-# session; bounded so a long-lived proxy cannot grow it without limit.
+# Track C: compaction revisions already decided, keyed by
+# `previous_response_id`. Module-level so it survives both across frames of one
+# session and across reconnects -- the WS `session_id` is a fresh uuid4 per
+# socket, so it deliberately plays no part in the key. Bounded, so a long-lived
+# proxy cannot grow it without limit.
 _JEV_COMPACTION_REVISIONS = JevCompactionRevisionStore()
 ```
 
@@ -7265,7 +7616,7 @@ git commit -m "feat(jev): run the compaction-boundary hook on the Codex WS clien
 
 **Interfaces:**
 - Consumes: everything from Task 26, plus the first-frame branch's in-scope `body` and `first_msg_raw`.
-- Produces: no new Python symbols. Behavioral guarantee: a compaction boundary that arrives as the **first** frame of a WebSocket (the shape a reconnect replay produces) is handled identically to one mid-session, and the same `_JEV_COMPACTION_REVISIONS` store makes a replay across a reconnect stale rather than a second drop.
+- Produces: no new Python symbols. Behavioral guarantee: a compaction boundary that arrives as the **first** frame of a WebSocket (the shape a reconnect replay produces) is handled identically to one mid-session, and because both call sites share the one `_JEV_COMPACTION_REVISIONS` store — which is keyed by `previous_response_id` and not by the per-socket `session_id` — a replay across a reconnect is stale rather than a second drop. The wiring tests below are source assertions (the relay is a 2000-line closure with no seam); the *behavior* of that guarantee is covered at the hook level by `test_a_reconnect_replay_is_stale_under_a_new_session_id` in `tests/test_jev_compaction_hook.py`, which runs the same boundary under two different WS session ids.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -7320,8 +7671,10 @@ Replace the first-frame branch at `headroom/proxy/handlers/openai.py:7675-7684`:
                 first_msg_raw = await _prepare_memory_frame(body, first_msg_raw)
                 # Track C: a compaction boundary can also arrive as the FIRST
                 # frame of a connection -- that is the shape a reconnect replay
-                # produces. Same hook, same revision store, so a replayed
-                # boundary is stale rather than dropped twice.
+                # produces. Same hook, same process-wide revision store (keyed
+                # by previous_response_id, not by this socket's fresh uuid4
+                # session_id), so a replayed boundary is stale rather than
+                # dropped twice.
                 first_msg_raw, _jev_first_reason = await apply_jev_compaction_boundary(
                     first_msg_raw,
                     jev_config=getattr(self.config, "jev", None),
@@ -7373,7 +7726,10 @@ The path fails open — forwarding the client's original frame bytes byte for by
 - `HEADROOM_JEV_MODE` is not `active` (the default is `off`)
 - the frame is not a recognizable compaction boundary
 - no WebSocket session identity, or a revision (`previous_response_id`) this
-  process already decided (a retry or a reconnect replay)
+  process already decided — a retry, or a replay after a reconnect (the claim is
+  process-wide and not scoped to one connection, precisely so that a reconnect,
+  which always brings a new internal session id, cannot decide the same
+  boundary twice)
 - the frame does not advertise `headroom_retrieve`, so the model could not get
   the content back
 - the candidate exceeds `HEADROOM_JEV_MAX_CANDIDATE_TOKENS`
@@ -7412,6 +7768,8 @@ all three tracks at once.
 ### Task 28: `jev` accounting block on `/stats`
 
 **Files:**
+- Create: `headroom/proxy/jev/accounting.py` (the one recorder + error classifier
+  every track calls; no third ad-hoc copy)
 - Modify: `headroom/proxy/prometheus_metrics.py` (new `jev_totals` beside the
   `jev_events_by_event` counter added in Task 7; `reset_runtime`; two new methods
   beside `record_jev_event`)
@@ -7419,6 +7777,10 @@ all three tracks at once.
   call-error paths — Task 8)
 - Modify: `headroom/proxy/jev/active_hook.py` (record accounting on the applied,
   call-failed and no-lease paths — Task 16)
+- Modify: `headroom/proxy/jev/compaction_decision.py` (record the call outcome —
+  the only place that can tell a Track C timeout from a rejection, Task 23)
+- Modify: `headroom/proxy/jev/compaction_hook.py` (record Track C's candidate,
+  decision and CCR accounting — Task 25)
 - Modify: `headroom/proxy/server.py:4770-4776` (`_build_stats_payload`, immediately
   after the existing `"compression": {...}` block and before `"compression_cache"`)
 - Test: `tests/test_jev_stats_block.py`
@@ -7428,13 +7790,56 @@ all three tracks at once.
   `JevShadowRunner` (Task 8), `run_jev_active_retention` (Task 16),
   `JevConfig.redacted()` (Task 1).
 - Produces:
+  - `headroom.proxy.jev.accounting.record_jev_accounting(metrics: Any, **fields: int) -> None`
+    — probes `metrics.record_jev_accounting` with `getattr` and swallows everything;
+    accounting never fails a turn
+  - `headroom.proxy.jev.accounting.classify_call_error(error: str | None) -> str | None`
+    — `"calls_timed_out"`, `"calls_rejected"`, or `None` when there was no error
   - `headroom.proxy.prometheus_metrics.JEV_ACCOUNTING_FIELDS: tuple[str, ...]`
   - `PrometheusMetrics.jev_totals: dict[str, int]`
   - `PrometheusMetrics.record_jev_accounting(self, **fields: int) -> None` — adds
     integer totals, ignores unknown keys, guarded by `_obs_counter_lock`
   - `PrometheusMetrics.jev_snapshot(self) -> dict[str, Any]` — the totals plus the
-    derived `projected_savings` (`TH - TP`) and the per-event counts
+    derived `projected_savings` (`TH - TP`), `realized_savings` (`TH - TF` on the
+    turns active retention actually changed) and the per-event counts
   - `GET /stats` gains a `jev` block: the snapshot plus `"config": config.jev.redacted()`
+
+**The four token letters, and where each comes from.** The design doc's
+"Dashboard and Metrics" section names `T0` (pre-Headroom), `TH` (post-Headroom),
+`TF` (post-active-retention, measured) and `TP` (shadow projection). All four are
+reported, and the two savings numbers are derived from disjoint pairs so a
+projection can never be mistaken for a realized saving:
+
+| Field | Letter | Recorded by | Meaning |
+|-------|--------|-------------|---------|
+| `tokens_baseline` | `T0` | shadow hook (Tasks 8–10) | the caller's tokens before Headroom compressed anything |
+| `tokens_headroom` | `TH` | shadow runner | post-Headroom tokens on the turns Jev was asked about |
+| `tokens_projected` | `TP` | shadow runner | what those turns WOULD have cost had the answer been applied |
+| `tokens_active_baseline` | `TH` | active hook (B), boundary hook (C) | post-Headroom tokens for the content active retention actually decided on |
+| `tokens_final` | `TF` | active hook (B), boundary hook (C) | measured tokens for that same content after retention was applied |
+
+`projected_savings = tokens_headroom - tokens_projected` and
+`realized_savings = tokens_active_baseline - tokens_final`. `tokens_final` never
+appears without its own baseline, which is the whole reason
+`tokens_active_baseline` exists as a separate field from `tokens_headroom`: TH as
+measured on shadow turns is not a baseline for the different turns active
+retention ran on. Track B records both over the whole message list; Track C
+records both over the one candidate it decided about (its frame-level totals are
+already accounted for by the existing WS usage path), which keeps the subtraction
+meaningful in both cases.
+
+**Call outcomes.** `calls_attempted` counts every call started;
+`calls_completed`, `calls_timed_out` and `calls_rejected` partition the ones that
+finished, and `calls_failed` is the sum of the last two (kept as its own field so
+an operator can alert on "any failure" without adding two series).
+`classify_call_error` is the single place the distinction is drawn, from the error
+string Track A's client already produces (`"ReadTimeout: …"` and friends).
+
+**CCR accounting.** `ccr_staged` counts staging attempts, `ccr_acknowledged`
+counts the ones that came back with a lease — which, per Task 13, means the write
+was read back and verified — and `ccr_failed` counts the rest. A gap between
+staged and acknowledged is exactly the signal that a CCR backend is quietly
+dropping writes.
 
 `/stats-history` is deliberately NOT extended. It is the durable realized-savings
 series, and the design doc requires `TP` to be "reported separately, never added to
@@ -7476,6 +7881,81 @@ def test_record_jev_accounting_sums_known_fields_and_ignores_the_rest() -> None:
     assert "not_a_field" not in snapshot
 
 
+def test_every_design_doc_accounting_field_is_reported() -> None:
+    # The design doc's "Dashboard and Metrics" list, field by field: T0/TH/TF/TP,
+    # calls attempted/completed/timed out/rejected, candidate count and tokens,
+    # keep/truncate/drop, and CCR staged/acknowledged/failed.
+    snapshot = PrometheusMetrics().jev_snapshot()
+    for field in (
+        "tokens_baseline",
+        "tokens_headroom",
+        "tokens_projected",
+        "tokens_active_baseline",
+        "tokens_final",
+        "calls_attempted",
+        "calls_completed",
+        "calls_timed_out",
+        "calls_rejected",
+        "calls_failed",
+        "candidates",
+        "candidate_tokens",
+        "keep",
+        "truncate",
+        "drop",
+        "ccr_staged",
+        "ccr_acknowledged",
+        "ccr_failed",
+        "fallbacks",
+        "projected_savings",
+        "realized_savings",
+    ):
+        assert snapshot[field] == 0, f"{field} must be present and zeroed from the start"
+
+
+def test_realized_and_projected_savings_come_from_disjoint_pairs() -> None:
+    metrics = PrometheusMetrics()
+    # A shadow turn: TH/TP only.
+    metrics.record_jev_accounting(tokens_headroom=1000, tokens_projected=600)
+    # An active turn: its own TH baseline and the measured TF.
+    metrics.record_jev_accounting(tokens_active_baseline=2000, tokens_final=1200)
+
+    snapshot = metrics.jev_snapshot()
+    assert snapshot["projected_savings"] == 400
+    assert snapshot["realized_savings"] == 800  # never 400 + 800, never 1400
+
+
+def test_call_errors_are_classified_once_for_every_track() -> None:
+    from headroom.proxy.jev.accounting import classify_call_error
+
+    assert classify_call_error("ReadTimeout: timed out") == "calls_timed_out"
+    assert classify_call_error("TimeoutError: ") == "calls_timed_out"
+    assert classify_call_error("HTTP 401: invalid api key") == "calls_rejected"
+    assert classify_call_error("max_tokens_exceeded") == "calls_rejected"
+    assert classify_call_error(None) is None
+    assert classify_call_error("") is None
+
+
+def test_record_jev_accounting_helper_tolerates_a_metricsless_proxy() -> None:
+    from headroom.proxy.jev.accounting import record_jev_accounting
+
+    class _Exploding:
+        def record_jev_accounting(self, **fields: int) -> None:
+            raise RuntimeError("counter blew up")
+
+    record_jev_accounting(None, calls_attempted=1)  # must not raise
+    record_jev_accounting(object(), calls_attempted=1)  # no recorder at all
+    record_jev_accounting(_Exploding(), calls_attempted=1)
+
+
+async def test_metrics_export_carries_the_accounting_totals() -> None:
+    metrics = PrometheusMetrics()
+    metrics.record_jev_accounting(drop=3, calls_timed_out=1)
+    export = await metrics.export()
+    assert 'headroom_jev_accounting_total{field="drop"} 3' in export
+    assert 'headroom_jev_accounting_total{field="calls_timed_out"} 1' in export
+    assert 'headroom_jev_accounting_total{field="keep"} 0' in export
+
+
 def test_jev_snapshot_carries_the_event_buckets() -> None:
     metrics = PrometheusMetrics()
     metrics.record_jev_event("shadow_projected")
@@ -7506,14 +7986,19 @@ def test_stats_exposes_a_redacted_jev_block() -> None:
             calls_attempted=1,
             calls_completed=1,
             drop=3,
+            tokens_baseline=4000,
             tokens_headroom=1000,
             tokens_projected=750,
+            ccr_staged=3,
+            ccr_acknowledged=3,
         )
         payload = client.get("/stats").json()
 
     jev = payload["jev"]
     assert jev["calls_attempted"] == 1
     assert jev["drop"] == 3
+    assert jev["tokens_baseline"] == 4000
+    assert jev["ccr_acknowledged"] == 3
     assert jev["projected_savings"] == 250
     assert jev["config"]["mode"] == "shadow"
     assert jev["config"]["model"] == "jev-test"
@@ -7538,19 +8023,33 @@ constants, add:
 #: added as a new key nobody reads, and a dashboard can rely on every field
 #: being present (zero-valued) from the first request.
 JEV_ACCOUNTING_FIELDS: tuple[str, ...] = (
+    # Call outcomes. `calls_completed` + `calls_timed_out` + `calls_rejected`
+    # partition the calls that finished; `calls_failed` is the sum of the last
+    # two, kept as its own field so "any failure" is one series to alert on.
     "calls_attempted",
     "calls_completed",
     "calls_failed",
+    "calls_timed_out",
+    "calls_rejected",
+    # Candidate volume.
     "candidates",
     "candidates_sent",
     "candidate_tokens",
+    # Answers.
     "keep",
     "truncate",
     "drop",
+    # Token accounting: T0 / TH / TP for the shadow projection, and the
+    # separate TH/TF pair for what active retention really changed. See the
+    # table in this task's Interfaces section.
+    "tokens_baseline",
     "tokens_headroom",
     "tokens_projected",
+    "tokens_active_baseline",
     "tokens_final",
+    # CCR: acknowledged means a verified read-back and a lease (Task 13).
     "ccr_staged",
+    "ccr_acknowledged",
     "ccr_failed",
     "fallbacks",
 )
@@ -7592,11 +8091,18 @@ Immediately after `record_jev_event` (added in Task 7), add:
                     continue
 
     def jev_snapshot(self) -> dict[str, Any]:
-        """Totals for the ``/stats`` ``jev`` block, plus the derived projection.
+        """Totals for the ``/stats`` ``jev`` block, plus the two derived savings.
 
-        ``projected_savings`` is ``TH - TP`` — Track A's shadow projection. It
-        is reported here and only here: the design doc requires it to stay out
-        of the realized savings the ledger and /stats-history persist.
+        ``projected_savings`` is ``TH - TP`` — Track A's shadow projection, what
+        active mode *would* have saved on the turns it was asked about. It is
+        reported here and only here: the design doc requires it to stay out of
+        the realized savings the ledger and /stats-history persist.
+
+        ``realized_savings`` is ``TH - TF`` measured on the content active
+        retention actually rewrote (``tokens_active_baseline`` against
+        ``tokens_final``). The two pairs never mix: a projection and a
+        measurement are different claims about different turns, and adding them
+        would overstate both.
         """
         with self._obs_counter_lock:
             totals: dict[str, Any] = {
@@ -7606,19 +8112,74 @@ Immediately after `record_jev_event` (added in Task 7), add:
         totals["projected_savings"] = max(
             0, totals["tokens_headroom"] - totals["tokens_projected"]
         )
+        totals["realized_savings"] = max(
+            0, totals["tokens_active_baseline"] - totals["tokens_final"]
+        )
         totals["events"] = events
         return totals
 ```
 
+Create `headroom/proxy/jev/accounting.py` — one recorder and one error
+classifier, so the three tracks cannot drift into three slightly different
+definitions of "a failed call":
+
+```python
+"""The single accounting recorder every Jev track reports through."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+#: Error-string fragments Track A's client produces for a call that ran out of
+#: time rather than one the service refused. `JevClient.decide` formats every
+#: failure as `f"{type(exc).__name__}: {exc}"` (Task 4), so httpx's
+#: `ReadTimeout` / `ConnectTimeout` / `PoolTimeout` and asyncio's `TimeoutError`
+#: all land here.
+_TIMEOUT_MARKERS = ("timeout", "timedout")
+
+
+def classify_call_error(error: str | None) -> str | None:
+    """Return the accounting field one call error belongs in, or None.
+
+    A timeout and a rejection are operationally different problems -- one says
+    the bound is too tight or the service is slow, the other says the request
+    or the credentials were refused -- and the design doc asks for both. They
+    are told apart here, once, from the error string the client already built.
+    """
+    if not error:
+        return None
+    lowered = str(error).lower().replace("_", "")
+    if any(marker in lowered for marker in _TIMEOUT_MARKERS):
+        return "calls_timed_out"
+    return "calls_rejected"
+
+
+def record_jev_accounting(metrics: Any, **fields: int) -> None:
+    """Add totals to ``metrics`` if it can take them. Never raises.
+
+    ``metrics`` may be ``None``, or an object from a Headroom build that
+    predates ``record_jev_accounting``; either way a missing counter costs a
+    number on a dashboard, never a turn.
+    """
+    recorder = getattr(metrics, "record_jev_accounting", None)
+    if recorder is None:
+        return
+    try:
+        recorder(**fields)
+    except Exception:  # noqa: BLE001 - accounting never fails a turn
+        logger.debug("jev: accounting not recorded")
+```
+
 In `headroom/proxy/jev/shadow.py`, add a recorder beside `_record` on
-`JevShadowRunner`:
+`JevShadowRunner` (importing `classify_call_error` and `record_jev_accounting`
+from `headroom.proxy.jev.accounting`):
 
 ```python
     def _record_accounting(self, **fields: int) -> None:
-        if self._metrics is None:
-            return
-        with contextlib.suppress(Exception):
-            self._metrics.record_jev_accounting(**fields)
+        record_jev_accounting(self._metrics, **fields)
 ```
 
 In `JevShadowRunner.maybe_run`, in the `answer.error is not None` branch, immediately
@@ -7631,6 +8192,9 @@ before the `return self._skip("call_error", ...)`, add:
                 fallbacks=1,
                 candidates=len(eligible),
                 candidates_sent=len(sent),
+                # A timeout and a refusal are different operational problems;
+                # `calls_failed` stays the sum so one series still covers both.
+                **{classify_call_error(answer.error) or "calls_rejected": 1},
             )
 ```
 
@@ -7646,6 +8210,9 @@ and immediately after `self._record("shadow_projected")`, add:
             keep=tallies["keep"],
             truncate=tallies["truncate"],
             drop=tallies["drop"],
+            # T0 as the caller measured it, TH and TP as this turn measured
+            # them. TP is a projection and is kept away from tokens_final.
+            tokens_baseline=max(0, int(original_tokens or 0)),
             tokens_headroom=th,
             tokens_projected=tp,
         )
@@ -7655,14 +8222,7 @@ In `headroom/proxy/jev/active_hook.py`, add beside `_record`:
 
 ```python
 def _record_accounting(proxy: Any, **fields: int) -> None:
-    metrics = getattr(proxy, "metrics", None)
-    recorder = getattr(metrics, "record_jev_accounting", None)
-    if recorder is None:
-        return
-    try:
-        recorder(**fields)
-    except Exception:  # noqa: BLE001 - accounting never fails a turn
-        logger.debug("jev active retention: accounting not recorded")
+    record_jev_accounting(getattr(proxy, "metrics", None), **fields)
 ```
 
 and, in `run_jev_active_retention`, immediately before the `return _noop("call_failed")`:
@@ -7674,6 +8234,7 @@ and, in `run_jev_active_retention`, immediately before the `return _noop("call_f
                 calls_failed=1,
                 fallbacks=1,
                 candidates=len(decision.candidates),
+                **{classify_call_error(decision.error) or "calls_rejected": 1},
             )
 ```
 
@@ -7685,6 +8246,14 @@ and immediately after `_record(proxy, "active_applied")`:
             decided = decision.decisions.get(cid, "keep")
             if decided in tallies:
                 tallies[decided] += 1
+        # TF needs its own TH or it says nothing: measure the SAME message list
+        # the same way, before retention was applied, and report the pair.
+        tokens_active_baseline = count_messages_corrected(
+            messages,
+            count_messages=tokenizer.count_messages,
+            count_text=tokenizer.count_text,
+        )
+        staged = len(decision.candidates) - tallies["keep"]
         _record_accounting(
             proxy,
             calls_attempted=1,
@@ -7695,11 +8264,86 @@ and immediately after `_record(proxy, "active_applied")`:
             keep=tallies["keep"],
             truncate=tallies["truncate"],
             drop=tallies["drop"],
+            tokens_active_baseline=tokens_active_baseline,
             tokens_final=tokens_after,
-            ccr_staged=len(leases),
-            ccr_failed=max(0, len(decision.candidates) - tallies["keep"] - len(leases)),
+            # `ccr_staged` counts attempts; a lease is Task 13's proof that the
+            # write was read back and verified, so it is what `acknowledged`
+            # means. The gap between the two is the signal that a CCR backend is
+            # quietly losing writes.
+            ccr_staged=max(0, staged),
+            ccr_acknowledged=len(leases),
+            ccr_failed=max(0, staged - len(leases)),
         )
 ```
+
+In `headroom/proxy/jev/compaction_decision.py` (Track C), record the call outcome
+inside `decide_single_candidate` — it is the only place that can tell a timeout
+from a rejection, because the function deliberately returns a bare
+`"keep"`/`"drop"` and throws the reason away. Add a keyword-only
+`metrics: Any = None` parameter, then: `record_jev_accounting(metrics,
+calls_attempted=1)` before the call; `calls_timed_out=1, calls_failed=1,
+fallbacks=1` in the `TimeoutError` handler; `calls_rejected=1, calls_failed=1,
+fallbacks=1` in the general `except`; and, once an answer is in hand,
+`calls_completed=1` when `getattr(answer, "error", None)` is falsy or
+`calls_rejected=1, calls_failed=1` when it is not.
+
+In `headroom/proxy/jev/compaction_hook.py` (Track C), import
+`record_jev_accounting` from `headroom.proxy.jev.accounting`, pass
+`metrics=metrics` into `decide_single_candidate`, and record the candidate,
+decision and CCR numbers around it. The block below goes immediately before the
+`return rewritten, "jev_compaction_dropped"` (the only exit where a rewrite
+actually happened, so `lease` is in hand):
+
+```python
+        # Track C decides about ONE candidate, so its baseline/final pair is
+        # candidate-scoped rather than turn-scoped: the frame's own totals are
+        # already accounted for by the existing WS usage path, and subtracting
+        # a whole-frame TF from a candidate-sized TH would be meaningless.
+        marker_tokens = max(1, len(lease.marker) // 4)
+        record_jev_accounting(
+            metrics,
+            candidates=1,
+            candidates_sent=1,
+            candidate_tokens=candidate.estimated_tokens,
+            drop=1,
+            ccr_staged=1,
+            ccr_acknowledged=1,
+            tokens_active_baseline=candidate.estimated_tokens,
+            tokens_final=marker_tokens,
+        )
+```
+
+with the matching one-liners on the other two exits: `keep=1` (plus
+`candidates`/`candidates_sent`/`candidate_tokens`) on the keep path, and
+`ccr_staged=1, ccr_failed=1` on the `jev_compaction_ccr_failed` path.
+
+In `PrometheusMetrics.export`, beside the `headroom_jev_events_total{event=...}`
+series Task 7 added, emit the totals as well so the design doc's `/metrics`
+requirement is met by the same numbers `/stats` reports:
+
+```python
+            # One series, one label — an operator graphs `drop` or
+            # `calls_timed_out` without Headroom minting a metric name per
+            # field, and a field added to JEV_ACCOUNTING_FIELDS appears here
+            # with no export change. Every field is emitted even at zero, so a
+            # dashboard panel exists from the first scrape.
+            lines.extend(
+                [
+                    "# HELP headroom_jev_accounting_total Jev retention accounting totals by field; token letters are T0=tokens_baseline, TH=tokens_headroom/tokens_active_baseline, TP=tokens_projected, TF=tokens_final",
+                    "# TYPE headroom_jev_accounting_total counter",
+                ]
+            )
+            for _field in JEV_ACCOUNTING_FIELDS:
+                lines.append(
+                    f'headroom_jev_accounting_total{{field="{_field}"}} '
+                    f"{int(jev_totals.get(_field, 0))}"
+                )
+            lines.append("")
+```
+
+taking `jev_totals` from the same `with self._obs_counter_lock:` block that
+already snapshots `jev_events_by_event` (`jev_totals = dict(self.jev_totals)`),
+so the export never reads the counters unlocked.
 
 In `headroom/proxy/server.py._build_stats_payload`, immediately after the
 `"compression": {...}` block (which ends at line 4776) and before
@@ -7719,13 +8363,13 @@ In `headroom/proxy/server.py._build_stats_payload`, immediately after the
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/test_jev_stats_block.py tests/test_jev_metrics.py tests/test_jev_shadow.py tests/test_jev_active_hook.py -q`
+Run: `uv run pytest tests/test_jev_stats_block.py tests/test_jev_metrics.py tests/test_jev_shadow.py tests/test_jev_active_hook.py tests/test_jev_compaction_decision.py tests/test_jev_compaction_hook.py -q`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add headroom/proxy/prometheus_metrics.py headroom/proxy/jev/shadow.py headroom/proxy/jev/active_hook.py headroom/proxy/server.py tests/test_jev_stats_block.py
+git add headroom/proxy/jev/accounting.py headroom/proxy/prometheus_metrics.py headroom/proxy/jev/shadow.py headroom/proxy/jev/active_hook.py headroom/proxy/jev/compaction_decision.py headroom/proxy/jev/compaction_hook.py headroom/proxy/server.py tests/test_jev_stats_block.py
 git commit -m "feat(jev): report the jev accounting block on /stats without leaking the key"
 ```
 
@@ -7836,8 +8480,8 @@ verbatim, can be truncated, or can be replaced by a retrievable CCR marker. It i
 | `HEADROOM_JEV_THRESHOLD_PERCENT` | Shadow mode only: skip the call until post-Headroom tokens reach this percentage of the model's context window. | `80` |
 | `HEADROOM_JEV_COOLDOWN_TURNS` | Shadow mode only: turns to wait before another call on the same session/branch. | `5` |
 | `HEADROOM_JEV_MAX_CANDIDATE_TOKENS` | Per-candidate ceiling on how much content is shown to Jev. | `20000` |
-| `HEADROOM_JEV_MAX_CANDIDATES` | Maximum candidates per call (oldest first). | `12` |
-| `HEADROOM_JEV_MAX_STATE_TOKENS` | Ceiling on the MEASURED serialized request. Jev rejects an oversized request outright, losing the whole call, so the request is trimmed until it really fits. | `8000` |
+| `HEADROOM_JEV_MAX_CANDIDATES` | Maximum candidates per call (oldest first). Applies in both `shadow` and `active` mode. | `12` |
+| `HEADROOM_JEV_MAX_STATE_TOKENS` | Ceiling on the MEASURED serialized request, in both `shadow` and `active` mode. Jev rejects an oversized request outright, losing the whole call, so the request is trimmed until it really fits. Raise this (with `HEADROOM_JEV_MAX_CANDIDATES`) if you want a bigger request at a compaction boundary. | `8000` |
 
 **What leaves this machine.** When the mode is not `off`, the content of eligible
 historical **tool results** (bounded by `HEADROOM_JEV_MAX_CANDIDATE_TOKENS`) plus
