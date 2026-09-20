@@ -1,0 +1,13 @@
+{
+  "name": "jev-plugin-compare",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "ONE-OFF Phase 0 comparison spike: fast-jev-compaction's core library vs Headroom on the Headroom benchmark corpus. Not production code. See compare.mjs.",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "setup": "node -e \"const p=require('./vendor-pin.json');const {execFileSync:x}=require('child_process');const r='vendor/fast-jev-compaction';const g=(...a)=>x('git',a,{stdio:'inherit'});require('fs').rmSync(r,{recursive:true,force:true});g('init','-q',r);g('-C',r,'remote','add','origin',p.repo);g('-C',r,'fetch','-q','--depth','1','origin',p.rev);g('-C',r,'checkout','-q',p.rev);require('fs').rmSync(r+'/.git',{recursive:true,force:true});require('fs').writeFileSync(r+'/.pinned-rev',p.rev+'\\n')\" && npm --prefix vendor/fast-jev-compaction install && npm --prefix vendor/fast-jev-compaction run build && npm run verify-vendor",
+    "verify-vendor": "node verify-vendor.mjs",
+    "dry-run": "bash run.sh --dry-run"
+  }
+}

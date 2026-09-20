@@ -20,10 +20,12 @@ What this script does NOT do:
 * No SSH tunnels, no second machine, no allowlisting/aggregation infrastructure.
   This is deliberately much simpler than the abandoned two-Mac
   ``benchmarks/codex_compaction_probe.py``.
-* No full message or tool content is recorded anywhere: only HTTP method, path,
-  top-level JSON keys, the ordered list of ``input``/``messages`` item *type*
-  values, and a handful of boolean compaction signals. Everything stays local
-  and in-memory; nothing is transmitted.
+* No full message or tool content is recorded anywhere: only the transport
+  (HTTP method, or the literal ``WS``), path, top-level JSON keys, the ordered
+  list of ``input``/``messages`` item *type* values, and a handful of boolean
+  compaction signals. Everything stays local and in-memory; nothing is
+  transmitted. WebSocket frames go through the same ``summarize_body`` path as
+  HTTP bodies, so the same no-content guarantee covers both transports.
 * It does not touch the user's Headroom configuration/state: the proxy runs with
   a private throwaway ``HEADROOM_WORKSPACE_DIR`` on an unused loopback port.
 
@@ -39,11 +41,27 @@ Caveats worth stating up front:
 * ``codex exec`` has no scriptable ``/compact`` command -- that slash command
   exists only in the interactive TUI. The only scriptable way to provoke native
   compaction is the ``model_auto_compact_token_limit`` config override, which
-  this probe sets low and then fills with large shell-output tool results.
-* The logging shim speaks HTTP only. Codex may try a WebSocket upgrade on
-  ``/v1/responses`` (Headroom's real proxy serves that route over WebSocket as
-  well); the shim refuses the upgrade so Codex falls back to HTTP, and the
-  report says how often that happened.
+  this probe sets low and then fills with large shell-output tool results. An
+  earlier run left this at the 20000 default and never crossed it, so native
+  auto-compaction never had a chance to fire; pass a low ``--auto-compact-limit``
+  (a few thousand) to actually exercise the boundary. That gap is closed.
+* The shim now relays WebSocket as well as HTTP. An earlier run refused Codex's
+  ``/v1/responses`` upgrade with 501 and only ever saw the HTTP fallback; the
+  shim now forwards the handshake to Headroom's real WebSocket route and pipes
+  frames in both directions, summarizing each client->proxy JSON frame through
+  the same recorder the HTTP side uses. That gap is closed. Frame reads carry
+  an absolute per-frame deadline (``WS_FRAME_TIMEOUT``) on top of the idle
+  socket clock, so a stalled or byte-trickling peer cannot pin a relay thread
+  or its sockets open for an unbounded time.
+* Still open: only the *client to proxy* direction is summarized, on both
+  transports. Server-sent event frames are relayed untouched and unrecorded, so
+  a compaction signal that exists only in a provider *response* would not be
+  seen here. Likewise this observes one Codex version, one model and one short
+  scripted session on one machine -- a negative result is evidence, not proof.
+* Still open: ``permessage-deflate`` WebSocket payloads are inflated with a
+  best-effort persistent inflater for logging only. If that decode ever fails
+  the frame is still relayed byte-for-byte, but it is reported as an
+  undecodable-frame note rather than a shape.
 
 Usage::
 
@@ -132,6 +150,25 @@ SHIM_CLIENT_TIMEOUT = 300.0
 # long run of real provider turns.
 MAX_TURNS = 10
 MAX_TURN_TIMEOUT = 1800.0
+
+# WebSocket relay tuning. The handshake is a normal HTTP round trip; the relay
+# that follows can idle for a whole model turn, so it gets a much longer clock
+# than SHIM_CLIENT_TIMEOUT allows for plain HTTP.
+WS_HANDSHAKE_TIMEOUT = 60.0
+WS_IDLE_TIMEOUT = 900.0
+# Absolute wall-clock budget for assembling ONE frame once its first header byte
+# has arrived. WS_IDLE_TIMEOUT is a per-recv idle clock and therefore resets on
+# every partial read, so on its own it lets a peer that trickles bytes hold a
+# frame read (and its socket) open indefinitely. This is a hard ceiling that
+# does not reset: a frame whose payload is still incomplete after this many
+# seconds aborts the relay. It only starts once the peer has begun a frame, so
+# a legitimately idle connection between turns is still governed by
+# WS_IDLE_TIMEOUT alone.
+WS_FRAME_TIMEOUT = 120.0
+WS_OPCODE_CONTINUATION = 0x0
+WS_OPCODE_TEXT = 0x1
+WS_OPCODE_BINARY = 0x2
+WS_OPCODE_CLOSE = 0x8
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +394,237 @@ def summarize_body(
 
 
 # ---------------------------------------------------------------------------
+# WebSocket frame plumbing (RFC 6455) -- relay only, never rewrite
+# ---------------------------------------------------------------------------
+
+
+def _ws_unmask(payload: bytes, key: bytes) -> bytes:
+    """XOR-unmask a client frame payload. Returns a *copy*; the wire bytes that
+    get forwarded upstream are always the original masked ones."""
+    if not payload or not key:
+        return payload
+    repeated = (key * (len(payload) // len(key) + 1))[: len(payload)]
+    return (int.from_bytes(payload, "big") ^ int.from_bytes(repeated, "big")).to_bytes(
+        len(payload), "big"
+    )
+
+
+def _read_exact(
+    reader: Any,
+    count: int,
+    *,
+    deadline: float | None = None,
+    sock: socket.socket | None = None,
+) -> bytes:
+    """Read exactly ``count`` bytes from a buffered reader, or raise.
+
+    ``deadline`` is an absolute ``time.monotonic()`` instant. Unlike a socket
+    timeout -- which is an *idle* clock and resets on every partial recv -- this
+    ceiling does not move, so a peer trickling one byte at a time cannot keep a
+    single frame read (and its socket) open beyond the budget. When ``sock`` is
+    given its timeout is also clamped to the time remaining, so no individual
+    blocking read can overshoot the deadline either.
+    """
+    if count == 0:
+        return b""
+    # ``read1`` returns as soon as *any* buffered/available bytes exist, at most
+    # one underlying recv. Plain ``read(n)`` would block inside the buffered
+    # reader until all n bytes arrived, which would hide the deadline check
+    # below entirely -- a peer trickling one byte at a time satisfies every
+    # individual recv, so neither the socket timeout nor an outer-loop check
+    # would ever fire. Looping over short reads is what makes the deadline real.
+    read_some = getattr(reader, "read1", None) or reader.read
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ConnectionError(
+                    f"websocket frame incomplete after {WS_FRAME_TIMEOUT:.0f}s "
+                    f"({remaining} of {count} bytes still outstanding)"
+                )
+            if sock is not None:
+                try:
+                    sock.settimeout(left)
+                except OSError:
+                    pass
+        chunk = read_some(remaining)
+        if not chunk:
+            raise ConnectionError("websocket peer closed mid-frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_http_head(sock: socket.socket) -> tuple[bytes, bytes]:
+    """Read a raw HTTP message head off a socket. Returns (head, leftover)."""
+    buffer = b""
+    # Same reasoning as _read_exact: WS_HANDSHAKE_TIMEOUT is a per-recv idle
+    # clock, so cap the whole head read with an absolute deadline too.
+    deadline = time.monotonic() + WS_HANDSHAKE_TIMEOUT
+    try:
+        while b"\r\n\r\n" not in buffer:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ConnectionError("upstream websocket handshake response timed out")
+            try:
+                sock.settimeout(left)
+            except OSError:
+                pass
+            chunk = sock.recv(8192)
+            if not chunk:
+                raise ConnectionError("upstream closed during websocket handshake")
+            buffer += chunk
+            if len(buffer) > 128 * 1024:
+                raise ConnectionError("upstream handshake response head too large")
+    finally:
+        # Hand the socket back with the plain handshake timeout, not whatever
+        # sliver of the deadline was left; the caller re-arms WS_IDLE_TIMEOUT
+        # itself once an upgrade is confirmed.
+        try:
+            sock.settimeout(WS_HANDSHAKE_TIMEOUT)
+        except OSError:
+            pass
+    head, _, leftover = buffer.partition(b"\r\n\r\n")
+    return head + b"\r\n\r\n", leftover
+
+
+def _status_code(head: bytes) -> int:
+    try:
+        return int(head.split(b"\r\n", 1)[0].split(b" ")[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _looks_like_json(payload: bytes) -> bool:
+    stripped = payload.lstrip()
+    return bool(stripped) and stripped[:1] in (b"{", b"[")
+
+
+@dataclass
+class WSFrameRelay:
+    """Frame-aware reader for the client->proxy half of a WebSocket relay.
+
+    Yields the *raw* frame bytes (to be forwarded upstream byte-for-byte) plus,
+    when a data message completes, a decoded copy used only to build a
+    structural summary. Nothing here ever mutates what is forwarded.
+    """
+
+    inflater: Any = None
+    inflate_broken: bool = False
+    frag_opcode: int | None = None
+    frag_rsv1: bool = False
+    frag_buffer: bytearray = field(default_factory=bytearray)
+    frag_oversized: bool = False
+    closing: bool = False
+
+    def _inflate(self, payload: bytes) -> tuple[bytes | None, str | None]:
+        """Best-effort permessage-deflate inflate of one complete message."""
+        if self.inflate_broken:
+            return None, None
+        if self.inflater is None:
+            self.inflater = zlib.decompressobj(-15)
+        try:
+            out = self.inflater.decompress(payload + b"\x00\x00\xff\xff", MAX_DECODED_BYTES + 1)
+        except zlib.error as exc:
+            # Context takeover means one failure poisons the stream; stop
+            # decoding rather than emit misleading shapes.
+            self.inflate_broken = True
+            return None, f"undecodable permessage-deflate frame ({type(exc).__name__})"
+        if len(out) > MAX_DECODED_BYTES or self.inflater.unconsumed_tail:
+            self.inflate_broken = True
+            return None, "oversized permessage-deflate frame"
+        return out, None
+
+    def read_frame(
+        self, reader: Any, sock: socket.socket | None = None
+    ) -> tuple[bytes, bytes | None, str | None]:
+        """Read one frame. Returns (raw_bytes, complete_message_or_None, note).
+
+        Waiting for the *start* of a frame is unbounded here on purpose -- a
+        WebSocket can legitimately sit idle for a whole model turn, and that
+        wait is governed by the socket's WS_IDLE_TIMEOUT. Once the first header
+        byte lands, the rest of the frame is on a fixed WS_FRAME_TIMEOUT budget
+        that does not reset on partial reads.
+        """
+        header = _read_exact(reader, 2)
+        deadline = time.monotonic() + WS_FRAME_TIMEOUT
+        first, second = header[0], header[1]
+        fin = bool(first & 0x80)
+        rsv1 = bool(first & 0x40)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+
+        extension = b""
+        try:
+            if length == 126:
+                extension = _read_exact(reader, 2, deadline=deadline, sock=sock)
+                length = int.from_bytes(extension, "big")
+            elif length == 127:
+                extension = _read_exact(reader, 8, deadline=deadline, sock=sock)
+                length = int.from_bytes(extension, "big")
+            if length > MAX_BODY_BYTES:
+                raise ConnectionError(f"websocket frame payload too large ({length} bytes)")
+
+            mask_key = _read_exact(reader, 4, deadline=deadline, sock=sock) if masked else b""
+            payload = _read_exact(reader, length, deadline=deadline, sock=sock)
+        finally:
+            # Restore the idle clock for the next frame's (legitimately long)
+            # header wait, whether this frame completed or aborted.
+            if sock is not None:
+                try:
+                    sock.settimeout(WS_IDLE_TIMEOUT)
+                except OSError:
+                    pass
+        raw = header + extension + mask_key + payload
+
+        if opcode >= 0x8:  # control frame: relay, never summarize
+            if opcode == WS_OPCODE_CLOSE:
+                self.closing = True
+            return raw, None, None
+
+        plain = _ws_unmask(payload, mask_key) if masked else payload
+
+        if opcode != WS_OPCODE_CONTINUATION:
+            self.frag_opcode = opcode
+            self.frag_rsv1 = rsv1
+            self.frag_buffer = bytearray()
+            self.frag_oversized = False
+        if self.frag_opcode is None:
+            return raw, None, "orphan websocket continuation frame"
+        if len(self.frag_buffer) + len(plain) > MAX_BODY_BYTES:
+            self.frag_oversized = True
+            self.frag_buffer = bytearray()
+        else:
+            self.frag_buffer.extend(plain)
+
+        if not fin:
+            return raw, None, None
+
+        opcode_done, rsv1_done = self.frag_opcode, self.frag_rsv1
+        message = bytes(self.frag_buffer)
+        oversized = self.frag_oversized
+        self.frag_opcode = None
+        self.frag_buffer = bytearray()
+        self.frag_oversized = False
+
+        if oversized:
+            return raw, None, "oversized websocket message (not summarized)"
+        if rsv1_done:
+            inflated, note = self._inflate(message)
+            if inflated is None:
+                return raw, None, note
+            message = inflated
+        if opcode_done not in (WS_OPCODE_TEXT, WS_OPCODE_BINARY):
+            return raw, None, None
+        if not _looks_like_json(message):
+            return raw, None, None
+        return raw, message, None
+
+
+# ---------------------------------------------------------------------------
 # Logging reverse-proxy shim (sits in front of the real Headroom proxy)
 # ---------------------------------------------------------------------------
 
@@ -434,23 +702,117 @@ class ShimHandler(BaseHTTPRequestHandler):
             out.append((key, value))
         return out
 
+    # -- websocket relay --------------------------------------------------
+    def _handshake_bytes(self) -> bytes:
+        """Rebuild the client's upgrade request with only ``Host`` rewritten."""
+        lines = [f"{self.command} {self.path} {self.request_version}"]
+        for key, value in self.headers.items():
+            if key.lower() == "host":
+                continue
+            lines.append(f"{key}: {value}")
+        lines.append(f"Host: {self.upstream_host}:{self.upstream_port}")
+        return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+
+    def _note(self, path: str, note: str) -> None:
+        self.recorder.record(
+            lambda seq: Observation(seq=seq, method="WS", path=path, body_bytes=0, note=note)
+        )
+
+    def _pump_to_client(self, upstream: socket.socket) -> None:
+        """Relay proxy->client frames verbatim. Responses are never summarized."""
+        try:
+            while True:
+                chunk = upstream.recv(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (OSError, ConnectionError, ValueError):
+            pass
+        finally:
+            try:
+                self.connection.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+    def _relay_client_frames(self, upstream: socket.socket, path: str) -> None:
+        relay = WSFrameRelay()
+        seen_notes: set[str] = set()
+        while True:
+            raw, message, note = relay.read_frame(self.rfile, self.connection)
+            # Forward first, summarize second: logging never delays the relay
+            # and never touches the bytes on the wire.
+            upstream.sendall(raw)
+            if note and note not in seen_notes:
+                seen_notes.add(note)
+                self._note(path, note)
+            if message is not None:
+                self.recorder.record(
+                    lambda seq, body=message: summarize_body(body, "WS", path, seq, None)
+                )
+            if relay.closing:
+                break
+
+    def _proxy_websocket(self) -> None:
+        path = self.path
+        self.close_connection = True
+        try:
+            upstream = socket.create_connection(
+                (self.upstream_host, self.upstream_port), timeout=WS_HANDSHAKE_TIMEOUT
+            )
+        except OSError as exc:
+            self._note(path, f"websocket upstream connect failed ({type(exc).__name__})")
+            try:
+                self.send_response(502)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except OSError:
+                pass
+            return
+
+        pump: threading.Thread | None = None
+        try:
+            upstream.sendall(self._handshake_bytes())
+            head, leftover = _read_http_head(upstream)
+            status = _status_code(head)
+            self.wfile.write(head)
+            if leftover:
+                self.wfile.write(leftover)
+            self.wfile.flush()
+
+            if status != 101:
+                self._note(path, f"websocket upgrade relayed; upstream declined ({status})")
+                self._pump_to_client(upstream)
+                return
+
+            self._note(path, "websocket upgrade relayed to headroom proxy (101)")
+            try:
+                self.connection.settimeout(WS_IDLE_TIMEOUT)
+            except OSError:
+                pass
+            upstream.settimeout(WS_IDLE_TIMEOUT)
+            pump = threading.Thread(target=self._pump_to_client, args=(upstream,), daemon=True)
+            pump.start()
+            self._relay_client_frames(upstream, path)
+        except (OSError, ConnectionError, ValueError) as exc:
+            self._note(path, f"websocket relay ended ({type(exc).__name__})")
+        finally:
+            for sock in (upstream, self.connection):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            if pump is not None:
+                pump.join(timeout=5.0)
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
     # -- main proxy path --------------------------------------------------
     def _proxy(self) -> None:
         if (self.headers.get("Upgrade") or "").lower() == "websocket":
-            # The shim is HTTP-only; record the attempt honestly and refuse so
-            # Codex falls back to the HTTP transport.
-            self.recorder.record(
-                lambda seq: Observation(
-                    seq=seq,
-                    method=self.command,
-                    path=self.path,
-                    body_bytes=0,
-                    note="websocket upgrade attempted (refused by probe shim)",
-                )
-            )
-            self.send_response(501)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._proxy_websocket()
             return
 
         try:
@@ -620,12 +982,9 @@ def codex_common_flags(shim_port: int, auto_compact_limit: int) -> list[str]:
         f"model_auto_compact_token_limit={auto_compact_limit}",
         "-c",
         "notify=[]",
-        # The shim is HTTP-only; keep Codex on the HTTP Responses transport so
-        # every request is observable.
-        "--disable",
-        "responses_websockets",
-        "--disable",
-        "responses_websockets_v2",
+        # The shim now relays WebSocket as well as HTTP, so Codex's own
+        # transport choice is left alone: whichever it picks is observable, and
+        # whichever it picks is what a real wrapped session would use.
     ]
 
 
@@ -757,6 +1116,11 @@ def drive_session(
 # ---------------------------------------------------------------------------
 
 
+def _transport(observation: Observation) -> str:
+    """Which wire the observation came off: the HTTP shim or the WS relay."""
+    return "ws" if observation.method == "WS" else "http"
+
+
 def print_report(
     observations: list[Observation],
     turn_results: list[dict[str, Any]],
@@ -787,15 +1151,19 @@ def print_report(
     print("Requests by route:")
     for route, count in by_path.most_common():
         print(f"  {count:4d}  {route}")
+    by_transport = Counter(_transport(o) for o in observations)
+    print("Observations by transport:")
+    for transport in ("http", "ws"):
+        print(f"  {by_transport.get(transport, 0):4d}  {transport}")
     print()
 
-    print("Distinct request shapes (structural only, no content):")
+    print("Distinct request shapes (structural only, no content; HTTP and WS transports):")
     shapes: dict[tuple[Any, ...], list[Observation]] = {}
     for observation in observations:
         shapes.setdefault(observation.shape_key(), []).append(observation)
     for index, (_key, group) in enumerate(shapes.items(), start=1):
         head = group[0]
-        print(f"  [{index}] x{len(group)}  {head.method} {head.path}")
+        print(f"  [{index}] x{len(group)}  [{_transport(head)}] {head.method} {head.path}")
         if head.note:
             print(f"        note: {head.note}")
         if head.top_keys:
@@ -816,19 +1184,27 @@ def print_report(
     both = [o for o in observations if o.is_compaction_related and o.has_prior_tool_items]
 
     print("Evidence:")
-    print(f"  (a) requests distinguishable as compaction-related: {len(compaction_hits)}")
+    print(
+        f"  (a) requests distinguishable as compaction-related: {len(compaction_hits)} "
+        f"(http={sum(1 for o in compaction_hits if _transport(o) == 'http')}, "
+        f"ws={sum(1 for o in compaction_hits if _transport(o) == 'ws')})"
+    )
     for observation in compaction_hits[:10]:
         print(
-            f"        #{observation.seq} {observation.method} {observation.path} "
-            f"signals={list(observation.compaction_signals)} "
+            f"        #{observation.seq} [{_transport(observation)}] {observation.method} "
+            f"{observation.path} signals={list(observation.compaction_signals)} "
             f"tool_items={len(observation.tool_item_types)}"
         )
-    print(f"  (b) requests carrying prior tool-call/result items: {len(tool_hits)}")
+    print(
+        f"  (b) requests carrying prior tool-call/result items: {len(tool_hits)} "
+        f"(http={sum(1 for o in tool_hits if _transport(o) == 'http')}, "
+        f"ws={sum(1 for o in tool_hits if _transport(o) == 'ws')})"
+    )
     if tool_hits:
         widest = max(tool_hits, key=lambda o: len(o.tool_item_types))
         print(
-            f"        widest: #{widest.seq} {widest.method} {widest.path} "
-            f"{len(widest.tool_item_types)} tool items of "
+            f"        widest: #{widest.seq} [{_transport(widest)}] {widest.method} "
+            f"{widest.path} {len(widest.tool_item_types)} tool items of "
             f"{len(widest.item_types)} total -> {_collapse(widest.item_types)}"
         )
     unknown = sorted(
@@ -838,7 +1214,9 @@ def print_report(
         print(f"  item types seen outside the known ALLOWED_TYPES vocabulary: {unknown}")
     print()
 
-    ws_attempts = sum(1 for o in observations if o.note and "websocket" in o.note)
+    ws_established = sum(1 for o in observations if o.note and "(101)" in o.note)
+    ws_declined = sum(1 for o in observations if o.note and "declined" in o.note)
+    ws_frames = sum(1 for o in observations if _transport(o) == "ws" and not o.note)
     print("Caveats for reading this result:")
     print(
         "  * `codex exec` exposes no scriptable `/compact` command (that is a TUI-only slash "
@@ -846,25 +1224,34 @@ def print_report(
         "`model_auto_compact_token_limit` config override used above; if the session never "
         "crossed that limit, native compaction simply never ran."
     )
-    if ws_attempts:
+    if ws_established or ws_declined or ws_frames:
         print(
-            f"  * Codex attempted a WebSocket upgrade on /v1/responses {ws_attempts} time(s). "
-            "This HTTP-only shim refused them (501) and Codex fell back to the HTTP Responses "
-            "transport. Headroom's real proxy does serve /v1/responses over WebSocket, so a "
-            "wrapped session may use that transport instead; shapes seen here are the HTTP ones."
+            f"  * WebSocket transport: {ws_established} upgrade(s) relayed to Headroom's real "
+            f"/v1/responses WS route, {ws_declined} declined upstream, {ws_frames} client->proxy "
+            "JSON frame(s) summarized. WS shapes appear above alongside the HTTP ones."
         )
+    else:
+        print(
+            "  * Codex never attempted a WebSocket upgrade in this run, so every shape above is "
+            "from the HTTP Responses transport. The relay was available but unused."
+        )
+    print(
+        "  * Only the client->proxy direction is summarized on either transport. A compaction "
+        "signal carried solely in a provider *response* would not be visible here."
+    )
     print()
 
     if both:
-        print("VERDICT: boundary observed")
+        transports = sorted({_transport(o) for o in both})
+        print(f"VERDICT: boundary observed (transport(s): {', '.join(transports)})")
         print(
             f"  {len(both)} request(s) were both compaction-distinguishable and carried prior "
             "tool-call/result items:"
         )
         for observation in both[:10]:
             print(
-                f"    #{observation.seq} {observation.method} {observation.path} "
-                f"signals={list(observation.compaction_signals)} "
+                f"    #{observation.seq} [{_transport(observation)}] {observation.method} "
+                f"{observation.path} signals={list(observation.compaction_signals)} "
                 f"items={_collapse(observation.item_types)}"
             )
     else:
