@@ -27,7 +27,12 @@ const MAX_REQUESTS_PER_TRIAL = 1;
 const MAX_REQUESTS_TOTAL = 2;
 let totalRequests = 0;
 
-/** The oracle. Six distinct records; every field is unique across records. */
+/**
+ * The oracle. Six distinct records: id/trace_id/host/message are unique across
+ * records; severity and region_ack are deliberately constant on all six (the
+ * trailing summary turns restate only those two). Only trace_id uniqueness
+ * matters to the check.
+ */
 const RECORDS = [
   { id: 'INC-4471', trace_id: '7f3a9c21e845b06d', host: 'edge-ap-south-11',  message: 'TLS handshake aborted by peer' },
   { id: 'INC-4472', trace_id: 'b219d4e77c3af158', host: 'cache-eu-west-03',  message: 'eviction storm: 94% of keys purged' },

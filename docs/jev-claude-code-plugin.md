@@ -99,9 +99,22 @@ comparison spike):
    claude plugin marketplace list
    ```
 
-   In-session, a `/compact` should produce a toast reading
-   `fast-jev-compaction: kept N/M messages, no summary (…)`, or
-   `fallback to built-in summary (…)` when Jev could not remove enough.
+   In-session, a `/compact` should produce a toast. The text the hook itself
+   passes to `$.ui.toast()` is `kept N/M messages, no summary (…)`, or
+   `fallback to built-in summary (…)` when Jev could not remove enough —
+   unprefixed. Whether Claude Code's plugin runtime prepends the plugin name
+   when it renders the toast has not been checked, so expect the wording above
+   with or without a `fast-jev-compaction:` prefix.
+
+   "Could not remove enough" is the `minReductionRatio` option from step 2, and
+   its default of `0.25` is worth understanding before relying on the plugin:
+   when Jev's decisions reduce the transcript by less than 25%, the hook
+   **discards them and calls Claude Code's built-in summarizer instead**
+   (`return next(event)`). Since Jev keeping everything produces 0% reduction,
+   a transcript Jev judges entirely worth keeping is compacted by the built-in
+   path, not by this plugin. See
+   [the Track D correctness check](superpowers/results/2026-09-20-jev-plugin-correctness-check.md#the-minreductionratio-gate),
+   where that is exactly what happened to the one-time trial.
 
 To try it without installing, from a checkout:
 `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
@@ -109,7 +122,8 @@ To try it without installing, from a checkout:
 ## Known caveat: the 87% number is deletion, not compression
 
 The Phase 0 comparison spike measured `fast-jev-compaction` alone against
-Headroom on the same corpus, same tokenizer, one shared `T0` baseline:
+Headroom on the same six-scenario corpus with the same tokenizer and the same
+`T0` baseline (with the denominator caveat below):
 
 | | Headroom alone | Headroom + Jev (track B) | fast-jev-compaction alone |
 |---|---:|---:|---:|
@@ -123,13 +137,28 @@ compression. On a synthetic corpus, "everything looks equally disposable" is a
 decision-quality question, not a free win; it is the mirror image of the
 "always keep" bias the original plan warned about.
 
-This does not change the recommended architecture, but per the design doc's
-Track D gate, **run a real task-correctness check before treating the plugin's
-numbers as safe to rely on** — exact-field recovery across a repeatable and a
-one-time case, in the style of the 2026-09-20 native-agent test, aimed
-specifically at this drop-everything behavior. If it holds up, the plugin is
-the right tool for Claude Code's episodic compaction. If it doesn't, document
-the failure mode and reconsider the configuration before recommending it.
+Two qualifications on the comparison itself, both from the harness source
+(`benchmarks/.jev-plugin-compare/compare.mjs`,
+`benchmarks/jev_plugin_compare_export.py`). The `fast-jev-compaction` percentage
+is computed only over the scenarios that produced a value, so its baseline is
+not necessarily the same `T0` total as the Headroom column's — the export step
+prints a warning when those baselines differ. And the corpus is adapted before
+Jev sees it: `system` and OpenAI `tool` messages are carried as `user` (the
+library's `Role` union is only `user | assistant`) and OpenAI tool arguments are
+`JSON.parse`d out of their string form. Token counts round-trip byte-exactly, so
+the reduction figures are comparable; the *decisions* were made on input shaped
+slightly differently from what native Claude Code would hand the hook.
+
+This does not change the recommended architecture. Per the design doc's Track D
+gate, a real task-correctness check has since been run —
+[`superpowers/results/2026-09-20-jev-plugin-correctness-check.md`](superpowers/results/2026-09-20-jev-plugin-correctness-check.md).
+Summary: the drop-everything behavior is **conditional on the transcript
+presenting the data as re-obtainable**, and in the repeatable case (the one the
+live hook actually runs, since it clears `minReductionRatio`) exact-field
+recovery held with no wrong answers. The one-time case is *not* settled: it
+reduces nothing, so the gate hands it to the built-in summarizer, which that
+check did not test. Read its "Honest limits" before treating any of this as
+closing the gate.
 
 Two smaller caveats from the plugin's own docs: function hooks are early
 access and may change between Claude Code releases (the plugin's type

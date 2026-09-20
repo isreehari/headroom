@@ -17,6 +17,16 @@ records, same question, same everything else — when the transcript said the da
 was one-time and unrecoverable. That flip is the whole result, and it is the
 opposite of the failure that was feared.
 
+**One caveat rides on top of the flip, and it is load-bearing.** Keeping
+everything means reducing nothing, and the *installed hook* — as opposed to the
+`compact()` library function this check drove — throws away a result that
+reduces too little. Trial 2's reduction was 0.0%, below the hook's
+`minReductionRatio` default of 25%, so in a live session that trial would never
+have produced the message list cell B reasons about; it would have fallen back
+to Claude Code's own built-in summarizer, which nothing here tested. See
+["The `minReductionRatio` gate"](#the-minreductionratio-gate) below — it is the
+main thing standing between this check and closing Track D's open item.
+
 ## Two things the task premise got wrong
 
 Both are stated up front because they bound what this document can claim.
@@ -46,18 +56,38 @@ already drives it. So this check ran the real, billed decision engine on a
 purpose-built transcript, then put a real model in front of the *actual*
 post-compaction message list the engine produced.
 
-**The one gap this leaves.** In a live session the plugin's `session.compact`
-hook hands the compacted list back to Claude Code as conversation history; here
-it was rendered into a prompt for a fresh `claude -p` session. The information
-content is identical — the same messages, the same deletions — but the framing
-is a prompt rather than replayed history. Nothing below turns on that
-difference, and the control cell confirms the rendering is faithful. It is still
-a simulation of the handoff, not the handoff.
+**The gaps this leaves.** Two, and the first is the bigger one.
+
+*The hook is not the library.* `correctness.mjs` calls `compact()` directly. The
+installed hook wraps that call in `compactSession()` plus an acceptance gate —
+see ["The `minReductionRatio` gate"](#the-minreductionratio-gate). The decision
+layer is identical: the hook overrides neither `keepThreshold` nor
+`preserveRecentMessages`, and `HOOK_DEFAULTS` in `hooks/fast-jev.ts` sets only
+`compactAtPercent`, `minReductionRatio` and `model` — the last to `DEFAULT_MODEL`
+(`jev-latest`), which is also what the bare `JevClient` this harness uses
+resolves to. So every decision in the table below is what the live hook would
+also get from Jev. What differs is what the hook then *does* with it.
+
+*The handoff is rendered, not replayed.* In a live session `session.compact`
+hands the compacted list back to Claude Code as conversation history; here it was
+rendered into a prompt for a fresh `claude -p` session. The information content
+is identical **for the fields this test exercises** — the same messages, the same
+deletions, the same tool-result bodies. It is not identical in general: the
+harness uses an ad-hoc `render()`, whereas the hook maps output back through
+`toSessionMessages()`, which preserves the engine's own message/tool objects and
+their handles and rebuilds only what changed. Those handles and the surrounding
+metadata carry no task facts in this synthetic transcript, and the control cell
+confirms the rendering is faithful for the target field — but it is still a
+simulation of the handoff, not the handoff.
 
 ## Setup
 
-Six distinct synthetic records, one per tool call, every field unique across
-records, in an 18-message transcript:
+Six distinct synthetic records, one per tool call, in an 18-message transcript.
+The four identifying fields — `incident_id`, `trace_id`, `host`, `message` — are
+unique across records; `severity` (`sev2`) and `region_ack` (`true`) are
+deliberately constant on all six, because the trailing summary turns restate
+exactly those two and nothing else. Only `trace_id` uniqueness matters to the
+oracle:
 
 | Call | Incident | `trace_id` | `host` |
 | --- | --- | --- | --- |
@@ -95,7 +125,10 @@ call).
 ## What the decision engine decided
 
 Real `compact()` through the library's own `JevClient`. Each trial was run
-twice, to separate a real effect from sampling noise. `keepCall` / `keepResult`
+twice, to separate a real effect from sampling noise — as two separate
+invocations of the harness, which caps itself at one Jev call per trial per
+invocation and has no repeat loop inside it. The numbers below were transcribed
+from stdout; no run artifacts were kept (see "Honest limits"). `keepCall` / `keepResult`
 are Jev's probabilities; the action is the library's own threshold logic.
 
 | Call | Trial 1 "re-runnable" run A | run B | Trial 2 "one-time" run A | run B |
@@ -131,6 +164,48 @@ Worth recording for the design doc: Phase 0's 87% reduction and this trial's
 56.7% both come from dropping everything. In trial 2 the reduction was **zero**.
 Savings and retention are the same dial.
 
+## The `minReductionRatio` gate
+
+This check drove `compact()`. The installed plugin does not call `compact()`
+and use whatever comes back — its `session.compact` handler checks how much the
+result actually saved, and discards Jev's decision entirely when the saving is
+too small (`hooks/fast-jev.ts`, the `session.compact` registration):
+
+```ts
+if (reductionRatio(result) < config.minReductionRatio) {
+  notify($, `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: …)`);
+  return next(event);
+}
+```
+
+`reductionRatio` is `(charsBefore - charsAfter) / charsBefore` (`src/compact.ts`),
+over the same `stats` printed above, and `HOOK_DEFAULTS.minReductionRatio` is
+`0.25`. Applying the gate to the two trials by hand — no new Jev calls, just the
+arithmetic on the committed `charsBefore`/`charsAfter`:
+
+| Trial | chars | `reductionRatio` | vs. 25% | What the live hook would do |
+| --- | --- | ---: | --- | --- |
+| 1 "re-runnable" | 1874 → 811 | **0.567** | passes | returns Jev's compacted list — the context cell A was given |
+| 2 "one-time" | 1999 → 1999 | **0.000** | **fails** | `return next(event)` — Claude Code's built-in summarizer |
+
+So the two halves of this check do not have the same standing:
+
+- **Cell A's context is what a live session would see.** Trial 1 clears the gate
+  comfortably, so the hook would return exactly that message list.
+- **Cell B's context is not.** The "Jev kept everything" list only exists at the
+  library level. Installed, this exact scenario falls through to built-in
+  summarization, whose fidelity on the target field was **not tested at all
+  here**. Cell B is evidence about the decision engine, not about the plugin.
+- **Cell C is unaffected**, because it is explicitly a counterfactual built from
+  `applyDecisions` rather than a path any live configuration takes.
+
+This also sharpens the "savings and retention are the same dial" point into
+something operational: the gate means the plugin cannot *quietly* trade savings
+for retention. When Jev decides everything is worth keeping, the plugin stops
+being the compactor for that event and hands the job back. Whether the built-in
+summarizer preserves a one-time `trace_id` is the natural next test, and it is
+the one this document cannot answer.
+
 ## What the model did with the result
 
 Four cells. Each is a fresh `claude -p` session with no other context, given the
@@ -139,8 +214,8 @@ actual post-compaction message list rendered as history, then the question.
 
 | Cell | Context the model got | Tool | Answer | Verdict |
 | --- | --- | --- | --- | --- |
-| **A** | Trial 1 output — t1–t5 **dropped** by Jev | re-callable | `b219d4e77c3af158` | **exact match, fallback-recovered** |
-| **B** | Trial 2 output — t1–t5 **kept** by Jev | none | `b219d4e77c3af158` | **exact match, from context** |
+| **A** | Trial 1 output — t1–t5 **dropped** by Jev | re-callable | `b219d4e77c3af158` | **exact match, recovered by tool re-call** |
+| **B** | Trial 2 output — t1–t5 **kept** by Jev (library-only; see the gate) | none | `b219d4e77c3af158` | **exact match, from context** |
 | **C** | Trial 2 transcript, drops **forced** (counterfactual) | none | `UNKNOWN` | **refused; no wrong answer** |
 | **D** | Trial 2 transcript, **uncompacted** control | none | `b219d4e77c3af158` | exact match (setup valid) |
 
@@ -148,9 +223,11 @@ actual post-compaction message list rendered as history, then the question.
 about — a confidently wrong exact fact after an unrecoverable drop — did not
 occur.
 
-**Cell A is a real recovery, not a lucky memory.** The target string does not
-appear anywhere in cell A's prompt (checked mechanically), so the only way to
-produce it was to re-run the lookup, which the model did. What made that
+**Cell A looks like a real recovery, not a lucky memory.** The target string does
+not appear anywhere in cell A's prompt (checked mechanically), so the only way to
+produce it from that prompt was to re-run the lookup. No tool-use transcript was
+captured, so this is inference from the prompt's contents rather than an observed
+call — see the sandboxing limit below. What made that
 possible is a detail of `applyDecisions` worth knowing: it strips the `tool_use`
 and `tool_result` blocks but **keeps the message's text**. The assistant's
 "Pulling the record for INC-4472." survives the drop. The model is therefore
@@ -163,14 +240,52 @@ practice, and it is not something the design doc currently notes.
 library's own `applyDecisions` a forced `drop_call` for every non-pinned call —
 no API call, no cherry-picking. Answer: `UNKNOWN`. The fact was genuinely,
 irrecoverably lost — and the model said so rather than inventing a plausible
-16-hex-digit string. So the cost of `drop_call` on unrecoverable data shows up
-as **capability loss, not silent corruption**, at least here.
+16-hex-digit string.
+
+State that result at the width it was actually measured at: **no wrong answer
+was observed in this one explicitly prompted synthetic cell.** The cell tests
+`applyDecisions` plus one model's compliance with a direct "answer UNKNOWN if
+you cannot obtain it" instruction, on a question that points straight at the
+missing field. It is a sighting of capability loss rather than silent
+corruption; it is not a demonstration that the real system avoids silent
+corruption on realistic tasks, where nothing prompts the model to check whether
+it still holds the fact.
 
 ## Honest limits
 
 - **Not the live plugin.** Not installed; the hook never ran. What ran was its
   decision engine and its `applyDecisions`, which is the part that makes the
   drop/keep choice, plus a rendered simulation of the handoff.
+- **The one-time case never reaches the tested code path when installed.** The
+  `minReductionRatio` gate above sends trial 2's 0.0% reduction to Claude Code's
+  built-in summarizer. Cell B therefore says nothing about the live plugin's
+  behavior on one-time data, and this limit is the reason Track D's open item is
+  not closed here. Re-running the trial through `compactSession()` plus the gate
+  — or through the installed hook once the install is permitted — is the missing
+  step.
+- **No run artifacts are committed.** `out/` (`decisions.json`,
+  `compacted-*.json`, `state-*.json`, `prompt-*.txt`) is generated, was not
+  retained, and is not in the repository; neither is a transcript of the four
+  `claude -p` sessions. Every number in the tables above was transcribed from
+  the harness's stdout by hand. `correctness.mjs` makes exactly one Jev call per
+  trial per invocation, so the "run twice / four billed requests" claim means two
+  separate invocations of the script — there is no A/B loop inside it, and
+  nothing committed proves the second invocation happened. Re-running it
+  regenerates `out/`, but against fresh sampling; treat the run-B column as
+  a claim on the author's word rather than as evidence in the repository.
+- **The model cells were not sandboxed.** The `claude -p` reproductions run from
+  a directory that also contains `oracle.json`, `incident_lookup.sh`,
+  `correctness.mjs` and the uncompacted prompts, all of which hold the answer.
+  The "no tools available" framing for cells B, C and D is asserted *inside the
+  prompt text* only; no `--tools ""`, sandbox flag or equivalent enforced it, and
+  no tool-use transcript was captured. So incidental file access cannot be ruled
+  out mechanically for B/C/D, and cell A's re-call — the thing that makes it "a
+  real recovery" — is inferred from the answer's presence plus the target
+  string's mechanically verified absence from the prompt, not from an observed
+  tool call. Cell C answering `UNKNOWN` while sitting in a directory containing
+  `oracle.json` is the strongest evidence that the answer files were not read,
+  and it is circumstantial. A re-run should restrict tools explicitly and keep
+  the transcripts.
 - **One transcript, n=1 per model cell.** Compaction decisions were repeated
   (stable); the model answers were not. One `UNKNOWN` is not a refusal rate, and
   "no wrong answers in 4 cells" is not a bound on the wrong-answer rate.
@@ -191,8 +306,9 @@ as **capability loss, not silent corruption**, at least here.
 
 ```
 cd benchmarks/.jev-plugin-compare
-npm run setup                                  # if vendor/ is absent
+npm run setup                                     # if vendor/ is absent
 TYPESAFE_API_KEY=... node correctness.mjs ./out   # 2 billed Jev requests, capped
+TYPESAFE_API_KEY=... node correctness.mjs ./outB  # run B: 2 more, a SECOND invocation
 node counterfactual.mjs ./out                     # no API call
 claude -p < ./out/prompt-repeatable.txt           # cell A (needs Bash allowed)
 claude -p < ./out/prompt-onetime.txt              # cell B
@@ -200,20 +316,38 @@ claude -p < ./out/prompt-onetime-forcedrop.txt    # cell C
 claude -p < ./out/prompt-onetime-control.txt      # cell D
 ```
 
-Four billed Jev requests were used in total (two trials, run twice), plus four
-`claude -p` sessions. The Jev key was read from the environment into the child
-process only; its value was never printed, logged or written to any file here.
+Four billed Jev requests were used in total: the script caps itself at one per
+trial and two per invocation, so the run-A/run-B columns above are two separate
+invocations, not a loop inside the harness. Plus four `claude -p` sessions. The
+Jev key was read from the environment into the child process only; its value was
+never printed, logged or written to any file here.
+
+Two things to do differently when re-running, both from the limits above. Keep
+`out/` — the decision tables here were transcribed by hand from stdout and
+nothing was committed. And run the four model cells with tools restricted
+explicitly (and the transcript captured) rather than relying on the prompt text
+to say "no tools": cells B, C and D as written can see `oracle.json` and
+`incident_lookup.sh` in the working directory.
 
 ## What this changes
 
-- Open item 3 of the design doc is answered for the repeatable case and answered
-  conditionally for the one-time case. `drop_call` did not corrupt task
-  correctness in any cell tested.
+- Open item 3 of the design doc is answered for the repeatable case — which is
+  also the case the live hook actually runs, since trial 1 clears the
+  `minReductionRatio` gate. `drop_call` did not corrupt task correctness in any
+  cell tested.
+- **Open item 3 is not closed for the one-time case, and this document should not
+  be read as closing it.** The gate routes that case to Claude Code's built-in
+  summarizer before any of cell B's reasoning applies, so what the plugin does
+  with genuinely one-time data is still untested end to end.
 - The design doc's framing of "Jev drops everything" should be narrowed: it drops
   everything *when the transcript presents the data as re-obtainable*. Phase 0's
   136/136 is consistent with that, not a counterexample to it.
 - The savings figure is conditional on the same thing. A workload of genuinely
-  one-time tool results should be expected to compact to roughly nothing.
+  one-time tool results should be expected to compact to roughly nothing — and,
+  because of the gate, to be compacted by Claude Code's built-in summarizer
+  rather than by the plugin at all. "Jev keeps everything" and "the plugin is
+  bypassed" are the same event.
 - Before this is called settled, the live plugin still needs to be installed and
-  the end-to-end `/compact` path run — and the implicit-need case above is a
-  better test than the explicit-question case run here.
+  the end-to-end `/compact` path run — including the below-threshold fallback
+  path, which is the one the one-time case takes. The implicit-need case above is
+  also a better test than the explicit-question case run here.
