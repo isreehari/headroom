@@ -27,6 +27,7 @@ from typing import Any, Literal, cast
 
 from headroom._subprocess import run as subprocess_run
 from headroom.config import HeadroomConfig, HeadroomMode
+from headroom.proxy.jev.config import JevConfig
 from headroom.proxy.models import ProxyConfig
 
 ConfigCallback = Callable[["Configurator"], None]
@@ -424,6 +425,14 @@ def _field_contract(
 
 def _public_dataclass_dict(value: Any) -> dict[str, Any]:
     raw = asdict(value)
+    # ``asdict`` recurses into nested dataclasses and ignores ``repr=False``, so
+    # a secret-bearing block would land here verbatim. This payload is written to
+    # bench manifests on disk and to HEADROOM_PROXY_CONFIG_JSON, so swap any such
+    # block for its redacted view. The key itself stays — ScenarioContract audits
+    # this payload against ProxyConfig's field names.
+    for name, live in ((name, getattr(value, name, None)) for name in raw):
+        if isinstance(live, JevConfig):
+            raw[name] = live.redacted()
     out = {key: _portable_value(val) for key, val in raw.items() if not key.startswith("_")}
     for name, field in value.__dataclass_fields__.items():
         if name in out or name.startswith("_"):
