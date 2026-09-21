@@ -898,6 +898,16 @@ class PrefixCacheTracker:
         self._last_activity: float = time.time()
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
+        # Monotonic generation of the two snapshots above: bumped by EVERY
+        # write to them, whichever recorder made it. A caller that recorded a
+        # turn and then wants to amend it later — the compaction-boundary
+        # re-record on `/v1/compress` is the one in tree — cannot decide that
+        # from the values alone: two turns of one session can legitimately
+        # record identical transcripts (ABA), and the amend would then roll
+        # the newer turn's state back to the older turn's. Reading this token
+        # while the recording turn still holds `session_turn_lock`, and
+        # requiring it to be unchanged before amending, closes that window.
+        self._snapshot_revision: int = 0
         # Idle gap (seconds) since the PREVIOUS turn's response, captured by
         # SessionTrackerStore.get_or_create at fetch time — BEFORE it refreshes
         # _last_activity. Without this snapshot, seconds_since_activity() reads
@@ -951,6 +961,7 @@ class PrefixCacheTracker:
         """
         self._last_activity = time.time()
         self._turn_number += 1
+        self._snapshot_revision += 1
         self._last_original_messages = copy.deepcopy(original_messages or messages)
         self._last_forwarded_messages = copy.deepcopy(messages)
 
@@ -998,6 +1009,16 @@ class PrefixCacheTracker:
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._last_forwarded_messages)
 
+    def get_snapshot_revision(self) -> int:
+        """Generation of the recorded transcript snapshots.
+
+        Strictly monotonic and bumped by every recorder that replaces them
+        (:meth:`record_returned` and :meth:`update_from_response`), so an
+        unchanged value is proof that the snapshots are still the ones the
+        reader's own turn recorded — which equal values are not.
+        """
+        return self._snapshot_revision
+
     def record_returned(
         self,
         original_messages: list[dict[str, Any]],
@@ -1015,6 +1036,7 @@ class PrefixCacheTracker:
         (``update_from_response``), or stay at their conservative local value.
         """
         self._last_activity = time.time()
+        self._snapshot_revision += 1
         self._last_original_messages = copy.deepcopy(original_messages)
         self._last_forwarded_messages = copy.deepcopy(returned_messages)
 

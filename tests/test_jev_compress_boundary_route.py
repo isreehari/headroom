@@ -17,7 +17,12 @@ owns and nothing below it:
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import textwrap
+import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -465,3 +470,143 @@ def test_a_gateway_boundary_turn_keeps_its_ctx_in_step_with_the_body(
         assert f"hash={hash_key}" in json.dumps(pending.body["messages"])
         assert pending.ctx is not None
         assert pending.ctx.messages == pending.body["messages"]
+
+
+# --------------------------------------------------------------------------
+# The re-record's outcome is ALWAYS observed: nothing can commit to session
+# state after the handler has stopped waiting for it.
+# --------------------------------------------------------------------------
+
+
+def _boundary_block() -> ast.If:
+    """The ``if jev_boundary:`` block of ``handle_compress``, as an AST node."""
+    import headroom.proxy.handlers.openai as openai_handler
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(openai_handler.OpenAIHandlerMixin)))
+    blocks = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "jev_boundary"
+    ]
+    assert len(blocks) == 1, f"expected exactly one `if jev_boundary:` block, found {len(blocks)}"
+    return blocks[0]
+
+
+def test_the_rerecord_never_touches_the_compression_executor() -> None:
+    """Two rules meet here, and both forbid that executor.
+
+    1. ``_run_compression_in_executor`` cannot cancel a worker that has
+       started. When its timeout fires the handler moves on and hands the
+       caller the PRE-retention bytes, while the orphaned worker can still
+       take ``session_turn_lock`` afterwards and record the RETAINED ones.
+       The caller then forwards one transcript while the session replays
+       another — the exact desync the handler's own ``except TimeoutError``
+       branch refuses to create for a session call.
+    2. That executor is not a neutral offload helper: an overrun leaves
+       timeout debt and quarantines the pool, so a slow Jev step would switch
+       off Headroom's own compression for unrelated traffic (the same ruling
+       `headroom/proxy/jev/hook.py` records for the Track A recount).
+
+    ``_rerecord_retained_session`` is self-bounding — one timed lock acquire
+    plus two recordings — so it is awaited through ``asyncio.to_thread`` with
+    no abandoning timeout, and every outcome is observed.
+    """
+    block = _boundary_block()
+    banned = {"_run_compression_in_executor", "COMPRESSION_TIMEOUT_SECONDS"}
+    assert not [
+        node for node in ast.walk(block) if isinstance(node, ast.Attribute) and node.attr in banned
+    ]
+    assert not [
+        node for node in ast.walk(block) if isinstance(node, ast.Name) and node.id in banned
+    ]
+    assert not [
+        node for node in ast.walk(block) if isinstance(node, ast.Constant) and node.value in banned
+    ]
+    # ...and it IS offloaded: this work is CPU-bound (two deep copies of a
+    # full transcript) and must not run on the event loop.
+    assert [
+        node
+        for node in ast.walk(block)
+        if isinstance(node, ast.Attribute) and node.attr == "to_thread"
+    ], "the re-record must still run off the event loop"
+
+
+def test_a_slow_rerecord_is_waited_for_and_never_desyncs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handler waits for the outcome instead of abandoning the worker.
+
+    The lock is held past the point an abandoning timeout would have fired,
+    then released. Whatever the caller is handed and whatever the session
+    replays must describe ONE conversation.
+    """
+    _install_jev(monkeypatch)
+    state: dict[str, Any] = {}
+    released = threading.Event()
+
+    def _hold_the_lock_briefly() -> None:
+        lock = state["cache"].session_turn_lock
+        lock.acquire()
+
+        def _release() -> None:
+            time.sleep(0.4)
+            lock.release()
+            released.set()
+
+        threading.Thread(target=_release, daemon=True).start()
+
+    _after_retention(monkeypatch, _hold_the_lock_briefly)
+
+    with _client(_active_jev()) as client:
+        state["cache"], state["tracker"] = _session_state(client, "s-slow")
+        resp = _post(client, mode="ccr", session_id="s-slow", jev_compaction_boundary=True)
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert released.is_set(), "the handler returned before the re-record could finish"
+        # The re-record was waited for, so it committed — and the caller's
+        # bytes and the replay state are the same bytes.
+        assert payload["jev"]["reason"] == "applied"
+        assert state["tracker"].get_last_forwarded_messages() == payload["messages"]
+
+
+def test_an_aba_rerecord_by_a_concurrent_turn_is_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent turn that records IDENTICAL values still wins.
+
+    Comparing values alone cannot tell "my own record" from "someone else's
+    byte-identical record", so the compare-and-set also pins the tracker's
+    snapshot generation, taken while this turn still held the lock.
+    """
+    _install_jev(monkeypatch)
+    state: dict[str, Any] = {}
+
+    def _a_concurrent_turn_records_the_same_bytes() -> None:
+        cache, tracker = state["cache"], state["tracker"]
+        with cache.session_turn_lock:
+            # Byte-identical to what this turn recorded: the value comparison
+            # cannot see this, the revision can.
+            tracker.record_returned(
+                tracker.get_last_original_messages(), tracker.get_last_forwarded_messages()
+            )
+            state["revision"] = tracker.get_snapshot_revision()
+
+    _after_retention(monkeypatch, _a_concurrent_turn_records_the_same_bytes)
+
+    with _client(_active_jev()) as client:
+        baseline = _post(client, mode="ccr", session_id="s-aba-baseline")
+        assert baseline.status_code == 200, baseline.text
+        state["cache"], state["tracker"] = _session_state(client, "s-aba")
+        resp = _post(client, mode="ccr", session_id="s-aba", jev_compaction_boundary=True)
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        # Nothing wrote after the concurrent turn: the retention was refused.
+        assert state["tracker"].get_snapshot_revision() == state["revision"]
+        assert "hash=" not in json.dumps(state["tracker"].get_last_forwarded_messages())
+
+    assert payload["jev"]["reason"] == "rerecord_failed"
+    assert payload["jev"]["applied"] == 0
+    assert payload["messages"] == baseline.json()["messages"]
+    assert payload["ccr_hashes"] == baseline.json()["ccr_hashes"]

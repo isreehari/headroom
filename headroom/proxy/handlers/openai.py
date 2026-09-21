@@ -10229,6 +10229,8 @@ class OpenAIHandlerMixin:
                     result.tokens_before,
                     tokens_after,
                     None,
+                    # No session, so no replay state and no generation of it.
+                    None,
                 )
 
             def _run_session_turn():
@@ -10335,12 +10337,25 @@ class OpenAIHandlerMixin:
                     # return time because whatever we hand back IS what the
                     # caller sends upstream.
                     session_tracker.record_returned(messages, final)
+                    # Read the generation this turn's own record_returned just
+                    # produced, still UNDER the lock. Sampling it later, on the
+                    # event loop, would leave a window for a concurrent turn to
+                    # record between the two — and the token would then vouch
+                    # for that turn's state instead of this one's.
+                    snapshot_revision = session_tracker.get_snapshot_revision()
                     info = {
                         "id": session_id,
                         "frozen_message_count": session_frozen,
                         "cached_prefix_replayed": turn.replayed,
                     }
-                    return result, final, raw_tokens_before, final_tokens_after, info
+                    return (
+                        result,
+                        final,
+                        raw_tokens_before,
+                        final_tokens_after,
+                        info,
+                        snapshot_revision,
+                    )
                 finally:
                     comp_cache.session_turn_lock.release()
 
@@ -10355,6 +10370,7 @@ class OpenAIHandlerMixin:
                 tokens_before,
                 tokens_after,
                 session_info,
+                session_snapshot_revision,
             ) = await self._run_compression_in_executor(
                 _run_session_turn if session_id else _run_stateless,
                 timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -10457,10 +10473,21 @@ class OpenAIHandlerMixin:
                                 # turn recorded; a newer turn's replay state is
                                 # what the caller most recently forwarded and
                                 # must never be rolled back to an older turn's
-                                # transcript. The recorded snapshots are deep
-                                # copies, so comparison is by value.
+                                # transcript.
+                                #
+                                # The GENERATION is the authority: two turns of
+                                # one session can record byte-identical
+                                # transcripts, and a value-only comparison
+                                # cannot tell that apart from nobody having
+                                # written (ABA). The value comparison is kept
+                                # alongside it because the two together are
+                                # strictly stronger than either — the recorded
+                                # snapshots are deep copies, so it is by value.
                                 if (
-                                    _retained_tracker.get_last_original_messages() != messages
+                                    session_snapshot_revision is None
+                                    or _retained_tracker.get_snapshot_revision()
+                                    != session_snapshot_revision
+                                    or _retained_tracker.get_last_original_messages() != messages
                                     or _retained_tracker.get_last_forwarded_messages()
                                     != _pre_jev_messages
                                 ):
@@ -10474,10 +10501,31 @@ class OpenAIHandlerMixin:
                         _rerecorded = False
                         _rerecord_detail = "a newer turn already recorded this session"
                         try:
-                            _rerecorded = await self._run_compression_in_executor(
-                                _rerecord_retained_session,
-                                timeout=COMPRESSION_TIMEOUT_SECONDS,
-                            )
+                            # `asyncio.to_thread`, deliberately NOT the
+                            # compression executor and with NO abandoning
+                            # timeout, for two independent reasons.
+                            #
+                            # 1. An abandoned worker can still commit. Neither
+                            #    helper can cancel a thread that has started,
+                            #    so a timeout here would hand the caller the
+                            #    PRE-retention bytes while the straggler later
+                            #    takes the lock and records the RETAINED ones —
+                            #    the caller forwards one transcript and the
+                            #    session replays another. That is precisely the
+                            #    desync this handler's own `except TimeoutError`
+                            #    branch refuses to create for a session call.
+                            #    Waiting means every outcome is observed.
+                            # 2. `_run_compression_in_executor` is not a neutral
+                            #    offload helper: an overrun leaves timeout debt
+                            #    and quarantines the pool, so a slow Jev step
+                            #    would switch off Headroom's own compression for
+                            #    unrelated traffic. Jev is additive to that
+                            #    compression, never able to degrade it.
+                            #
+                            # Waiting is safe because the callable is
+                            # self-bounding: one timed lock acquire plus two
+                            # recordings, no unbounded work.
+                            _rerecorded = await asyncio.to_thread(_rerecord_retained_session)
                         except asyncio.CancelledError:
                             raise
                         except Exception as rerecord_error:  # noqa: BLE001 - see below
