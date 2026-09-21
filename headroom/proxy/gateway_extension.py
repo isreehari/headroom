@@ -154,6 +154,17 @@ class GatewayTurn:
         result = self._transformer.result if self._transformer is not None else None
         if result is None:
             return FinishedTurn(fields={}, transforms=list(transforms_applied), messages=None)
+        # The provider body below is built from THIS list, so the turn context
+        # has to describe the same conversation: `commit` hands the pending
+        # turn `result.ctx`, and a re-drive re-calls the model with
+        # `ctx.messages` (`gateway_turn.run_response_half`). The context was
+        # captured executor-side, before the handler had its final list, and a
+        # step that runs after the executor — Jev active retention on a
+        # compaction boundary — can replace it. Replaying the pre-replacement
+        # bytes after the provider was shown the post-replacement ones is a
+        # torn conversation. Normally the same object, so this is a no-op.
+        if result.ctx is not None and result.ctx.messages is not messages:
+            result.ctx.messages = messages
         # mode="ccr" markers are only useful if the model can resolve them:
         # inject headroom_retrieve and let the response half answer it (a
         # re-drive), or leave it to the caller otherwise.

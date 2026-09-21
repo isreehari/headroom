@@ -154,6 +154,67 @@ def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> 
     return hashes
 
 
+#: Same bound `headroom.proxy.jev.active_hook` puts on an error string before
+#: it reaches a log line.
+_JEV_MAX_DETAIL_CHARS = 400
+
+
+def _jev_log_safe_detail(exc: BaseException, jev_config: Any) -> str:
+    """Log-safe text for an exception raised while finishing a boundary turn.
+
+    The exception is arbitrary — a lock timeout, a quarantined executor, or a
+    tracker raising with whatever is in its state — and anything on the Jev
+    path can put the configured endpoint (userinfo, query token) or the API
+    key into a message. So the same single entry point the rest of the branch
+    uses, ``headroom.proxy.jev.client.scrub_secrets``, runs here too: scrub
+    first, then truncate, so a key straddling the cut cannot survive as a
+    prefix. With no Jev config to scrub against (and if scrubbing itself
+    fails) the message is dropped entirely rather than logged unscrubbed —
+    the type name alone is enough to diagnose this call site.
+    """
+    try:
+        if jev_config is None:
+            return type(exc).__name__
+        from headroom.proxy.jev.client import scrub_secrets
+
+        return scrub_secrets(f"{type(exc).__name__}: {exc}", jev_config)[:_JEV_MAX_DETAIL_CHARS]
+    except Exception:  # noqa: BLE001 - never trade a leak for a nicer log line
+        return type(exc).__name__
+
+
+def _jev_message_shape(messages: list[dict[str, Any]], model_name: str) -> str:
+    """Name the wire shape of the list Jev is actually shown.
+
+    This route accepts an OpenAI Chat list and an Anthropic list independently
+    of the model name — a Claude-named model can carry ``role: "tool"``
+    messages and a GPT-named one can carry ``tool_result`` blocks — so the
+    model name is only the last resort. ``message_shape`` is metadata
+    (``headroom.proxy.jev.request.build_retention_state``); candidate
+    selection and application are shape-agnostic and detect structurally, so
+    this only has to be honest, never load-bearing.
+    """
+    has_tool_role = False
+    has_tool_result_block = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            has_tool_role = True
+            continue
+        content = message.get("content")
+        if message.get("role") == "user" and isinstance(content, list):
+            has_tool_result_block = has_tool_result_block or any(
+                isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+            )
+    if has_tool_role != has_tool_result_block:
+        return "openai" if has_tool_role else "anthropic"
+    # Ambiguous (both shapes present) or silent (neither): fall back to the
+    # same model-name heuristic this handler already uses for the context
+    # limit and the tracker's provider.
+    lowered = model_name.lower()
+    return "anthropic" if ("claude" in lowered or "anthropic" in lowered) else "openai"
+
+
 def _codex_ws_compression_timeout_seconds() -> float:
     return min(COMPRESSION_TIMEOUT_SECONDS, _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS)
 
@@ -10314,17 +10375,13 @@ class OpenAIHandlerMixin:
                 # Jev is told the shape of the list it is actually shown. A
                 # Responses body reaches this point as its chat-shaped view
                 # (`build_responses_view` at the top of the handler), so it is
-                # named as such; otherwise the same model-name heuristic the
-                # session tracker's provider uses separates an Anthropic-shaped
-                # body from a Chat Completions one. Candidate selection itself
-                # is shape-agnostic, so this only has to be honest, never
-                # load-bearing.
+                # named as such; every other body is classified from the
+                # FORWARDED list itself, not from the model name, because this
+                # route accepts both shapes whatever the model is called.
                 if carries_responses_view(body):
                     jev_message_shape = "openai_responses"
-                elif "claude" in model_name.lower() or "anthropic" in model_name.lower():
-                    jev_message_shape = "anthropic"
                 else:
-                    jev_message_shape = "openai"
+                    jev_message_shape = _jev_message_shape(final_messages, model_name)
 
                 jev_result = await run_jev_active_retention(
                     proxy=self,
@@ -10354,6 +10411,13 @@ class OpenAIHandlerMixin:
                 # count with that placeholder would report a free lunch on a
                 # turn that changed nothing.
                 if jev_result.applied:
+                    # Everything the Jev mutation replaces, kept so the whole
+                    # mutation can be discarded as ONE unit if the replay
+                    # state cannot be moved with it (below).
+                    _pre_jev_messages = final_messages
+                    _pre_jev_tokens_after = tokens_after
+                    _pre_jev_ccr_hashes = ccr_hashes
+
                     final_messages = jev_result.messages
                     tokens_after = jev_result.tokens_after
                     # Additive and de-duplicated, order preserved: Headroom's
@@ -10365,18 +10429,17 @@ class OpenAIHandlerMixin:
                         _retained_cache = comp_cache
                         _retained_tracker = session_tracker
 
-                        def _rerecord_retained_session() -> None:
+                        def _rerecord_retained_session() -> bool:
                             # Without this the session state still holds the
                             # PRE-retention bytes while the caller forwards the
                             # retained ones: the next turn would replay the old
                             # prefix over the new one and bust the provider
                             # cache on the very first turn after a compaction.
+                            #
                             # TIMED acquire for the same reason the turn itself
                             # uses one — an untimed wait parks an executor
-                            # worker behind a slow session — and the
-                            # TimeoutError lands on the session-mode
-                            # 503-and-retry path, which leaves replay state
-                            # consistent with what the caller was given.
+                            # worker behind a slow session and arms the
+                            # compression quarantine for ALL traffic.
                             if not _retained_cache.session_turn_lock.acquire(
                                 timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
                             ):
@@ -10385,15 +10448,72 @@ class OpenAIHandlerMixin:
                                     "(re-recording retained messages)"
                                 )
                             try:
+                                # COMPARE-AND-SET. `_run_session_turn` released
+                                # this lock before the Jev call was awaited, so
+                                # a concurrent same-session turn can have
+                                # completed and recorded ITS state in the
+                                # meantime — this is the route the per-session
+                                # lock exists for. Only replace the state THIS
+                                # turn recorded; a newer turn's replay state is
+                                # what the caller most recently forwarded and
+                                # must never be rolled back to an older turn's
+                                # transcript. The recorded snapshots are deep
+                                # copies, so comparison is by value.
+                                if (
+                                    _retained_tracker.get_last_original_messages() != messages
+                                    or _retained_tracker.get_last_forwarded_messages()
+                                    != _pre_jev_messages
+                                ):
+                                    return False
                                 _retained_cache.update_from_result(messages, _retained_messages)
                                 _retained_tracker.record_returned(messages, _retained_messages)
+                                return True
                             finally:
                                 _retained_cache.session_turn_lock.release()
 
-                        await self._run_compression_in_executor(
-                            _rerecord_retained_session,
-                            timeout=COMPRESSION_TIMEOUT_SECONDS,
-                        )
+                        _rerecorded = False
+                        _rerecord_detail = "a newer turn already recorded this session"
+                        try:
+                            _rerecorded = await self._run_compression_in_executor(
+                                _rerecord_retained_session,
+                                timeout=COMPRESSION_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as rerecord_error:  # noqa: BLE001 - see below
+                            _rerecord_detail = _jev_log_safe_detail(
+                                rerecord_error, getattr(self.config, "jev", None)
+                            )
+                        if not _rerecorded:
+                            # FAIL OPEN. A busy lock, a quarantined executor or
+                            # a losing compare-and-set is a Jev step failing —
+                            # it must never turn a SUCCESSFUL Headroom
+                            # compression into a 503 (the handler's TimeoutError
+                            # branch would do exactly that for a session call).
+                            # Discard the mutation whole: the caller gets
+                            # Headroom's own output, which is precisely what
+                            # the session state still holds, so the two agree
+                            # again. The CCR entries staged for the abandoned
+                            # retention are harmless — nothing references them
+                            # and they expire on their lease.
+                            #
+                            # No `exc_info`: the formatter would render the
+                            # ORIGINAL exception text, defeating the scrubbing
+                            # in `_jev_log_safe_detail` for exactly the
+                            # exceptions that can carry the Jev endpoint or key.
+                            logger.warning(
+                                "[compress:%s] jev active retention: could not re-record "
+                                "the retained session state (%s); discarding the retention "
+                                "and returning Headroom's own compressed output",
+                                session_id,
+                                _rerecord_detail,
+                            )
+                            final_messages = _pre_jev_messages
+                            tokens_after = _pre_jev_tokens_after
+                            ccr_hashes = _pre_jev_ccr_hashes
+                            jev_info["applied"] = 0
+                            jev_info["hashes"] = []
+                            jev_info["reason"] = "rerecord_failed"
 
             tokens_saved = max(0, tokens_before - tokens_after)
             latency_ms = (time.time() - start_time) * 1000

@@ -204,6 +204,15 @@ def _install_jev(monkeypatch: pytest.MonkeyPatch) -> _Jev:
     return jev
 
 
+def _session_state(client: TestClient, session_id: str) -> tuple[Any, Any]:
+    """The very cache + tracker objects the handler will use for this session."""
+    proxy = client.app.state.proxy
+    key = f"{SESSION_KEY_PREFIX}{session_id}"
+    return proxy._get_compression_cache(key), proxy.session_tracker_store.get_or_create(
+        key, "openai"
+    )
+
+
 def test_a_boundary_turn_retains_and_rerecords_the_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -243,3 +252,216 @@ def test_a_boundary_turn_retains_and_rerecords_the_session(
         proxy = client.app.state.proxy
         tracker = proxy.session_tracker_store.get_or_create(f"{SESSION_KEY_PREFIX}s1", "openai")
         assert f"hash={hash_key}" in json.dumps(tracker.get_last_forwarded_messages())
+
+
+# --------------------------------------------------------------------------
+# The retained-state re-record is fail-open and never clobbers a newer turn.
+# --------------------------------------------------------------------------
+
+
+def _after_retention(monkeypatch: pytest.MonkeyPatch, hook: Callable[[], None]) -> None:
+    """Run ``hook`` in the window the turn lock is free, after the Jev call.
+
+    That window is exactly where a concurrent same-session turn lands: the
+    turn released ``session_turn_lock`` in its ``finally`` before the
+    orchestrator was awaited, and the re-record has not re-acquired it yet.
+    """
+    from headroom.proxy.jev import active_hook
+
+    real = active_hook.run_jev_active_retention
+
+    async def _wrapped(**kwargs: Any) -> Any:
+        result = await real(**kwargs)
+        hook()
+        return result
+
+    monkeypatch.setattr(active_hook, "run_jev_active_retention", _wrapped)
+
+
+def test_a_concurrent_turn_is_not_overwritten_by_the_rerecord(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_jev(monkeypatch)
+    newer = [{"role": "user", "content": "a newer same-session turn already recorded this"}]
+    state: dict[str, Any] = {}
+
+    def _a_concurrent_turn_completes() -> None:
+        cache, tracker = state["cache"], state["tracker"]
+        with cache.session_turn_lock:
+            cache.update_from_result(newer, newer)
+            tracker.record_returned(newer, newer)
+
+    _after_retention(monkeypatch, _a_concurrent_turn_completes)
+
+    with _client(_active_jev()) as client:
+        baseline = _post(client, mode="ccr", session_id="s-race-baseline")
+        assert baseline.status_code == 200, baseline.text
+        state["cache"], state["tracker"] = _session_state(client, "s-race")
+        resp = _post(client, mode="ccr", session_id="s-race", jev_compaction_boundary=True)
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+
+        # The newer turn's replay state is intact: the older boundary turn's
+        # retained messages did NOT overwrite it.
+        assert state["tracker"].get_last_forwarded_messages() == newer
+
+    # Jev ran, but its mutation was discarded, so the caller is given exactly
+    # what a non-boundary turn would have returned.
+    info = payload["jev"]
+    assert info["called"] is True
+    assert info["candidates"] >= 1
+    assert info["applied"] == 0
+    assert info["hashes"] == []
+    assert info["reason"] == "rerecord_failed"
+    assert payload["messages"] == baseline.json()["messages"]
+    assert payload["tokens_after"] == baseline.json()["tokens_after"]
+    assert payload["ccr_hashes"] == baseline.json()["ccr_hashes"]
+
+
+def test_a_busy_session_lock_fails_open_instead_of_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_jev(monkeypatch)
+    # The re-record's timed acquire, shortened so the test does not sit out
+    # the production 10s wait.
+    monkeypatch.setattr("headroom.proxy.handlers.openai._SESSION_TURN_LOCK_TIMEOUT_SECONDS", 0.05)
+    state: dict[str, Any] = {}
+
+    def _hold_the_turn_lock() -> None:
+        state["cache"].session_turn_lock.acquire()
+
+    _after_retention(monkeypatch, _hold_the_turn_lock)
+
+    with _client(_active_jev()) as client:
+        baseline = _post(client, mode="ccr", session_id="s-busy-baseline")
+        assert baseline.status_code == 200, baseline.text
+        state["cache"], state["tracker"] = _session_state(client, "s-busy")
+        try:
+            resp = _post(client, mode="ccr", session_id="s-busy", jev_compaction_boundary=True)
+        finally:
+            state["cache"].session_turn_lock.release()
+
+    # A Jev step must never turn a SUCCESSFUL compression into an error.
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    info = payload["jev"]
+    assert info["called"] is True
+    assert info["applied"] == 0
+    assert info["hashes"] == []
+    assert info["reason"] == "rerecord_failed"
+    assert payload["messages"] == baseline.json()["messages"]
+    assert payload["tokens_after"] == baseline.json()["tokens_after"]
+    assert payload["ccr_hashes"] == baseline.json()["ccr_hashes"]
+
+
+# --------------------------------------------------------------------------
+# message_shape describes the list Jev is actually shown, not the model name.
+# --------------------------------------------------------------------------
+
+
+def _anthropic_messages() -> list[dict[str, Any]]:
+    """The same conversation in Anthropic shape: a ``tool_result`` block."""
+    return [
+        {"role": "user", "content": "Get items"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "c1", "name": "get", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "c1", "content": _blob("a")}],
+        },
+        *[{"role": "assistant", "content": f"step {i}"} for i in range(6)],
+    ]
+
+
+def _shape_of(jev: _Jev) -> str:
+    assert jev.requests, "the route must reach the real Jev client"
+    return str(jev.requests[0]["state"]["message_shape"])
+
+
+def test_message_shape_reads_an_anthropic_list_under_an_openai_model_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jev = _install_jev(monkeypatch)
+    with _client(_active_jev()) as client:
+        resp = client.post(
+            "/v1/compress",
+            json={
+                "model": "gpt-4o",
+                "messages": _anthropic_messages(),
+                "config": {
+                    "mode": "ccr",
+                    "session_id": "s-shape-a",
+                    "jev_compaction_boundary": True,
+                },
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    assert _shape_of(jev) == "anthropic"
+
+
+def test_message_shape_reads_an_openai_list_under_a_claude_model_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jev = _install_jev(monkeypatch)
+    with _client(_active_jev()) as client:
+        resp = client.post(
+            "/v1/compress",
+            json={
+                "model": "claude-sonnet-4-5-20250929",
+                "messages": _messages(),
+                "config": {
+                    "mode": "ccr",
+                    "session_id": "s-shape-b",
+                    "jev_compaction_boundary": True,
+                },
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    assert _shape_of(jev) == "openai"
+
+
+# --------------------------------------------------------------------------
+# A gateway-claimed boundary turn: the provider body and the turn context the
+# re-drive replays must describe the SAME conversation.
+# --------------------------------------------------------------------------
+
+
+def test_a_gateway_boundary_turn_keeps_its_ctx_in_step_with_the_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_jev(monkeypatch)
+    with _client(_active_jev()) as client:
+        resp = client.post(
+            "/v1/compress",
+            json={
+                "model": "gpt-4o",
+                "messages": _messages(),
+                "config": {
+                    "mode": "ccr",
+                    "session_id": "s-gateway",
+                    "jev_compaction_boundary": True,
+                },
+                "gateway": {
+                    "can_redrive": True,
+                    "can_relay_response": True,
+                    "session_affinity": True,
+                    "plugin_version": "test",
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["jev"]["reason"] == "applied"
+        hash_key = payload["jev"]["hashes"][0]
+
+        pending = client.app.state.proxy.gateway_turns.get(payload["turn_id"])
+        assert pending is not None, "a relaying gateway turn must be registered"
+        # The redrive path re-calls the model with `ctx.messages`
+        # (`gateway_turn.py:1014`), while the provider was given
+        # `fields["body"]`. A redrive that replays the PRE-retention bytes
+        # after the provider saw the retention marker is a torn conversation.
+        assert f"hash={hash_key}" in json.dumps(pending.body["messages"])
+        assert pending.ctx is not None
+        assert pending.ctx.messages == pending.body["messages"]
