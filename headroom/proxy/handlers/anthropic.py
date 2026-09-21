@@ -2354,6 +2354,30 @@ class AnthropicHandlerMixin:
                 except Exception as e:
                     logger.debug(f"[{request_id}] post_compress hook error: {e}")
 
+            # Jev retention, Track A (shadow). Runs AFTER Headroom's own
+            # compression and BEFORE anything is forwarded: it records a
+            # projection (TP) and a metric, and never mutates
+            # `optimized_messages`. Default off; every failure path — including
+            # an unknown model or a Jev timeout — fails open with a metric.
+            # Deliberately not assigned: nothing it returns may reach the
+            # forwarded request.
+            from headroom.proxy.jev.hook import run_jev_shadow_hook
+
+            await run_jev_shadow_hook(
+                self,
+                provider="anthropic",
+                model=model,
+                messages=optimized_messages,
+                frozen_prefix=frozen_message_count,
+                optimized_tokens=optimized_tokens,
+                original_tokens=original_tokens,
+                session_id=session_id,
+                tokenizer=tokenizer,
+                message_shape="anthropic",
+                request_id=request_id,
+                context_limit_source=self.anthropic_provider,
+            )
+
             # CCR Tool Injection: Inject retrieval tool if compression occurred
             # OR if this session has previously done CCR (PR-B7 sticky-on).
             # The legacy `CCRToolInjector` flips on/off based on the *current*

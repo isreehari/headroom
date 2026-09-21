@@ -4049,6 +4049,26 @@ class OpenAIHandlerMixin:
             except Exception as e:
                 logger.debug(f"[{request_id}] post_compress hook error: {e}")
 
+        # Jev retention, Track A (shadow) — see handlers/anthropic.py for the
+        # contract. Observational only; `optimized_messages` is never mutated
+        # and the result is deliberately discarded.
+        from headroom.proxy.jev.hook import run_jev_shadow_hook
+
+        await run_jev_shadow_hook(
+            self,
+            provider="openai",
+            model=model,
+            messages=optimized_messages,
+            frozen_prefix=int(openai_frozen_count or 0),
+            optimized_tokens=optimized_tokens,
+            original_tokens=original_tokens,
+            session_id=openai_session_id,
+            tokenizer=tokenizer,
+            message_shape="openai",
+            request_id=request_id,
+            context_limit_source=self.openai_provider,
+        )
+
         # CCR Tool Injection: Inject retrieval tool if compression occurred
         # OR if this session has previously done CCR (PR-B7 sticky-on).
         # See `headroom/proxy/handlers/anthropic.py` and PR-B7 plan
@@ -6076,6 +6096,29 @@ class OpenAIHandlerMixin:
                     waste_signals_dict = _waste.to_dict()
             except Exception:
                 pass
+
+        # Jev retention, Track A (shadow) on the Responses path. The
+        # post-compression item list lives in body["input"] here (compression
+        # goes through CompressionUnits and rewrites the body in place), not in
+        # an `optimized_messages` variable, and this path keeps no frozen-prefix
+        # bookkeeping — so the protected prefix is 0. Observational only.
+        from headroom.proxy.jev.hook import run_jev_shadow_hook
+
+        _jev_input = body.get("input")
+        await run_jev_shadow_hook(
+            self,
+            provider="openai",
+            model=str(model or ""),
+            messages=_jev_input if isinstance(_jev_input, list) else None,
+            frozen_prefix=0,
+            optimized_tokens=optimized_tokens,
+            original_tokens=original_tokens,
+            session_id=_responses_session_id,
+            tokenizer=tokenizer,
+            message_shape="openai_responses",
+            request_id=request_id,
+            context_limit_source=self.openai_provider,
+        )
 
         # CCR: a stream:true request whose tool list carries headroom_retrieve
         # can't be intercepted mid-SSE-stream without full event-level
