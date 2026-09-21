@@ -60,11 +60,19 @@ def candidate_retention_hash(session_id: str, branch_id: str, content: str) -> s
     ``CompressionStore``'s own default key uses, satisfies ``store()``'s
     ``explicit_hash`` hex validation, and sits inside the 12–24 range both
     marker scanners accept.
+
+    The fields are LENGTH-PREFIXED, not merely separated. Any separator byte —
+    NUL included — can legally occur inside tool output, and a separated
+    encoding then lets one field bleed into the next: ``("a\\0b", "c")`` and
+    ``("a", "b\\0c")`` would hash identically, so two different branches of one
+    session could share an entry, and therefore a lease and a TTL. A length
+    prefix has no such collision: the parse is unambiguous for every input.
     """
     digest = hashlib.sha256()
     for part in (_RETENTION_HASH_VERSION, session_id, branch_id, content):
-        digest.update(part.encode("utf-8", "replace"))
-        digest.update(b"\x00")  # unambiguous field separator
+        encoded = part.encode("utf-8", "replace")
+        digest.update(f"{len(encoded)}:".encode("ascii"))
+        digest.update(encoded)
     return digest.hexdigest()[:24]
 
 
@@ -174,8 +182,15 @@ def stage_retention(
     #    reading the bytes back proves the content is retrievable — and the
     #    bytes must MATCH, because a collision or a stale row under the same
     #    key would otherwise let us drop content nothing holds a copy of.
+    #
+    #    `peek`, not `retrieve`: retrieve() is the model-facing read and has two
+    #    side effects this integrity check must not have — it logs a redacted
+    #    preview of the payload (on by default), which would put the retained
+    #    content in the log on every staged candidate and break this function's
+    #    identifiers-only contract, and it records an access, which would score
+    #    one phantom retrieval per candidate in the CCR feedback statistics.
     try:
-        entry = store.retrieve(hash_key)
+        entry = store.peek(hash_key)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "jev retention: CCR read-back failed for candidate %s (hash=%s, %s); keeping original",

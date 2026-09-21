@@ -600,6 +600,42 @@ class CompressionStore:
             json.dumps(event, ensure_ascii=False, separators=(",", ":")),
         )
 
+    def peek(self, hash_key: str) -> CompressionEntry | None:
+        """Read an entry back WITHOUT logging it or counting it as a retrieval.
+
+        :meth:`retrieve` is the model-facing read: it emits a
+        ``headroom_retrieve`` log event carrying a redacted preview of the
+        original content (on by default — see :func:`_payload_preview_enabled`)
+        and calls :meth:`CompressionEntry.record_access`, which feeds the CCR
+        feedback/TOIN statistics. Both are correct for a real retrieval and
+        wrong for an internal integrity check.
+
+        Jev active retention has to read an entry back to prove the write was
+        acknowledged before it drops the only other copy of the content
+        (``headroom/proxy/jev/retention_ccr.py``). Doing that through
+        :meth:`retrieve` would write the retained payload into the log on every
+        staged candidate — breaking that path's identifiers-only logging
+        contract — and would score one phantom retrieval per candidate, skewing
+        the very metrics the feedback loop learns from.
+
+        Like :meth:`exists`, this is a pure probe: an expired entry reads as
+        ``None`` and is left in place rather than deleted.
+
+        Args:
+            hash_key: Key returned by :meth:`store`.
+
+        Returns:
+            A defensive copy of the entry when it exists and is live, else
+            ``None``. The copy matters for the same reason it does in
+            :meth:`retrieve`: the in-memory backend hands out the live object,
+            whose mutable fields could otherwise be changed under the caller.
+        """
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return None
+            return replace(entry, search_queries=list(entry.search_queries))
+
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.
 

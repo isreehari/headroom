@@ -378,3 +378,79 @@ def test_re_store_floor_does_not_leak_across_different_keys(store: CompressionSt
     other = store.store("different content", "compressed")
     assert other != leased
     assert _stored_ttl(store, other) == 60
+
+
+def test_peek_returns_a_live_entry(store: CompressionStore) -> None:
+    hash_key = store.store(ORIGINAL, "compressed", tool_name="Read")
+    entry = store.peek(hash_key)
+    assert entry is not None
+    assert entry.original_content == ORIGINAL
+    assert entry.tool_name == "Read"
+
+
+def test_peek_returns_none_for_a_missing_entry(store: CompressionStore) -> None:
+    assert store.peek("deadbeefdeadbeefdeadbeef") is None
+
+
+def test_peek_returns_none_for_an_expired_entry_without_deleting_it(
+    store: CompressionStore,
+) -> None:
+    """A pure probe, like `exists`: it must not delete, and must not resurrect."""
+    hash_key = store.store(ORIGINAL, "compressed", ttl=60)
+    _backdate(store, hash_key, 3_600)
+
+    assert store.peek(hash_key) is None
+    assert store._backend.get(hash_key) is not None  # noqa: SLF001 - probe must not delete
+
+
+def test_peek_does_not_log_the_payload(
+    store: CompressionStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`retrieve` logs a redacted preview of the content; `peek` must not.
+
+    The retention read-back runs on every staged candidate, so logging there
+    would spill the retained tool output into the proxy log by default
+    (`_payload_preview_enabled()` is True when HEADROOM_LOG_PAYLOAD_PREVIEW is
+    unset). The `retrieve` half of this test is what keeps the `peek` half from
+    being vacuous.
+    """
+    hash_key = store.store(ORIGINAL, "compressed")
+
+    with caplog.at_level("DEBUG", logger=compression_store.__name__):
+        assert store.peek(hash_key) is not None
+    assert not [r for r in caplog.records if "headroom_retrieve" in r.getMessage()]
+
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger=compression_store.__name__):
+        assert store.retrieve(hash_key) is not None
+    assert [r for r in caplog.records if "headroom_retrieve" in r.getMessage()]
+
+
+def test_peek_does_not_count_as_a_retrieval(store: CompressionStore) -> None:
+    """`peek` must not feed the CCR feedback/TOIN statistics."""
+    hash_key = store.store(ORIGINAL, "compressed")
+    for _ in range(3):
+        assert store.peek(hash_key) is not None
+
+    entry = store._backend.get(hash_key)  # noqa: SLF001 - reading without recording access
+    assert entry is not None
+    assert entry.retrieval_count == 0
+
+    assert store.retrieve(hash_key) is not None
+    after = store._backend.get(hash_key)  # noqa: SLF001
+    assert after is not None
+    assert after.retrieval_count == 1
+
+
+def test_peek_hands_back_a_defensive_copy(store: CompressionStore) -> None:
+    """Mutating what `peek` returns must not corrupt the stored entry."""
+    hash_key = store.store(ORIGINAL, "compressed")
+    entry = store.peek(hash_key)
+    assert entry is not None
+    entry.ttl = 1
+    entry.search_queries.append("injected")
+
+    stored = store._backend.get(hash_key)  # noqa: SLF001
+    assert stored is not None
+    assert stored.ttl == 60
+    assert stored.search_queries == []

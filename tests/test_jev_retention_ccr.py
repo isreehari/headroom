@@ -12,6 +12,7 @@ is exercised once, here.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -66,6 +67,19 @@ def test_hash_fields_cannot_be_smeared_into_each_other() -> None:
     and therefore one lease and one TTL.
     """
     assert candidate_retention_hash("s1a", "b", "p") != candidate_retention_hash("s1", "ab", "p")
+
+
+def test_hash_separator_cannot_be_forged_from_inside_a_field() -> None:
+    """A field containing the separator byte must not be able to fake a boundary.
+
+    Tool output is arbitrary text and can legally contain NUL, so a
+    separator-only encoding is ambiguous: ("a\\0b", "c") and ("a", "b\\0c")
+    would collide. Length-prefixing removes the ambiguity.
+    """
+    assert candidate_retention_hash("a\x00b", "c", "p") != candidate_retention_hash(
+        "a", "b\x00c", "p"
+    )
+    assert candidate_retention_hash("s", "b", "1:x") != candidate_retention_hash("s", "b1", ":x")
 
 
 def test_hash_is_accepted_as_an_explicit_store_key() -> None:
@@ -173,7 +187,7 @@ def test_read_back_with_different_content_returns_none() -> None:
 
 def test_missing_read_back_returns_none() -> None:
     class Amnesiac(CompressionStore):
-        def retrieve(self, hash_key: str, query: str | None = None) -> None:  # type: ignore[override]
+        def peek(self, hash_key: str) -> None:  # type: ignore[override]
             return None
 
     store = Amnesiac(default_ttl=60, enable_feedback=False, backend=InMemoryBackend())
@@ -201,7 +215,7 @@ def test_store_failure_returns_none_and_does_not_raise() -> None:
 
 def test_read_back_failure_returns_none_and_does_not_raise() -> None:
     class Exploding(CompressionStore):
-        def retrieve(self, hash_key: str, query: str | None = None) -> None:  # type: ignore[override]
+        def peek(self, hash_key: str) -> None:  # type: ignore[override]
             raise RuntimeError("disk on fire")
 
     lease = _stage(Exploding(default_ttl=60, enable_feedback=False, backend=InMemoryBackend()))
@@ -235,6 +249,57 @@ def test_failed_stage_logs_no_content(caplog: pytest.LogCaptureFixture) -> None:
     assert jev_records
     for record in jev_records:
         assert secret not in record.getMessage()
+
+
+def test_successful_stage_logs_no_content_at_any_level(caplog: pytest.LogCaptureFixture) -> None:
+    """Staging must not spill the retained payload into the log.
+
+    The acknowledged read-back goes through `CompressionStore.peek`, not
+    `retrieve`: `retrieve` emits a `headroom_retrieve` event carrying a
+    redacted PREVIEW of the original content, and the preview is on by default
+    (HEADROOM_LOG_PAYLOAD_PREVIEW unset). Staging every candidate of a boundary
+    turn through that would write the retained tool output to the log.
+    """
+    store = _store()
+    content = "ORIGINAL TOOL OUTPUT for candidate zero"
+    with caplog.at_level(logging.DEBUG):  # root: captures every logger involved
+        lease = stage_retention(
+            store,
+            candidate_id="cand_0000",
+            session_id="s1",
+            branch_id="compress",
+            content=content,
+            tool_name="get_items",
+            tool_call_id="call_1",
+            original_tokens=4096,
+        )
+    assert lease is not None
+    for record in caplog.records:
+        message = record.getMessage()
+        assert content not in message
+        assert "headroom_retrieve" not in message
+
+    # Positive control: the same read through `retrieve` DOES log the payload,
+    # so the assertions above are about `peek`, not about a deaf caplog.
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        assert store.retrieve(lease.hash_key) is not None
+    assert any(content in r.getMessage() for r in caplog.records)
+
+
+def test_successful_stage_scores_no_retrieval() -> None:
+    """The integrity read-back must not be counted as a real retrieval.
+
+    `retrieve` calls `record_access`, so reading back through it would score
+    one phantom retrieval per staged candidate and skew the CCR feedback
+    statistics the TOIN loop learns from.
+    """
+    store = _store()
+    lease = _stage(store)
+    assert lease is not None
+    entry = store._backend.get(lease.hash_key)  # noqa: SLF001 - must not record an access
+    assert entry is not None
+    assert entry.retrieval_count == 0
 
 
 def test_first_write_already_carries_the_lease() -> None:
