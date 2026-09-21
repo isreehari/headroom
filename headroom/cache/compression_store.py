@@ -436,6 +436,27 @@ class CompressionStore:
                         "Duplicate store for hash=%s, updating entry",
                         hash_key,
                     )
+                # One-way retention floor: a re-store may LENGTHEN an entry's
+                # life, never shorten it. The overwrite above installs a brand
+                # new entry with a fresh created_at and (usually) the default
+                # TTL, and the CCR mirror bridge re-stores the same
+                # explicit_hash on every turn a marker is re-encountered. That
+                # would silently wipe a retention lease taken by
+                # :meth:`extend_ttl` in an earlier turn, and the entry would
+                # then expire while its marker is still in the conversation —
+                # a guaranteed 404 on /v1/retrieve with no copy left anywhere,
+                # which is precisely what the lease exists to prevent.
+                #
+                # The DEADLINE is what is carried forward, not the raw ttl
+                # number: ttl is relative to created_at, and created_at has
+                # just moved to now, so reusing the old ttl would silently
+                # extend the deadline by the old entry's age. An already
+                # expired entry has no life to preserve (and must not be
+                # resurrected), so it is left to take the new TTL as written.
+                if not existing.is_expired():
+                    floor_ttl = math.ceil(existing.created_at + existing.ttl - entry.created_at)
+                    if floor_ttl > entry.ttl:
+                        entry.ttl = floor_ttl
                 # Mark old heap entry as stale since we're replacing it.
                 self._stale_heap_entries += 1
 

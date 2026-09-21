@@ -316,3 +316,65 @@ def test_extend_ttl_persists_to_the_sqlite_ttl_column(tmp_path: Path) -> None:
         assert entry.original_content == ORIGINAL
     finally:
         _close(reopened)
+
+
+def test_re_store_does_not_shorten_a_leased_entry(store: CompressionStore) -> None:
+    """A re-store must never cut an unexpired entry's life short.
+
+    `store()` overwrites an existing key in place with a fresh
+    `created_at`/`ttl`, and the CCR mirror bridge re-stores the same
+    `explicit_hash` on every turn a marker is re-encountered. Without a one-way
+    deadline floor, the retention lease taken in turn N is wiped in turn N+1 and
+    the entry expires while its marker is still in the conversation -- a
+    guaranteed 404 on `/v1/retrieve` with no copy left anywhere.
+    """
+    hash_key = store.store(ORIGINAL, "compressed")
+    assert store.extend_ttl(hash_key, 86_400) is True
+    leased_deadline = float(store.get_entry_status(hash_key)["expires_at"])
+
+    # Turn N+1: same content, same key, the store's (short) default TTL.
+    assert store.store(ORIGINAL, "compressed", explicit_hash=hash_key) == hash_key
+
+    status = store.get_entry_status(hash_key)
+    assert status["status"] == "available"
+    assert float(status["expires_at"]) >= leased_deadline - 1
+    assert _remaining(store, hash_key) >= 86_400
+
+
+def test_re_store_may_lengthen_but_never_shortens(store: CompressionStore) -> None:
+    """The floor is one-way: a longer TTL on a re-store still wins."""
+    hash_key = store.store(ORIGINAL, "compressed", ttl=3_600)
+    assert store.store(ORIGINAL, "compressed", explicit_hash=hash_key, ttl=7_200) == hash_key
+    assert _remaining(store, hash_key) >= 7_200 - 1
+
+    assert store.store(ORIGINAL, "compressed", explicit_hash=hash_key, ttl=60) == hash_key
+    assert _remaining(store, hash_key) >= 7_200 - 1
+
+
+def test_re_store_floor_survives_an_aged_entry(store: CompressionStore) -> None:
+    """The floor carries the DEADLINE forward, not the raw ttl number."""
+    hash_key = store.store(ORIGINAL, "compressed", ttl=86_400)
+    _backdate(store, hash_key, 3_600)  # one hour old: 85_800s of life left
+    assert store.store(ORIGINAL, "compressed", explicit_hash=hash_key) == hash_key
+
+    remaining = _remaining(store, hash_key)
+    assert 82_000 <= remaining <= 86_400 + 1
+
+
+def test_re_store_of_an_expired_entry_starts_a_fresh_window(store: CompressionStore) -> None:
+    """An expired entry has no life to preserve; the new TTL applies as written."""
+    hash_key = store.store(ORIGINAL, "compressed", ttl=86_400)
+    _backdate(store, hash_key, 90_000)
+    assert store.get_entry_status(hash_key)["status"] == "expired"
+
+    assert store.store(ORIGINAL, "compressed", explicit_hash=hash_key) == hash_key
+    assert _stored_ttl(store, hash_key) == 60
+    assert store.retrieve(hash_key) is not None
+
+
+def test_re_store_floor_does_not_leak_across_different_keys(store: CompressionStore) -> None:
+    """Only the SAME key's deadline is carried forward."""
+    leased = store.store(ORIGINAL, "compressed", ttl=86_400)
+    other = store.store("different content", "compressed")
+    assert other != leased
+    assert _stored_ttl(store, other) == 60
