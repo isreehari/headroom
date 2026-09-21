@@ -9,6 +9,7 @@ from typing import Any
 
 from headroom.proxy.jev.compaction import (
     JevCompactionBoundary,
+    JevCompactionCandidate,
     detect_compaction_boundary,
     extract_compaction_candidate,
     replace_candidate_output,
@@ -191,6 +192,82 @@ def test_extraction_never_mutates_the_frame() -> None:
     assert boundary is not None
     assert extract_compaction_candidate(inner, boundary, max_candidate_bytes=0) is not None
     assert json.dumps(inner, sort_keys=True) == before
+
+
+# --------------------------------------------------------------------------
+# The content binding must be injective.
+# --------------------------------------------------------------------------
+
+
+# `json.loads` accepts a lone surrogate escape, so a client can put one in a
+# tool output. Encoding it with `errors="replace"` collapses it onto the single
+# byte b"?" -- the same bytes a literal "?" produces -- which would make two
+# different bodies hash-identical and let a marker land on content that was
+# never staged. The encoding used for the binding must be injective.
+_LONE_SURROGATE = json.loads('"\\ud800"')
+
+
+def _candidate_for(output: Any) -> tuple[dict[str, Any], JevCompactionCandidate]:
+    inner = _inner(output)
+    boundary = detect_compaction_boundary(inner)
+    assert boundary is not None
+    candidate = extract_compaction_candidate(inner, boundary, max_candidate_bytes=0)
+    assert candidate is not None
+    return inner, candidate
+
+
+def test_a_lone_surrogate_body_does_not_collide_with_a_question_mark() -> None:
+    assert _LONE_SURROGATE == "\ud800"
+    _, surrogate = _candidate_for(_LONE_SURROGATE)
+    _, question = _candidate_for("?")
+    assert surrogate.output_text == _LONE_SURROGATE
+    assert question.output_text == "?"
+    assert surrogate.content_sha256 != question.content_sha256
+    assert surrogate.candidate_id != question.candidate_id
+
+
+def test_replace_refuses_a_body_swapped_across_the_old_collision_class() -> None:
+    inner, candidate = _candidate_for(_LONE_SURROGATE)
+    inner["input"][0]["output"] = "?"
+    before = json.dumps(inner, sort_keys=True)
+    assert replace_candidate_output(inner, candidate, "[marker]") is False
+    assert json.dumps(inner, sort_keys=True) == before
+    assert inner["input"][0]["output"] == "?"
+
+    # ...and the mirror direction: staged "?", body swapped to the surrogate.
+    inner, candidate = _candidate_for("?")
+    inner["input"][0]["output"] = _LONE_SURROGATE
+    before = json.dumps(inner, sort_keys=True)
+    assert replace_candidate_output(inner, candidate, "[marker]") is False
+    assert json.dumps(inner, sort_keys=True) == before
+
+
+def test_a_lone_surrogate_body_still_round_trips_when_it_is_unchanged() -> None:
+    # Injectivity must not be bought by declining the candidate: an untouched
+    # surrogate body is still extractable and still replaceable.
+    inner, candidate = _candidate_for(_LONE_SURROGATE)
+    assert replace_candidate_output(inner, candidate, "[marker]") is True
+    assert inner["input"][0]["output"] == "[marker]"
+
+    nested, nested_candidate = _candidate_for({"k": _LONE_SURROGATE})
+    assert replace_candidate_output(nested, nested_candidate, "[marker]") is True
+    assert nested["input"][0]["output"] == "[marker]"
+
+
+def test_distinct_surrogates_hash_distinctly() -> None:
+    seen = {_candidate_for(chr(code))[1].content_sha256 for code in range(0xD800, 0xD810)}
+    assert len(seen) == 16
+
+
+def test_the_byte_ceiling_uses_the_same_encoding_as_the_hash() -> None:
+    # A lone surrogate is 3 bytes under the binding's encoding, not 1. The
+    # ceiling must agree with the hash or the two can disagree about the body.
+    body = _LONE_SURROGATE * 8  # 24 bytes encoded, 8 under a lossy encoding
+    inner = _inner(body)
+    boundary = detect_compaction_boundary(inner)
+    assert boundary is not None
+    assert extract_compaction_candidate(inner, boundary, max_candidate_bytes=16) is None
+    assert extract_compaction_candidate(inner, boundary, max_candidate_bytes=24) is not None
 
 
 # --------------------------------------------------------------------------
