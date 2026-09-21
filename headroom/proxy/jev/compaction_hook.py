@@ -396,14 +396,18 @@ async def apply_jev_compaction_boundary(
         # path only would undercount `candidates` and lose `candidate_tokens`
         # entirely whenever the CCR commit fails.
         #
-        # `estimated_tokens` is `bytes // 4` (see compaction.py). It is an
-        # estimate, never a measurement, and everything derived from it below
-        # is declared as such through `realized_savings_estimated`.
+        # `estimated_tokens` is `bytes // 4` (see compaction.py). There is no
+        # tokenizer in reach at a WebSocket frame boundary, so every token
+        # number this track reports goes into an `_estimated` counter and
+        # never into the measured one Tracks A and B fill with tokenizer
+        # counts. `candidates`/`candidates_sent` are unit-free counts and do
+        # aggregate across tracks; the boundary carries exactly one candidate
+        # and it is always sent, so nothing is ever trimmed here.
         record_jev_accounting(
             metrics,
             candidates=1,
             candidates_sent=1,
-            candidate_tokens=candidate.estimated_tokens,
+            candidate_tokens_estimated=candidate.estimated_tokens,
         )
         if decision != JEV_DECISION_DROP:
             _record_jev_event(metrics, "compaction_keep")
@@ -462,10 +466,12 @@ async def apply_jev_compaction_boundary(
         # already accounted for by the existing WS usage path, and subtracting
         # a whole-frame TF from a candidate-sized TH would be meaningless.
         #
-        # Both sides are `bytes // 4` estimates -- there is no tokenizer in
-        # reach at a WS frame boundary -- so the whole of this contribution to
-        # `realized_savings` is also reported as `realized_savings_estimated`.
-        # It is a saving that really happened; its SIZE is an estimate.
+        # Both sides are `bytes // 4` estimates, so the pair goes into the
+        # `_estimated` twins of TH/TF and `/stats` derives
+        # `realized_savings_estimated` from them, beside — never inside — the
+        # measured `realized_savings`. It is a saving that really happened;
+        # its SIZE is an estimate, and mixing the two units in one counter
+        # would leave an operator unable to say which they were reading.
         marker_tokens = max(1, len(lease.marker) // 4)
         record_jev_accounting(
             metrics,
@@ -473,9 +479,8 @@ async def apply_jev_compaction_boundary(
             applied=1,
             ccr_staged=1,
             ccr_acknowledged=1,
-            tokens_active_baseline=candidate.estimated_tokens,
-            tokens_final=marker_tokens,
-            realized_savings_estimated=max(0, candidate.estimated_tokens - marker_tokens),
+            tokens_active_baseline_estimated=candidate.estimated_tokens,
+            tokens_final_estimated=marker_tokens,
         )
         logger.info(
             "[%s] jev compaction boundary: dropped 1 candidate session_id=%s "

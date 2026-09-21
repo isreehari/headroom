@@ -412,6 +412,11 @@ class JevShadowRunner:
                 fallbacks=1,
                 candidates=len(eligible),
                 candidates_sent=len(sent),
+                candidates_trimmed=max(0, len(eligible) - len(sent)),
+                # A rejected call is not a free call: it carried a payload,
+                # and its size is what tells a too-large request apart from a
+                # broken credential. Recorded on failure exactly as on success.
+                candidate_tokens=sum(cand.est_tokens for cand in sent),
                 # A timeout and a refusal are different operational problems;
                 # `calls_failed` stays the sum so one series still covers both.
                 **{classify_call_error(answer.error) or "calls_rejected": 1},
@@ -425,6 +430,36 @@ class JevShadowRunner:
                 latency_ms=answer.latency_ms,
                 error=answer.error,
             )
+
+        tallies = {"keep": 0, "truncate": 0, "drop": 0}
+        for decision in answer.decisions.values():
+            if decision in tallies:
+                tallies[decision] += 1
+
+        # The CALL is accounted for here -- before the staleness check, and
+        # therefore on the stale path too. A stale answer is a normal shadow
+        # outcome, not an error: the request was made, the tokens were spent
+        # and Jev billed for them, so leaving it out of `calls_attempted` made
+        # the counter understate real Jev traffic (and its cost) by exactly
+        # the turns that raced. The DECISIONS are real too and are counted for
+        # the same reason, which keeps
+        # `keep + truncate + drop == candidates_sent`.
+        #
+        # What is deliberately NOT recorded here is the token pair: TH and TP
+        # are measured below against a message list the conversation has
+        # already moved past, so a stale turn's projection is meaningless and
+        # must never reach TP.
+        self._record_accounting(
+            calls_attempted=1,
+            calls_completed=1,
+            candidates=len(eligible),
+            candidates_sent=len(sent),
+            candidates_trimmed=max(0, len(eligible) - len(sent)),
+            candidate_tokens=sum(cand.est_tokens for cand in sent),
+            keep=tallies["keep"],
+            truncate=tallies["truncate"],
+            drop=tallies["drop"],
+        )
 
         # 7. The conversation may have moved on while the call was in flight.
         if not self.identity_store.is_current(identity):
@@ -447,29 +482,20 @@ class JevShadowRunner:
             projected_messages, count_messages=count_messages, count_text=count_text
         )
 
-        tallies = {"keep": 0, "truncate": 0, "drop": 0}
-        for decision in answer.decisions.values():
-            if decision in tallies:
-                tallies[decision] += 1
-
         self._record("shadow_projected")
         if tallies["keep"] == len(sent):
             # The old metadata-keep-v2 bias: unseen results always come back
             # "keep". Worth a counter, not a failure.
             self._record("shadow_all_keep")
 
+        # Only the token pair is left to record: the call and the decisions
+        # were counted above, before the staleness gate.
+        #
+        # T0 as the caller measured it, TH and TP as this turn measured them.
+        # TP is a projection: it is kept away from tokens_final and `applied`
+        # stays at zero, because Track A rewrote nothing. All three are
+        # tokenizer counts, so none of them touches an `_estimated` counter.
         self._record_accounting(
-            calls_attempted=1,
-            calls_completed=1,
-            candidates=len(eligible),
-            candidates_sent=len(sent),
-            candidate_tokens=sum(cand.est_tokens for cand in sent),
-            keep=tallies["keep"],
-            truncate=tallies["truncate"],
-            drop=tallies["drop"],
-            # T0 as the caller measured it, TH and TP as this turn measured
-            # them. TP is a projection: it is kept away from tokens_final and
-            # `applied` stays at zero, because Track A rewrote nothing.
             tokens_baseline=max(0, int(original_tokens or 0)),
             tokens_headroom=th,
             tokens_projected=tp,

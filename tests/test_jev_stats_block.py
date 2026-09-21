@@ -23,6 +23,7 @@ from headroom.proxy.jev.client import JevAnswer
 from headroom.proxy.jev.compaction_hook import apply_jev_compaction_boundary
 from headroom.proxy.jev.compaction_state import JevCompactionRevisionStore
 from headroom.proxy.jev.config import JevConfig
+from headroom.proxy.jev.identity import JevIdentityStore
 from headroom.proxy.jev.shadow import JevShadowRunner
 from headroom.proxy.prometheus_metrics import JEV_ACCOUNTING_FIELDS, PrometheusMetrics
 
@@ -71,7 +72,12 @@ def test_every_design_doc_accounting_field_is_reported() -> None:
         "calls_rejected",
         "calls_failed",
         "candidates",
+        "candidates_sent",
+        "candidates_trimmed",
         "candidate_tokens",
+        "candidate_tokens_estimated",
+        "tokens_active_baseline_estimated",
+        "tokens_final_estimated",
         "keep",
         "truncate",
         "drop",
@@ -85,6 +91,21 @@ def test_every_design_doc_accounting_field_is_reported() -> None:
         "realized_savings_estimated",
     ):
         assert snapshot[field] == 0, f"{field} must be present and zeroed from the start"
+
+
+def test_measured_and_estimated_token_counters_are_named_apart() -> None:
+    """No field may hold a mixture of tokenizer counts and `bytes // 4`.
+
+    The allowlist is the contract, so the pairing is asserted on the allowlist
+    itself: every ``*_estimated`` counter has a measured counterpart of the
+    same name, and the three counters a track could blend are all paired.
+    """
+    for measured in ("candidate_tokens", "tokens_active_baseline", "tokens_final"):
+        assert measured in JEV_ACCOUNTING_FIELDS
+        assert f"{measured}_estimated" in JEV_ACCOUNTING_FIELDS
+    for name in JEV_ACCOUNTING_FIELDS:
+        if name.endswith("_estimated"):
+            assert name.removesuffix("_estimated") in JEV_ACCOUNTING_FIELDS
 
 
 def test_realized_and_projected_savings_come_from_disjoint_pairs() -> None:
@@ -359,19 +380,21 @@ class _ActiveProxy:
         self.metrics = metrics
 
 
-def _active_config() -> JevConfig:
-    return JevConfig(
-        mode="active",
-        api_key=API_KEY,
-        endpoint=ENDPOINT,
-        model="jev-test",
-        timeout_ms=500,
-        threshold_percent=80,
-        cooldown_turns=5,
-        max_candidate_tokens=4000,
-        max_candidates=12,
-        max_state_tokens=200_000,
-    )
+def _active_config(**overrides: Any) -> JevConfig:
+    values: dict[str, Any] = {
+        "mode": "active",
+        "api_key": API_KEY,
+        "endpoint": ENDPOINT,
+        "model": "jev-test",
+        "timeout_ms": 500,
+        "threshold_percent": 80,
+        "cooldown_turns": 5,
+        "max_candidate_tokens": 4000,
+        "max_candidates": 12,
+        "max_state_tokens": 200_000,
+    }
+    values.update(overrides)
+    return JevConfig(**values)
 
 
 def _blob(seed: str, rows: int = 60) -> str:
@@ -440,8 +463,14 @@ async def test_active_applied_records_its_own_baseline_and_measured_final(
     assert snapshot["realized_savings"] == (
         snapshot["tokens_active_baseline"] - snapshot["tokens_final"]
     )
-    # Track B measures with the tokenizer, so none of this is an estimate.
+    # Track B measures with the tokenizer, so none of this is an estimate and
+    # the `_estimated` counters stay untouched.
+    assert snapshot["candidate_tokens"] > 0
+    assert snapshot["candidate_tokens_estimated"] == 0
+    assert snapshot["tokens_active_baseline_estimated"] == 0
+    assert snapshot["tokens_final_estimated"] == 0
     assert snapshot["realized_savings_estimated"] == 0
+    assert snapshot["candidates_trimmed"] == 0
     # Track B never touches the projection pair.
     assert snapshot["tokens_projected"] == 0
     assert snapshot["projected_savings"] == 0
@@ -595,15 +624,25 @@ async def test_compaction_drop_records_an_estimated_realized_saving() -> None:
     assert snapshot["calls_completed"] == 1
     assert snapshot["candidates"] == 1
     assert snapshot["candidates_sent"] == 1
-    assert snapshot["candidate_tokens"] > 0
     assert snapshot["drop"] == 1
     assert snapshot["applied"] == 1
     assert snapshot["ccr_staged"] == 1
     assert snapshot["ccr_acknowledged"] == 1
-    assert snapshot["realized_savings"] > 0
-    # Track C's pair is `bytes // 4` on both sides, so every token of it is
-    # declared as an estimate rather than passed off as a measurement.
-    assert snapshot["realized_savings_estimated"] == snapshot["realized_savings"]
+    # Track C has no tokenizer in reach: every token it reports is `bytes // 4`
+    # and lands in an `_estimated` counter. The measured counters stay at zero,
+    # so nothing an operator reads as a measurement was produced by an
+    # estimate.
+    assert snapshot["candidate_tokens_estimated"] > 0
+    assert snapshot["tokens_active_baseline_estimated"] > 0
+    assert snapshot["tokens_final_estimated"] > 0
+    assert snapshot["candidate_tokens"] == 0
+    assert snapshot["tokens_active_baseline"] == 0
+    assert snapshot["tokens_final"] == 0
+    assert snapshot["realized_savings"] == 0
+    assert snapshot["realized_savings_estimated"] == (
+        snapshot["tokens_active_baseline_estimated"] - snapshot["tokens_final_estimated"]
+    )
+    assert snapshot["realized_savings_estimated"] > 0
     assert snapshot["tokens_projected"] == 0
 
 
@@ -856,3 +895,204 @@ def test_stats_history_is_not_extended_with_the_projection() -> None:
     assert payload["jev"]["projected_savings"] == 9_000
     assert payload["savings_history"] == []
     assert "jev" not in json.dumps(history)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 — accounting accuracy
+# ---------------------------------------------------------------------------
+
+
+async def test_decide_active_retention_reports_the_subset_it_actually_sent() -> None:
+    """Finding 1: ``JevActiveDecision`` could not tell a Jev-answered keep from
+    a budget-trimmed one (deferred here by Task 15), so the accounting counted
+    candidates that were never sent as both sent and kept."""
+    from headroom.proxy.jev.active import decide_active_retention
+
+    decision = await decide_active_retention(
+        config=_active_config(max_state_tokens=8_000),
+        client=_ShadowClient("drop"),
+        messages=_active_messages(),
+        frozen_prefix=0,
+        model="gpt-4o",
+        session_id="s1",
+        branch_id="b1",
+    )
+
+    assert len(decision.candidates) == 2
+    assert len(decision.sent) == 1
+    assert decision.sent[0] is decision.candidates[0]
+    # The trimmed candidate still defaults to keep so nothing acts on it, but
+    # that keep is Headroom's default, not Jev's verdict.
+    assert decision.decisions[decision.candidates[1].candidate_id] == "keep"
+    assert decision.decisions[decision.sent[0].candidate_id] == "drop"
+
+
+async def test_budget_trimmed_candidates_are_not_counted_as_sent_or_as_keeps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.proxy.jev.active_hook import run_jev_active_retention
+
+    _install_active_client(monkeypatch)
+    store = CompressionStore(default_ttl=60, enable_feedback=False, backend=InMemoryBackend())
+    monkeypatch.setattr("headroom.proxy.jev.active_hook.get_compression_store", lambda: store)
+
+    metrics = PrometheusMetrics()
+    proxy = _ActiveProxy(_active_config(max_state_tokens=8_000), metrics)
+    result = await run_jev_active_retention(
+        proxy=proxy, messages=_active_messages(), model="gpt-4o", session_id="s1"
+    )
+    assert result.reason == "applied"
+
+    snapshot = metrics.jev_snapshot()
+    assert snapshot["candidates"] == 2
+    assert snapshot["candidates_sent"] == 1
+    assert snapshot["candidates_trimmed"] == 1
+    # The one Jev answered, and nothing else. A trimmed candidate is neither a
+    # keep nor a drop: Jev was never asked about it.
+    assert snapshot["drop"] == 1
+    assert snapshot["keep"] == 0
+    assert snapshot["truncate"] == 0
+    assert snapshot["keep"] + snapshot["truncate"] + snapshot["drop"] == snapshot["candidates_sent"]
+    # And the token volume is the sent candidate's, not both candidates'.
+    assert snapshot["candidate_tokens"] > 0
+    assert snapshot["applied"] == 1
+
+
+class _NeverCurrentStore(JevIdentityStore):
+    """An identity store that reports every answer as already superseded."""
+
+    def is_current(self, identity: Any) -> bool:
+        return False
+
+
+async def test_a_stale_shadow_answer_is_still_counted_as_a_completed_call() -> None:
+    """Finding 2: a stale response is a normal shadow outcome, not an error.
+
+    Omitting it from `calls_attempted` made the counter understate real Jev
+    traffic — and therefore its cost — by exactly the turns that raced.
+    """
+    metrics = PrometheusMetrics()
+    runner = JevShadowRunner(
+        _SHADOW_CONFIG,
+        client=_ShadowClient("drop"),
+        metrics=metrics,
+        identity_store=_NeverCurrentStore(),
+    )
+    result = await runner.maybe_run(
+        provider="openai",
+        model="gpt-5.6",
+        messages=_shadow_messages(),
+        frozen_prefix=1,
+        optimized_tokens=900,
+        original_tokens=4000,
+        context_limit=1000,
+        session_id="sess-1",
+        count_text=_count_text,
+        count_messages=_count_messages,
+        message_shape="openai",
+    )
+    assert result.reason == "stale_revision"
+
+    snapshot = metrics.jev_snapshot()
+    assert snapshot["calls_attempted"] == 1
+    assert snapshot["calls_completed"] == 1
+    assert snapshot["calls_failed"] == 0
+    assert snapshot["candidates"] == 2
+    assert snapshot["candidates_sent"] == 2
+    assert snapshot["candidate_tokens"] > 0
+    assert snapshot["drop"] == 2
+    # The projection itself was measured against a conversation that has moved
+    # on, so it is correctly discarded and must never reach TP.
+    assert snapshot["tokens_headroom"] == 0
+    assert snapshot["tokens_projected"] == 0
+    assert snapshot["tokens_baseline"] == 0
+    assert snapshot["projected_savings"] == 0
+    assert snapshot["events"].get("shadow_stale_revision") == 1
+
+
+async def test_shadow_records_candidate_tokens_on_a_failed_call() -> None:
+    """Finding 3: the error paths recorded the candidate COUNT but dropped the
+    token volume, so a rejected call looked free."""
+    metrics = PrometheusMetrics()
+    await _run_shadow(metrics, client=_ShadowClient(error="ReadTimeout: bound exceeded"))
+
+    snapshot = metrics.jev_snapshot()
+    assert snapshot["candidates"] == 2
+    assert snapshot["candidates_sent"] == 2
+    assert snapshot["candidate_tokens"] > 0
+    assert snapshot["candidates_trimmed"] == 0
+
+
+async def test_active_records_candidate_tokens_on_a_failed_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.proxy.jev.active_hook import run_jev_active_retention
+
+    _install_active_client(monkeypatch, error="HTTPStatusError: 401 unauthorized")
+    store = CompressionStore(default_ttl=60, enable_feedback=False, backend=InMemoryBackend())
+    monkeypatch.setattr("headroom.proxy.jev.active_hook.get_compression_store", lambda: store)
+
+    metrics = PrometheusMetrics()
+    proxy = _ActiveProxy(_active_config(), metrics)
+    result = await run_jev_active_retention(
+        proxy=proxy, messages=_active_messages(), model="gpt-4o", session_id="s1"
+    )
+    assert result.reason == "call_failed"
+
+    snapshot = metrics.jev_snapshot()
+    assert snapshot["candidates"] == 2
+    assert snapshot["candidates_sent"] == 2
+    assert snapshot["candidate_tokens"] > 0
+    assert snapshot["calls_rejected"] == 1
+
+
+async def test_compaction_records_candidate_tokens_as_an_estimate_even_on_a_keep() -> None:
+    metrics = PrometheusMetrics()
+    _out, reason = await _run_compaction(metrics, client=_CompactionClient("keep"))
+    assert reason == "jev_compaction_keep"
+
+    snapshot = metrics.jev_snapshot()
+    assert snapshot["candidate_tokens_estimated"] > 0
+    assert snapshot["candidate_tokens"] == 0
+
+
+async def test_two_tracks_together_never_blend_measured_and_estimated_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 4: the whole point of the split.
+
+    With Track B and Track C both reporting into one snapshot, every measured
+    counter must hold only Track B's tokenizer numbers and every estimated
+    counter only Track C's ``bytes // 4`` ones.
+    """
+    from headroom.proxy.jev.active_hook import run_jev_active_retention
+
+    metrics = PrometheusMetrics()
+
+    # Track C alone first, so its contribution can be read off exactly.
+    await _run_compaction(metrics)
+    only_c = metrics.jev_snapshot()
+    assert only_c["realized_savings"] == 0
+    assert only_c["realized_savings_estimated"] > 0
+
+    _install_active_client(monkeypatch)
+    store = CompressionStore(default_ttl=60, enable_feedback=False, backend=InMemoryBackend())
+    monkeypatch.setattr("headroom.proxy.jev.active_hook.get_compression_store", lambda: store)
+    proxy = _ActiveProxy(_active_config(), metrics)
+    await run_jev_active_retention(
+        proxy=proxy, messages=_active_messages(), model="gpt-4o", session_id="s1"
+    )
+
+    both = metrics.jev_snapshot()
+    # Track B added nothing to the estimated side ...
+    assert both["candidate_tokens_estimated"] == only_c["candidate_tokens_estimated"]
+    assert both["tokens_active_baseline_estimated"] == only_c["tokens_active_baseline_estimated"]
+    assert both["tokens_final_estimated"] == only_c["tokens_final_estimated"]
+    assert both["realized_savings_estimated"] == only_c["realized_savings_estimated"]
+    # ... and Track C added nothing to the measured side.
+    assert both["candidate_tokens"] > only_c["candidate_tokens"] == 0
+    assert both["tokens_active_baseline"] > 0
+    assert both["realized_savings"] > 0
+    # Counts are unit-free, so those DO aggregate across tracks.
+    assert both["candidates"] == 3
+    assert both["applied"] == 3

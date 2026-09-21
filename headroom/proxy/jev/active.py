@@ -35,7 +35,7 @@ client scrubs every error string it produces before returning it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from headroom.proxy.jev.candidates import (
@@ -75,6 +75,15 @@ class JevActiveDecision:
     still honestly a candidate, it was simply never asked about.
     ``decisions`` has one entry per candidate in ``candidates``; a candidate
     Jev was not asked about, or did not answer for, is ``keep``.
+
+    ``sent`` is the subset the request budget admitted -- exactly the
+    candidates Jev was asked about, in order, and always a prefix of
+    ``candidates``. It exists because ``decisions`` alone cannot tell a
+    Jev-answered ``keep`` from a budget-trimmed one: both read ``"keep"``, and
+    reporting the second as the first overstates both how many candidates were
+    sent and how often Jev chose to keep. ``len(candidates) - len(sent)`` is
+    the trimmed count, which is its own signal: a high trim rate means the
+    request budget is the binding constraint, not Jev's judgement.
     """
 
     candidates: list[JevCandidate]
@@ -82,6 +91,7 @@ class JevActiveDecision:
     called: bool
     error: str | None
     latency_ms: float
+    sent: list[JevCandidate] = field(default_factory=list)
 
 
 async def decide_active_retention(
@@ -115,7 +125,7 @@ async def decide_active_retention(
     )
     if not candidates:
         return JevActiveDecision(
-            candidates=[], decisions={}, called=False, error=None, latency_ms=0.0
+            candidates=[], decisions={}, called=False, error=None, latency_ms=0.0, sent=[]
         )
 
     # Every selected candidate gets an answer, and the default is always the
@@ -157,12 +167,15 @@ async def decide_active_retention(
         max_state_tokens=config.max_state_tokens,
     )
     if not sent:
+        # Nothing fit the measured request budget: every candidate was
+        # trimmed, so `sent` is empty and none of these keeps is Jev's.
         return JevActiveDecision(
             candidates=candidates,
             decisions=decisions,
             called=False,
             error=None,
             latency_ms=0.0,
+            sent=[],
         )
 
     payload = make_payload(sent, view_tokens)
@@ -196,4 +209,5 @@ async def decide_active_retention(
         called=True,
         error=answer.error,
         latency_ms=answer.latency_ms,
+        sent=sent,
     )

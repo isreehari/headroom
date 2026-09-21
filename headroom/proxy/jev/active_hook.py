@@ -251,6 +251,13 @@ async def run_jev_active_retention(
                 calls_failed=1,
                 fallbacks=1,
                 candidates=len(decision.candidates),
+                # A rejected call is not a free call: it carried a payload, and
+                # its size is what an operator needs in order to tell a
+                # too-large request apart from a broken credential. Recorded on
+                # the failure paths exactly as on the success path.
+                candidates_sent=len(decision.sent),
+                candidates_trimmed=max(0, len(decision.candidates) - len(decision.sent)),
+                candidate_tokens=sum(c.est_tokens for c in decision.sent),
                 **{classify_call_error(decision.error) or "calls_rejected": 1},
             )
             return _unchanged("call_failed", candidates=total, called=decision.called)
@@ -265,8 +272,14 @@ async def run_jev_active_retention(
         # `keep`/`truncate`/`drop` are Jev's DECISIONS; what was carried out is
         # `applied`, recorded further down, and the gap between the two is a
         # partial-staging failure.
+        #
+        # The tallies run over `decision.sent`, NOT over every candidate. A
+        # candidate the measured request budget trimmed also reads `"keep"` in
+        # `decisions` — that is Headroom's safe default, not Jev's verdict —
+        # and counting it would inflate both the apparent keep rate and the
+        # apparent call volume. It is counted as `candidates_trimmed` instead.
         tallies = {"keep": 0, "truncate": 0, "drop": 0}
-        for cand in decision.candidates:
+        for cand in decision.sent:
             decided = decision.decisions.get(cand.candidate_id, "keep")
             if decided in tallies:
                 tallies[decided] += 1
@@ -275,8 +288,9 @@ async def run_jev_active_retention(
             calls_attempted=1,
             calls_completed=1,
             candidates=len(decision.candidates),
-            candidates_sent=len(decision.candidates),
-            candidate_tokens=sum(c.est_tokens for c in decision.candidates),
+            candidates_sent=len(decision.sent),
+            candidates_trimmed=max(0, len(decision.candidates) - len(decision.sent)),
+            candidate_tokens=sum(c.est_tokens for c in decision.sent),
             keep=tallies["keep"],
             truncate=tallies["truncate"],
             drop=tallies["drop"],

@@ -91,9 +91,13 @@ JEV_ACCOUNTING_FIELDS: tuple[str, ...] = (
     "calls_timed_out",
     "calls_rejected",
     # Candidate volume. `candidates` is everything selected, `candidates_sent`
-    # the subset the measured request budget actually asked about.
+    # the subset the measured request budget actually asked about, and
+    # `candidates_trimmed` the difference. A high trim rate means the request
+    # budget is the binding constraint rather than Jev's judgement, which is a
+    # different problem from Jev keeping everything.
     "candidates",
     "candidates_sent",
+    "candidates_trimmed",
     "candidate_tokens",
     # Answers: Jev's DECISION tallies, not what was carried out. A candidate
     # Jev said `drop` to whose CCR commit then failed still counts here as a
@@ -112,12 +116,16 @@ JEV_ACCOUNTING_FIELDS: tuple[str, ...] = (
     "tokens_projected",
     "tokens_active_baseline",
     "tokens_final",
-    # How much of `tokens_active_baseline - tokens_final` came from a
-    # `bytes // 4` ESTIMATE rather than a tokenizer measurement. Track B
-    # measures both sides with the model's tokenizer and contributes nothing
-    # here; Track C decides at a WS frame boundary where no tokenizer is in
-    # reach, so all of its contribution is estimated and says so.
-    "realized_savings_estimated",
+    # The `*_estimated` twins. Every token counter above holds a TOKENIZER
+    # measurement and nothing else; a track with no tokenizer in reach (Track
+    # C, deciding at a WebSocket frame boundary, where a candidate's size is
+    # `bytes // 4`) reports into these instead. Blending the two would leave
+    # an operator unable to say what unit a number is in, which is worse than
+    # two honest series, so the units are never summed together. Each name
+    # here is exactly its measured counterpart plus `_estimated`.
+    "candidate_tokens_estimated",
+    "tokens_active_baseline_estimated",
+    "tokens_final_estimated",
     # CCR: acknowledged means a verified read-back and a lease (Task 13).
     "ccr_staged",
     "ccr_acknowledged",
@@ -688,11 +696,13 @@ class PrometheusMetrics:
         measurement are different claims about different turns, and adding them
         would overstate both.
 
-        ``realized_savings_estimated`` is the part of ``realized_savings``
-        derived from a ``bytes // 4`` estimate rather than a tokenizer
-        measurement — Track C's whole contribution, since a WS frame boundary
-        has no tokenizer in reach. It is reported so an operator can see how
-        much of the realized number is measured and how much is estimated.
+        ``realized_savings_estimated`` is the same subtraction over the
+        ``*_estimated`` counters: the saving claimed by a track that had no
+        tokenizer in reach and priced its candidate at ``bytes // 4`` (Track C,
+        at a WebSocket frame boundary). It is a saving that really happened
+        whose SIZE is an estimate, so it is reported beside ``realized_savings``
+        rather than added to it — one blended number would leave an operator
+        unable to say what unit either half was in.
         """
         with self._obs_counter_lock:
             totals: dict[str, Any] = {
@@ -702,6 +712,10 @@ class PrometheusMetrics:
         totals["projected_savings"] = max(0, totals["tokens_headroom"] - totals["tokens_projected"])
         totals["realized_savings"] = max(
             0, totals["tokens_active_baseline"] - totals["tokens_final"]
+        )
+        totals["realized_savings_estimated"] = max(
+            0,
+            totals["tokens_active_baseline_estimated"] - totals["tokens_final_estimated"],
         )
         totals["events"] = events
         return totals
@@ -1640,7 +1654,7 @@ class PrometheusMetrics:
             # dashboard panel exists from the first scrape.
             lines.extend(
                 [
-                    "# HELP headroom_jev_accounting_total Jev retention accounting totals by field; token letters are T0=tokens_baseline, TH=tokens_headroom/tokens_active_baseline, TP=tokens_projected, TF=tokens_final. TP is a projection and is never part of the realized saving (tokens_active_baseline - tokens_final); realized_savings_estimated is the part of that realized saving derived from a bytes//4 estimate rather than a tokenizer measurement",
+                    "# HELP headroom_jev_accounting_total Jev retention accounting totals by field; token letters are T0=tokens_baseline, TH=tokens_headroom/tokens_active_baseline, TP=tokens_projected, TF=tokens_final. TP is a projection and is never part of the realized saving (tokens_active_baseline - tokens_final). Token fields hold tokenizer measurements; the matching *_estimated fields hold bytes//4 estimates from tracks with no tokenizer in reach, and the two are never summed together",
                     "# TYPE headroom_jev_accounting_total counter",
                 ]
             )
