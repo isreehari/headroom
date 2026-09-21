@@ -43,10 +43,19 @@ against the same fake client socket and fake upstream used by
   frame 1 (there that rewrite happens well before the hook), so the first-frame
   test spies on ``_compress_openai_responses_payload_in_executor`` instead and
   pins the order from both sides at once;
-* frames whose type the guard must reject -- cancel, session.update, and a frame
-  that is not JSON at all -- do NOT reach the hook, which is the guard's
-  *polarity*: no AST check can establish that, because an inverted test would
-  satisfy it just as well.
+* frames whose type the guard must reject -- ``response.cancel``,
+  ``session.update``, and a frame that is not JSON at all -- do NOT reach the
+  hook, which is the guard's *polarity*: no AST check can establish that,
+  because an inverted test would satisfy it just as well. **All three shapes are
+  exercised separately on each path**, because the two paths have two different
+  guards: the relay loop's is ``_inbound_frame_body.get("type") ==
+  "response.create"``, the first frame's is ``body.get("type") ==
+  "response.create" or ("type" not in body and "input" in body)``. A guard that
+  wrongly accepted a cancel frame on one path while rejecting it on the other
+  has to fail a test, so neither path may borrow the other's coverage --
+  ``test_relay_skips_the_hook_for_non_create_frames`` covers frames 2..N,
+  ``test_a_non_create_first_frame_does_not_reach_the_hook`` covers frame 1, and
+  each is parametrised over all three shapes.
 
 What none of it proves is the replay guarantee itself -- that the same boundary
 arriving under a second session id comes back stale. That is behaviour of the
@@ -1144,20 +1153,49 @@ async def test_first_frame_hook_is_handed_the_frame_before_first_frame_compressi
     )
 
 
+#: The three shapes the first-frame guard must reject, each named for what makes
+#: it distinct. They are NOT interchangeable: the first-frame guard is
+#: ``body.get("type") == "response.create" or ("type" not in body and "input" in
+#: body)``, so ``session.update`` is rejected by the first disjunct, a cancel
+#: frame by the first disjunct with a different type value, and a non-JSON
+#: payload only because ``body`` stays ``{}`` and the SECOND disjunct's
+#: ``"input" in body`` is false. Three different sub-expressions, so three cases.
+NON_CREATE_FIRST_FRAMES = [
+    pytest.param(
+        json.dumps({"type": "session.update", "session": {"model": "gpt-5.6-sol"}}),
+        id="session_update",
+    ),
+    pytest.param(_cancel_frame(), id="response_cancel"),
+    pytest.param("this frame is not JSON at all", id="not_json"),
+]
+
+
 @pytest.mark.asyncio
-async def test_a_non_create_first_frame_does_not_reach_the_hook() -> None:
-    """BEHAVIOURAL. The first-frame guard's polarity.
+@pytest.mark.parametrize("first", NON_CREATE_FIRST_FRAMES)
+async def test_a_non_create_first_frame_does_not_reach_the_hook(first: str) -> None:
+    """BEHAVIOURAL. The FIRST-frame guard's polarity, for all three shapes.
 
     ``test_first_frame_hook_sits_inside_a_guard_mentioning_response_create``
     proves only that the call is inside an ``if`` naming the constant -- an
-    inverted condition satisfies that too. Here a ``session.update`` frame opens
-    the connection and must not reach the hook, while the ``response.create``
-    that follows it does. Only frames whose ``type`` the first-frame branch
-    accepts may pay for Track C.
+    inverted condition satisfies that too.
+
+    Deliberately parametrised rather than leaning on
+    ``test_relay_skips_the_hook_for_non_create_frames``, which drives the same
+    three shapes through the OTHER call site. The two guards are different
+    expressions (see :data:`NON_CREATE_FIRST_FRAMES`), so a first-frame guard
+    that wrongly accepted a cancel frame, or a non-JSON payload, while still
+    rejecting ``session.update`` would have satisfied the earlier single-shape
+    version of this test with the file's coverage claim still reading as met.
+
+    Each case asserts both halves: the frame is forwarded to the upstream
+    untouched, AND the hook was not reached for it -- while the
+    ``response.create`` that follows on the same socket still is, so a guard
+    that simply never fires cannot pass.
+
+    **Does NOT prove** anything about frames 2..N; that is the relay-loop test.
     """
     seen: list[str] = []
     boundary = _boundary_frame()
-    first = json.dumps({"type": "session.update", "session": {"model": "gpt-5.6-sol"}})
     upstream = _FakeUpstream(_upstream_events())
     client_ws = _FakeWebSocket(frames=[first, boundary])
     handler = _DummyOpenAIHandler()
@@ -1169,8 +1207,13 @@ async def test_a_non_create_first_frame_does_not_reach_the_hook() -> None:
         await handler.handle_openai_responses_ws(client_ws)
 
     assert len(seen) == 1, (
-        "a non-create first frame must not reach the hook; only the "
+        f"the non-create first frame {first!r} must not reach the hook; only the "
         f"response.create that followed it may, but the hook saw {len(seen)} frames"
     )
-    assert json.loads(seen[0])["type"] == "response.create"
-    assert upstream.sent[0] == first, "the non-create first frame crossed untouched"
+    assert json.loads(seen[0])["type"] == "response.create", (
+        "the one frame that reached the hook must be the create frame, not the "
+        "non-create first frame"
+    )
+    assert upstream.sent[0] == first, (
+        "the non-create first frame must cross to the upstream untouched"
+    )
