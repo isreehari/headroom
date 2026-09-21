@@ -86,18 +86,56 @@ def _called_name(node: ast.Call) -> str | None:
 
 
 def _relay_function(tree: ast.Module) -> ast.AsyncFunctionDef:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == RELAY:
-            return node
-    raise AssertionError(f"{RELAY} not found in {OPENAI_HANDLER}")
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == RELAY
+    ]
+    assert len(matches) == 1, f"expected exactly one `{RELAY}` in {OPENAI_HANDLER}"
+    return matches[0]
 
 
 def _calls_in(node: ast.AST, name: str) -> list[ast.Call]:
+    """Every ``ast.Call`` in the subtree that *invokes* ``name``.
+
+    Deliberately narrow: this answers "where is it called", which is what the
+    ordering assertions need. It does NOT see the name used as a value, bound
+    to a local, or reached through an alias. Use :func:`_references_in` for
+    "is this name mentioned at all".
+    """
     return [
         child
         for child in ast.walk(node)
         if isinstance(child, ast.Call) and _called_name(child) == name
     ]
+
+
+def _references_in(node: ast.AST, name: str) -> list[ast.AST]:
+    """Every mention of ``name`` in the subtree, in any form.
+
+    Wider than :func:`_calls_in` on purpose, because some invariants are about
+    *reachability*, not about a call. Matches:
+
+    * ``ast.Name`` -- a bare reference, including one bound to a local or
+      passed as a value (``fn = _run_compression_in_executor``);
+    * ``ast.Attribute`` -- ``self._run_compression_in_executor``, and any other
+      object it might be reached through;
+    * ``ast.Constant`` -- the name as a string, which is how ``getattr`` and
+      ``functools.partial`` style indirection would spell it.
+
+    An alias bound *outside* the inspected subtree still escapes this, which no
+    single-subtree AST check can close; the behavioural tests are what cover
+    what actually runs.
+    """
+    found: list[ast.AST] = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id == name:
+            found.append(child)
+        elif isinstance(child, ast.Attribute) and child.attr == name:
+            found.append(child)
+        elif isinstance(child, ast.Constant) and child.value == name:
+            found.append(child)
+    return found
 
 
 def _position(node: ast.expr) -> tuple[int, int]:
@@ -112,7 +150,12 @@ def _sole_hook_call(relay: ast.AsyncFunctionDef) -> ast.Call:
 
 
 def _normalized(node: ast.AST) -> str:
-    """``ast.unparse`` output with quote style made irrelevant."""
+    """``ast.unparse`` output with quote style made irrelevant.
+
+    ``ast.unparse`` prefers single quotes, so a source-faithful comparison
+    would fail on quote style alone. Only used on short expressions whose
+    string literals contain no quote characters of their own.
+    """
     return ast.unparse(node).replace('"', "'")
 
 
@@ -244,16 +287,49 @@ def test_hook_call_passes_the_session_identity_config_and_store() -> None:
     assert len(call.args) == 1, "the frame is the sole positional argument"
 
 
-def test_hook_call_never_touches_the_shared_compression_executor() -> None:
+def test_jev_call_site_never_reaches_the_shared_compression_executor() -> None:
     """STRUCTURAL. Its timeout path quarantines compression for all later traffic.
 
-    Jev work must never be routed through ``_run_compression_in_executor``; the
+    ``_run_compression_in_executor``'s timeout path marks timeout debt and
+    quarantines the shared pool, which would switch Headroom's own compression
+    off for unrelated traffic. No Jev step may add a new way to arm that -- the
     orchestrator owns its own bound.
+
+    The check is for any *reference*, not just a call: passing the executor as a
+    value, binding it to a local or reaching it through an attribute or a
+    ``getattr`` string would arm the same quarantine just as effectively as
+    calling it inline, so ``ast.Name``, ``ast.Attribute`` and ``ast.Constant``
+    are all matched.
+
+    Scope, stated precisely: this covers the hook call's own subtree and the
+    whole ``if`` block Track C added to the relay. It cannot see an alias bound
+    elsewhere in the closure and handed in, which no single-subtree AST check
+    can; that residue is why the behavioural tests exist.
     """
-    call = _sole_hook_call(_relay_function(_module()))
-    assert not _calls_in(call, "_run_compression_in_executor"), (
-        "Jev work must never use the shared compression executor: its timeout "
-        "path quarantines compression for every later frame"
+    relay = _relay_function(_module())
+    call = _sole_hook_call(relay)
+    executor = "_run_compression_in_executor"
+
+    assert not _references_in(call, executor), (
+        "Jev work must never reference the shared compression executor: its "
+        "timeout path quarantines compression for every later frame"
+    )
+
+    # Widen to the whole statement Track C added, so a line like
+    # `fn = self._run_compression_in_executor` sitting beside the await is
+    # caught too.
+    jev_block = [
+        node for node in ast.walk(relay) if isinstance(node, ast.If) and call in set(ast.walk(node))
+    ]
+    assert jev_block, "the hook call must sit inside a guard (see the guard test)"
+    innermost = min(jev_block, key=lambda node: len(list(ast.walk(node))))
+    offending = [
+        ast.unparse(node)
+        for node in _references_in(innermost, executor)
+        if isinstance(node, ast.Name | ast.Attribute)
+    ]
+    assert not offending, (
+        f"the relay branch carrying the Jev hook references {executor}: {offending}"
     )
 
 
@@ -268,9 +344,16 @@ def test_relay_branches_on_the_imported_reason_constant() -> None:
     assert "REASON_DROPPED" in module_level.get("headroom.proxy.jev.compaction_hook", set()), (
         "branch on the exported REASON_* constant rather than re-typing the literal"
     )
-    relay_source = ast.unparse(_relay_function(tree))
-    assert '"jev_compaction_dropped"' not in relay_source
-    assert "'jev_compaction_dropped'" not in relay_source
+    # Matched as a *constant node*, not as text in the unparsed source: an
+    # earlier version of this test compared both quote styles against
+    # ``ast.unparse`` output, and since ``unparse`` normalizes to single quotes
+    # the double-quoted half could never have fired. A node walk has no such
+    # blind spot.
+    relay = _relay_function(tree)
+    assert not _references_in(relay, "jev_compaction_dropped"), (
+        "branch on the imported REASON_DROPPED constant rather than re-typing "
+        "the literal reason string in the relay"
+    )
 
 
 # ---------------------------------------------------------------------------

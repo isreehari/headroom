@@ -8508,7 +8508,8 @@ class OpenAIHandlerMixin:
                                     # marker. Returns `msg` byte-identical
                                     # unless an acknowledged CCR commit
                                     # succeeded; owns its own gating, timeout,
-                                    # logging and metrics; never raises.
+                                    # metrics and outcome logging for all
+                                    # thirteen reasons; never raises.
                                     msg, _jev_reason = await apply_jev_compaction_boundary(
                                         msg,
                                         jev_config=getattr(self.config, "jev", None),
@@ -8519,6 +8520,20 @@ class OpenAIHandlerMixin:
                                         metrics=getattr(self, "metrics", None),
                                     )
                                     if _jev_reason == REASON_DROPPED:
+                                        # NOT a second outcome log: the
+                                        # orchestrator already reported the
+                                        # drop with revision, candidate, CCR
+                                        # hash and token estimate. This adds
+                                        # the one fact it structurally cannot
+                                        # know -- `client_frame_index`, the
+                                        # relay-local frame ordinal every other
+                                        # WS line and every wire-debug capture
+                                        # on this route is keyed by. Without it
+                                        # a committed drop cannot be tied back
+                                        # to a specific client frame. Emitted
+                                        # only on the rare committed-drop path,
+                                        # and carries no exception text, no
+                                        # server text and no credentials.
                                         logger.info(
                                             "[%s] WS /v1/responses jev compaction drop "
                                             "frame=%d session_id=%s",
