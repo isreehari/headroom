@@ -34,6 +34,7 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -630,6 +631,71 @@ class CompressionStore:
                 self._stale_heap_entries += 1
 
             return status
+
+    def extend_ttl(self, hash_key: str, ttl: int) -> bool:
+        """Guarantee a live entry survives at least ``ttl`` more seconds (retention lease).
+
+        Jev active retention drops a tool result out of the forwarded
+        conversation and leaves a ``Retrieve original: hash=`` marker in its
+        place. That entry then holds the only copy of the content, so it has to
+        outlive the session-scale default TTL an ordinary compression entry
+        gets (where the original is still sitting in the caller's transcript).
+
+        ``ttl`` is measured **from now**, not from the entry's creation. The
+        store's TTL is relative to ``created_at``
+        (:meth:`CompressionEntry.is_expired` is ``now - created_at > ttl``), so
+        writing ``ttl`` straight into the field would give an entry that is
+        already 20 minutes old only ``ttl`` minus 20 minutes of life left. The
+        stored value is therefore raised to ``ceil(age) + ttl``; ``ceil``
+        rounds the sub-second remainder in the caller's favour, since the field
+        is an int and a lease must never come up short.
+
+        Extension is ONE-WAY: a lease that would leave the entry with less life
+        than it already has is ignored (the call still succeeds). Ordinary
+        compression re-stores the same content on every turn a marker is
+        re-encountered, and letting one of those shorten a lease that retention
+        took would expire the entry while its marker is still in the
+        conversation — a guaranteed 404 on ``/v1/retrieve`` with no copy left
+        anywhere.
+
+        An expired entry is reported as a failure and left untouched: it is not
+        deleted (so this stays a non-destructive probe, like :meth:`exists`) and
+        above all not resurrected, because its content is already unreachable
+        through :meth:`retrieve`.
+
+        Args:
+            hash_key: Key returned by :meth:`store`.
+            ttl: Seconds from now the entry must remain retrievable for. ``0``
+                is a valid no-op lease (it can never shorten anything).
+
+        Returns:
+            True when the entry exists, is not expired, and is now guaranteed
+            for at least ``ttl`` more seconds. False when the entry is missing
+            or already expired — the caller must then keep the original
+            content instead of replacing it with a marker.
+
+        Raises:
+            ValueError: ``ttl`` is negative.
+        """
+        if ttl < 0:
+            raise ValueError(f"ttl must be non-negative, got {ttl!r}")
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return False
+            # Age can only grow, so anchoring on it keeps the deadline
+            # (created_at + ttl) at least `ttl` seconds ahead of *this* moment.
+            required = math.ceil(time.time() - entry.created_at) + ttl
+            if entry.ttl < required:
+                entry.ttl = required
+                # Write back through the backend: the in-memory backend hands
+                # out the live object, but SQLiteBackend deserializes a fresh
+                # copy per get() and only refreshes the `ttl` column its purge
+                # query (and startup sweep) reads on set(), so the lease
+                # survives a restart as well as an opportunistic purge.
+                # created_at is untouched, so the eviction heap stays valid.
+                self._backend.set(hash_key, entry)
+            return True
 
     def get_stats(self) -> dict[str, Any]:
         """Get store statistics for monitoring."""
