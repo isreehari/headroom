@@ -77,6 +77,57 @@ def _config_for(proxy: Any, runner: Any) -> JevConfig:
     return JevConfig()
 
 
+def responses_token_counts(items: Any, tokenizer: Any, tokens_saved: int) -> tuple[int, int]:
+    """``(optimized_tokens, original_tokens)`` for a ``/v1/responses`` turn.
+
+    The Responses handler cannot supply these itself. Its own pair is counted
+    from a *synthetic* ``messages`` list built from ``instructions`` plus a
+    **string** ``input`` (``if isinstance(input_data, str)``); for the
+    list-valued ``input`` Codex actually sends, that list is empty or
+    instructions-only, so both numbers are ~0 and
+    :meth:`JevShadowRunner._attempt` would take the
+    ``shadow_below_threshold`` exit on literally every turn -- Track A would
+    never observe the Responses path at all.
+
+    So the post-compression item list is counted here instead, with
+    ``count_messages_corrected``: a plain message counter reads only
+    ``content`` and prices a ``function_call_output`` item's ``output``
+    payload at zero, and ``output`` is the exact field candidate selection and
+    the projection operate on.
+
+    ``original`` is reconstructed as ``optimized + tokens_saved`` rather than
+    counted, mirroring the handler's own ``optimized = original - saved``
+    relation: the pre-compression item list is gone by this point, and a
+    baseline counted against a different list would make ``TH`` incomparable.
+
+    Fails open to ``(0, 0)`` -- a non-list ``input``, a tokenizer missing its
+    methods, any raise. ``0`` lands on the runner's below-threshold skip, so a
+    turn this cannot measure is skipped under a named gate instead of being
+    counted as a Jev failure. Nothing is awaited here, so
+    ``asyncio.CancelledError`` cannot arise.
+    """
+    if not isinstance(items, list):
+        return (0, 0)
+    try:
+        from headroom.proxy.jev.candidates import count_messages_corrected
+
+        count_text = getattr(tokenizer, "count_text", None)
+        count_messages = getattr(tokenizer, "count_messages", None)
+        if not callable(count_text) or not callable(count_messages):
+            return (0, 0)
+        optimized = max(
+            0,
+            int(
+                count_messages_corrected(
+                    items, count_messages=count_messages, count_text=count_text
+                )
+            ),
+        )
+    except Exception:  # noqa: BLE001 - fail open, same contract as the hook.
+        return (0, 0)
+    return (optimized, optimized + max(0, int(tokens_saved or 0)))
+
+
 def _resolve_context_limit(context_limit_source: Any, model: str) -> int:
     """The model's context window, or ``0`` when there isn't a usable one.
 

@@ -392,3 +392,154 @@ async def test_a_disabled_runner_is_not_awaited_at_all() -> None:
 
     assert await _call(proxy, TripwireSource()) is None
     assert metrics.events == []
+
+
+# --- responses_token_counts -------------------------------------------------
+#
+# The Responses handler's own `original_tokens`/`optimized_tokens` are counted
+# from a synthetic `messages` list that is built from `instructions` plus a
+# *string* `input` only (handlers/openai.py: `if isinstance(input_data, str)`).
+# For the list-valued `input` Codex actually sends, that pair is ~0 and the
+# runner's threshold gate would skip every single turn. These cover the
+# replacement count.
+
+
+def _responses_items() -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": "hello"},
+        {"type": "function_call_output", "call_id": "fc0", "output": "D" * 4000},
+    ]
+
+
+def test_responses_token_counts_prices_function_call_output() -> None:
+    from headroom.proxy.jev.hook import responses_token_counts
+
+    items = _responses_items()
+    tokenizer = FakeTokenizer()
+    # The content-only counter misses the `output` payload entirely...
+    assert tokenizer.count_messages(items) < 10
+    optimized, original = responses_token_counts(items, tokenizer, 250)
+    # ...while the corrected count prices it.
+    assert optimized > 500
+    assert original == optimized + 250
+
+
+def test_responses_token_counts_keeps_original_minus_optimized_equal_to_saved() -> None:
+    from headroom.proxy.jev.hook import responses_token_counts
+
+    optimized, original = responses_token_counts(_responses_items(), FakeTokenizer(), 17)
+    assert original - optimized == 17
+
+
+@pytest.mark.parametrize("saved", [0, -5, None])
+def test_responses_token_counts_floors_a_nonsense_saved_at_zero(saved: Any) -> None:
+    from headroom.proxy.jev.hook import responses_token_counts
+
+    optimized, original = responses_token_counts(_responses_items(), FakeTokenizer(), saved)
+    assert original == optimized
+
+
+@pytest.mark.parametrize("items", ["a string input", None, 42, {"input": "x"}])
+def test_responses_token_counts_is_zero_for_a_non_list_input(items: Any) -> None:
+    from headroom.proxy.jev.hook import responses_token_counts
+
+    # (0, 0) lands on the runner's own below-threshold skip, so a string-shaped
+    # Responses turn is skipped by a named gate rather than mis-measured.
+    assert responses_token_counts(items, FakeTokenizer(), 100) == (0, 0)
+
+
+def test_responses_token_counts_fails_open_on_a_raising_tokenizer() -> None:
+    from headroom.proxy.jev.hook import responses_token_counts
+
+    class Exploding:
+        def count_text(self, text: str) -> int:
+            raise RuntimeError("boom")
+
+        def count_messages(self, messages: list[dict[str, Any]]) -> int:
+            raise RuntimeError("boom")
+
+    assert responses_token_counts(_responses_items(), Exploding(), 100) == (0, 0)
+
+
+def test_responses_token_counts_fails_open_on_a_tokenizer_without_the_methods() -> None:
+    from headroom.proxy.jev.hook import responses_token_counts
+
+    assert responses_token_counts(_responses_items(), None, 100) == (0, 0)
+    assert responses_token_counts(_responses_items(), object(), 100) == (0, 0)
+
+
+async def test_a_list_input_responses_turn_actually_reaches_jev() -> None:
+    """The regression this helper exists for, end to end through the runner.
+
+    With the handler's own synthetic-`messages` count the turn is skipped as
+    `below_threshold` on every single request; with the recounted pair the
+    same turn gets past the gate and a shadow call really happens.
+    """
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def decide(self, *, state: Any, questions: Any, candidate_ids: Any) -> Any:
+            from headroom.proxy.jev.client import JevAnswer
+
+            self.calls += 1
+            return JevAnswer(decisions=dict.fromkeys(candidate_ids, "drop"))
+
+        async def aclose(self) -> None:
+            return None
+
+    from headroom.proxy.jev.hook import responses_token_counts
+
+    items: list[dict[str, Any]] = [
+        {"role": "system", "content": "sys"},
+        {"type": "function_call_output", "call_id": "fc0", "output": "D" * 8000},
+        *[{"role": "assistant", "content": f"tail {i}"} for i in range(6)],
+    ]
+    tokenizer = FakeTokenizer()
+    config = JevConfig(mode="shadow", api_key="sk-test", threshold_percent=50, max_candidates=12)
+
+    # (a) what the handler's own locals would say for a list-valued `input`:
+    # `messages` is empty there, so the pair is ~0.
+    handler_optimized = tokenizer.count_messages([])
+    client_a = FakeClient()
+    proxy_a = FakeProxy(JevShadowRunner(config, client=client_a), FakeMetrics())
+    result_a = await run_jev_shadow_hook(
+        proxy_a,
+        provider="openai",
+        model="gpt-5.6",
+        messages=items,
+        frozen_prefix=0,
+        optimized_tokens=handler_optimized,
+        original_tokens=handler_optimized,
+        session_id="sess-resp",
+        tokenizer=tokenizer,
+        message_shape="openai_responses",
+        request_id="r",
+        context_limit_source=FakeLimitSource(1000),
+    )
+    assert result_a is not None and result_a.reason == "below_threshold"
+    assert client_a.calls == 0
+
+    # (b) what the call site now passes.
+    optimized, original = responses_token_counts(items, tokenizer, 300)
+    client_b = FakeClient()
+    proxy_b = FakeProxy(JevShadowRunner(config, client=client_b), FakeMetrics())
+    result_b = await run_jev_shadow_hook(
+        proxy_b,
+        provider="openai",
+        model="gpt-5.6",
+        messages=items,
+        frozen_prefix=0,
+        optimized_tokens=optimized,
+        original_tokens=original,
+        session_id="sess-resp",
+        tokenizer=tokenizer,
+        message_shape="openai_responses",
+        request_id="r",
+        context_limit_source=FakeLimitSource(1000),
+    )
+    assert result_b is not None and result_b.ran is True
+    assert client_b.calls == 1
+    # Still shadow: the caller's list is untouched.
+    assert items[1]["output"] == "D" * 8000

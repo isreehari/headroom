@@ -43,7 +43,16 @@ def test_openai_responses_calls_the_shadow_hook_on_the_input_items() -> None:
     assert "run_jev_shadow_hook(" in source
     assert 'message_shape="openai_responses"' in source
     assert 'body.get("input")' in source
-    assert "original_tokens=original_tokens" in source
+    # The baseline still reaches the hook, but NOT as the handler's own
+    # `original_tokens`: that pair is counted from a synthetic `messages` list
+    # holding only `instructions` plus a *string* `input`, so for a
+    # list-valued `input` it is ~0 and every turn would trip the runner's
+    # below-threshold gate. `responses_token_counts` recounts the real item
+    # list (pricing `function_call_output` payloads) and reconstructs the
+    # baseline from `tokens_saved`.
+    assert "responses_token_counts(" in source
+    assert "original_tokens=_jev_original" in source
+    assert "optimized_tokens=_jev_optimized" in source
 
 
 def test_no_call_site_assigns_from_the_hook() -> None:
