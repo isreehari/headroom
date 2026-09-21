@@ -321,10 +321,21 @@ When the mode is not `off`, Headroom sends the Jev endpoint a request containing
       WebSocket connection** -- not your conversation id, and not derived from
       anything the client sent -- plus the raw Codex `previous_response_id` as the
       branch id and the boundary's item count. Track C sends **no revision hash**.
-      Because that id is per connection, a reconnect produces a new one and Jev
-      cannot correlate the two; the boundary's own replay protection is keyed on
-      `previous_response_id` for exactly that reason;
+      A reconnect mints a new `session_id`, so correlation *by Headroom's own session
+      id* does not survive one -- but that is not unlinkability. The
+      provider-assigned `previous_response_id` sent as `branch_id` is **stable across
+      reconnects by design**: that stability is what the boundary's replay protection
+      is keyed on, so a replayed boundary remains linkable to its earlier attempt
+      through `branch_id`;
 - fixed English instructions and the keep/truncate/drop criteria.
+
+None of these identifiers is an anonymization measure, and the hashed ones are not an
+exception. A SHA-256 branch id or revision hash hides the *content* it was derived
+from, but it is stable and deterministic -- the same branch yields the same branch id
+on every turn -- so a recipient can link every request belonging to one conversation.
+The `content_sha256` accompanying each candidate is a hash of the **full** tool result,
+so anyone holding the same bytes can confirm a match even for the part that was
+truncated out of the view.
 
 Candidates are only ever tool results. In shadow mode and Track B they must also lie
 outside the protected prefix and outside the last 6 messages; Track C's boundary
