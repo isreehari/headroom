@@ -209,6 +209,29 @@ async def test_missing_answers_block_fails_open() -> None:
     assert "no dict at 'answers'" in (answer.error or "")
 
 
+async def test_missing_answers_keys_are_scrubbed_too() -> None:
+    """The key listing is server-controlled: a key can echo a credential."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "jev-1.2.3",
+                "sk-super-secret": 1,
+                "https://api.example.invalid/v1/systemone?token=leaky": 2,
+            },
+        )
+
+    jev = _client(handler)
+    answer = await jev.decide(state={}, questions={}, candidate_ids=["cand_0000"])
+    await jev.aclose()
+
+    assert answer.decisions == {"cand_0000": "keep"}
+    assert "no dict at 'answers'" in (answer.error or "")
+    assert "sk-super-secret" not in (answer.error or "")
+    assert "token=leaky" not in (answer.error or "")
+
+
 async def test_decide_after_aclose_fails_open_instead_of_dialling_out() -> None:
     """aclose() must not let the next call resurrect a real network client."""
     calls = 0

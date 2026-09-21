@@ -208,9 +208,12 @@ class JevClient:
         answers = body.get(ANSWERS_FIELD)
         if not isinstance(answers, dict):
             # Keys only: a value could be anything the server chose to echo.
-            answer.error = (
+            # The keys are server-controlled too, so they get scrubbed like
+            # every other string this module puts into an error.
+            answer.error = _scrub(
                 f"no dict at '{ANSWERS_FIELD}' (keys were {sorted(map(str, body))[:12]}); "
-                "falling back to keep for every candidate"
+                "falling back to keep for every candidate",
+                self._config,
             )
             return answer
 
