@@ -346,6 +346,34 @@ async def test_a_long_error_is_truncated_in_the_log() -> None:
     assert metrics.events == ["shadow_fail_open"]
 
 
+async def test_a_raising_jev_shadow_attribute_fails_open() -> None:
+    """Nothing this module reads off a foreign object may escape the guard."""
+
+    class ExplodingProxy:
+        metrics = FakeMetrics()
+
+        @property
+        def jev_shadow(self) -> Any:
+            raise RuntimeError("proxy attribute blew up")
+
+    proxy = ExplodingProxy()
+    assert await _call(proxy, FakeLimitSource()) is None
+    assert proxy.metrics.events == ["shadow_fail_open"]
+
+
+async def test_a_raising_enabled_property_fails_open() -> None:
+    metrics = FakeMetrics()
+
+    class MoodyRunner:
+        @property
+        def enabled(self) -> bool:
+            raise RuntimeError("config went away")
+
+    proxy = FakeProxy(MoodyRunner(), metrics)
+    assert await _call(proxy, FakeLimitSource()) is None
+    assert metrics.events == ["shadow_fail_open"]
+
+
 async def test_a_disabled_runner_is_not_awaited_at_all() -> None:
     """The off path is the common path: it must not build or await anything."""
 
