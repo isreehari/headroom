@@ -470,3 +470,68 @@ CMD ["headroom", "proxy", "--host", "0.0.0.0"]
 ```
 
 > **Note:** `build-essential` is required at install time because `headroom-ai` includes `hnswlib`, a C++ extension that must be compiled from source. It is removed after installation to keep the image slim.
+
+## Jev Compaction Boundary (Codex WebSocket)
+
+Codex's native compaction crosses Headroom on the `/v1/responses` **WebSocket**
+route only. At that moment the client sends a `response.create` frame whose
+`input` is one tool output plus a `compaction_trigger` item, anchored by
+`previous_response_id` — exactly one retention candidate per compaction event.
+
+With `HEADROOM_JEV_MODE=active`, Headroom asks Jev one keep/drop question about
+that candidate. On `drop`, the original tool output is written to the CCR store,
+the write is acknowledged and read back byte-equal, and only then is the item's
+body replaced on the wire with a retrieval marker
+(`[N tokens compressed to 0. … Retrieve more: hash=…]`) that the model redeems
+with the `headroom_retrieve` tool or `POST /v1/retrieve`. Nothing is deleted;
+the item, its type and its `call_id` are preserved so the tool-call/tool-result
+pairing stays intact.
+
+Both directions a boundary can arrive are covered: mid-session, on the
+client→upstream relay loop, and as the **first** frame of a connection, which is
+the shape a reconnect replay produces. Both call sites run the same
+orchestrator, in the same position — after memory injection and before
+Headroom's own compression, so Jev is shown and stages the original tool output
+rather than an already-compressed marker — and both share one process-wide
+revision store keyed by `previous_response_id`. Because the key does not include
+the per-socket session id (a fresh UUID for every accepted socket), a boundary
+replayed on a new connection is recognised as one this process already decided
+and is left alone rather than being dropped a second time. Jev is additive to
+Headroom's deterministic compression, never a substitute for it.
+
+The path fails open — forwarding the client's original frame bytes byte for byte
+— in every one of these cases:
+
+- `HEADROOM_JEV_MODE` is not `active` (the default is `off`)
+- the frame is not a recognizable compaction boundary
+- no WebSocket session identity, or a revision (`previous_response_id`) this
+  process already decided — a retry, or a replay after a reconnect
+- the frame does not advertise `headroom_retrieve`, so the model could not get
+  the content back
+- the candidate exceeds `HEADROOM_JEV_MAX_CANDIDATE_TOKENS`
+- no Jev client configured, the call times out (`HEADROOM_JEV_TIMEOUT_MS`), or
+  the answer is anything other than an unambiguous `drop`
+- any CCR write, read-back or lease is not acknowledged
+
+Three limits are worth stating plainly, because none of them is a guarantee the
+code makes:
+
+- **The revision store is in-process and in-memory.** There is no cross-worker
+  or cross-restart ledger, so a proxy restart reopens every revision. The store
+  is also bounded (512 entries, least-recently-touched evicted first): a
+  revision that is evicted after 512 distinct others have passed through can be
+  claimed again.
+- **Reopening a revision is not a double drop of live content.** A replayed
+  frame carries the bytes again, and the marker that replaces them retrieves
+  exactly those bytes; the cost of a reopened revision is one extra keep/drop
+  decision and one extra CCR stage, not lost content.
+- **Everything after the claim is single-shot; failures are not retried.** The
+  revision is claimed before Jev is called, so a timeout, an ambiguous answer or
+  a failed CCR commit forgoes retention on that boundary permanently rather than
+  trying again. That is deliberate: a retry that skips to "keep" loses an
+  optimisation, whereas re-deciding a boundary whose CCR commit already
+  succeeded is the case that must never happen.
+
+Outcomes are counted on `headroom_jev_events_total{event}` with the
+`compaction_*` event labels. Only the client→proxy direction is inspected: a
+compaction signal carried solely in a provider response is not visible here.

@@ -83,6 +83,11 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.image_isolation import run_image_compression_isolated
+from headroom.proxy.jev.compaction_hook import (
+    REASON_DROPPED,
+    apply_jev_compaction_boundary,
+)
+from headroom.proxy.jev.compaction_state import JevCompactionRevisionStore
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
 from headroom.proxy.passthrough import (
@@ -107,6 +112,12 @@ _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
+# Track C: compaction revisions already decided, keyed by
+# `previous_response_id`. Module-level so it survives both across frames of one
+# session and across reconnects -- the WS `session_id` is a fresh uuid4 per
+# socket, so it deliberately plays no part in the key. Bounded, so a long-lived
+# proxy cannot grow it without limit.
+_JEV_COMPACTION_REVISIONS = JevCompactionRevisionStore()
 # The WS->HTTP fallback streams SSE, so `read` is the gap BETWEEN events, not a
 # cap on the whole response: 120s of silence from a live Codex turn means the
 # upstream is gone, not thinking. That is this path's own bound and is
@@ -152,6 +163,67 @@ def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> 
         collect(marker, allow_bare_hash=True)
     collect(messages)
     return hashes
+
+
+#: Same bound `headroom.proxy.jev.active_hook` puts on an error string before
+#: it reaches a log line.
+_JEV_MAX_DETAIL_CHARS = 400
+
+
+def _jev_log_safe_detail(exc: BaseException, jev_config: Any) -> str:
+    """Log-safe text for an exception raised while finishing a boundary turn.
+
+    The exception is arbitrary — a lock timeout, a quarantined executor, or a
+    tracker raising with whatever is in its state — and anything on the Jev
+    path can put the configured endpoint (userinfo, query token) or the API
+    key into a message. So the same single entry point the rest of the branch
+    uses, ``headroom.proxy.jev.client.scrub_secrets``, runs here too: scrub
+    first, then truncate, so a key straddling the cut cannot survive as a
+    prefix. With no Jev config to scrub against (and if scrubbing itself
+    fails) the message is dropped entirely rather than logged unscrubbed —
+    the type name alone is enough to diagnose this call site.
+    """
+    try:
+        if jev_config is None:
+            return type(exc).__name__
+        from headroom.proxy.jev.client import scrub_secrets
+
+        return scrub_secrets(f"{type(exc).__name__}: {exc}", jev_config)[:_JEV_MAX_DETAIL_CHARS]
+    except Exception:  # noqa: BLE001 - never trade a leak for a nicer log line
+        return type(exc).__name__
+
+
+def _jev_message_shape(messages: list[dict[str, Any]], model_name: str) -> str:
+    """Name the wire shape of the list Jev is actually shown.
+
+    This route accepts an OpenAI Chat list and an Anthropic list independently
+    of the model name — a Claude-named model can carry ``role: "tool"``
+    messages and a GPT-named one can carry ``tool_result`` blocks — so the
+    model name is only the last resort. ``message_shape`` is metadata
+    (``headroom.proxy.jev.request.build_retention_state``); candidate
+    selection and application are shape-agnostic and detect structurally, so
+    this only has to be honest, never load-bearing.
+    """
+    has_tool_role = False
+    has_tool_result_block = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            has_tool_role = True
+            continue
+        content = message.get("content")
+        if message.get("role") == "user" and isinstance(content, list):
+            has_tool_result_block = has_tool_result_block or any(
+                isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+            )
+    if has_tool_role != has_tool_result_block:
+        return "openai" if has_tool_role else "anthropic"
+    # Ambiguous (both shapes present) or silent (neither): fall back to the
+    # same model-name heuristic this handler already uses for the context
+    # limit and the tracker's provider.
+    lowered = model_name.lower()
+    return "anthropic" if ("claude" in lowered or "anthropic" in lowered) else "openai"
 
 
 def _codex_ws_compression_timeout_seconds() -> float:
@@ -4049,6 +4121,26 @@ class OpenAIHandlerMixin:
             except Exception as e:
                 logger.debug(f"[{request_id}] post_compress hook error: {e}")
 
+        # Jev retention, Track A (shadow) — see handlers/anthropic.py for the
+        # contract. Observational only; `optimized_messages` is never mutated
+        # and the result is deliberately discarded.
+        from headroom.proxy.jev.hook import run_jev_shadow_hook
+
+        await run_jev_shadow_hook(
+            self,
+            provider="openai",
+            model=model,
+            messages=optimized_messages,
+            frozen_prefix=int(openai_frozen_count or 0),
+            optimized_tokens=optimized_tokens,
+            original_tokens=original_tokens,
+            session_id=openai_session_id,
+            tokenizer=tokenizer,
+            message_shape="openai",
+            request_id=request_id,
+            context_limit_source=self.openai_provider,
+        )
+
         # CCR Tool Injection: Inject retrieval tool if compression occurred
         # OR if this session has previously done CCR (PR-B7 sticky-on).
         # See `headroom/proxy/handlers/anthropic.py` and PR-B7 plan
@@ -6077,6 +6169,53 @@ class OpenAIHandlerMixin:
             except Exception:
                 pass
 
+        # Jev retention, Track A (shadow) on the Responses path. The
+        # post-compression item list lives in body["input"] here (compression
+        # goes through CompressionUnits and rewrites the body in place), not in
+        # an `optimized_messages` variable, and this path keeps no frozen-prefix
+        # bookkeeping — so the protected prefix is 0. Observational only.
+        from headroom.proxy.jev.hook import (
+            count_responses_tokens_offloaded,
+            jev_shadow_enabled,
+            run_jev_shadow_hook,
+        )
+
+        _jev_input = body.get("input")
+        # This path's own `original_tokens`/`optimized_tokens` are counted from
+        # the synthetic `messages` list built near the top of this handler,
+        # which only carries `instructions` plus a *string* `input`. For the
+        # list-valued `input` Codex sends, that pair is ~0 and the runner's
+        # threshold gate would skip every turn, so count the real item list
+        # instead. A string `input` IS covered by the handler's own numbers,
+        # so they are kept there.
+        #
+        # `jev_shadow_enabled` gates the recount, not the hook: the recount is
+        # CPU-bound over the whole transcript, and Jev is off by default, so an
+        # unconfigured proxy must not pay for it. When it IS on the count runs
+        # off the loop (GH #1701) on the default thread pool — NOT on the
+        # compression executor, whose timeout path quarantines compression for
+        # everyone. The hook itself is still awaited unconditionally so its
+        # fail-open metric keeps covering this path.
+        _jev_optimized, _jev_original = optimized_tokens, original_tokens
+        if isinstance(_jev_input, list) and jev_shadow_enabled(self):
+            _jev_optimized, _jev_original = await count_responses_tokens_offloaded(
+                _jev_input, tokenizer, tokens_saved
+            )
+        await run_jev_shadow_hook(
+            self,
+            provider="openai",
+            model=str(model or ""),
+            messages=_jev_input if isinstance(_jev_input, list) else None,
+            frozen_prefix=0,
+            optimized_tokens=_jev_optimized,
+            original_tokens=_jev_original,
+            session_id=_responses_session_id,
+            tokenizer=tokenizer,
+            message_shape="openai_responses",
+            request_id=request_id,
+            context_limit_source=self.openai_provider,
+        )
+
         # CCR: a stream:true request whose tool list carries headroom_retrieve
         # can't be intercepted mid-SSE-stream without full event-level
         # splicing (#1877 proposals B/C, out of scope here). Instead, force
@@ -7682,6 +7821,52 @@ class OpenAIHandlerMixin:
                     if isinstance(first_response_body, dict)
                     else None
                 )
+                # Track C: a compaction boundary can also arrive as the FIRST
+                # frame of a connection, which is exactly the shape a reconnect
+                # replay produces -- the relay loop below never sees frame 1, so
+                # without this call site such a replay bypassed Track C
+                # entirely. Same orchestrator and the SAME process-wide
+                # `_JEV_COMPACTION_REVISIONS`: the store is keyed by
+                # `previous_response_id` and never by `session_id` (a fresh
+                # uuid4 per accepted socket), so a boundary replayed on a NEW
+                # connection is recognised as already claimed and comes back
+                # stale rather than being dropped a second time.
+                #
+                # Placed last in this branch to mirror the relay-loop site
+                # exactly: after `_prepare_memory_frame` so Jev sees the frame
+                # Headroom will really send, and before the first-frame
+                # compression block below so Jev stages the ORIGINAL tool output
+                # rather than an already-compressed marker. Returns
+                # `first_msg_raw` byte-identical unless an acknowledged CCR
+                # commit succeeded; owns its own gating, timeout, metrics and
+                # outcome logging for all thirteen reasons; never raises.
+                #
+                # `current_response_input` above is deliberately left on the
+                # pre-hook items, mirroring the relay loop, which also computes
+                # it from the inbound frame: both paths recompute it from the
+                # final outbound bytes further down.
+                first_msg_raw, _jev_first_reason = await apply_jev_compaction_boundary(
+                    first_msg_raw,
+                    jev_config=getattr(self.config, "jev", None),
+                    proxy=self,
+                    session_id=session_id,
+                    request_id=request_id,
+                    revisions=_JEV_COMPACTION_REVISIONS,
+                    metrics=getattr(self, "metrics", None),
+                )
+                if _jev_first_reason == REASON_DROPPED:
+                    # NOT a second outcome log -- same rationale as the
+                    # relay-loop site. The orchestrator already reported the
+                    # drop with revision, candidate, CCR hash and token
+                    # estimate; this adds only the frame ordinal every other WS
+                    # line on this route is keyed by, which on this path is
+                    # always 1. No exception text, no server text, no
+                    # credentials.
+                    logger.info(
+                        "[%s] WS /v1/responses jev compaction drop frame=1 session_id=%s",
+                        request_id,
+                        session_id,
+                    )
             # Hot-fix follow-up to PR #406 — inline Rust compression on the
             # WS first frame before forwarding upstream. PR #406 enabled
             # the same call for HTTP /v1/responses; PR-C5's "WS-side
@@ -8359,6 +8544,48 @@ class OpenAIHandlerMixin:
                                         else None
                                     )
                                     msg = await _prepare_memory_frame(_inbound_frame_body, msg)
+                                    # Track C: Codex's native compaction
+                                    # boundary is WS-only and carries exactly
+                                    # one candidate. Runs after the memory
+                                    # rewrite and before compression so Jev
+                                    # sees (and CCR stages) the ORIGINAL tool
+                                    # output rather than an already-compressed
+                                    # marker. Returns `msg` byte-identical
+                                    # unless an acknowledged CCR commit
+                                    # succeeded; owns its own gating, timeout,
+                                    # metrics and outcome logging for all
+                                    # thirteen reasons; never raises.
+                                    msg, _jev_reason = await apply_jev_compaction_boundary(
+                                        msg,
+                                        jev_config=getattr(self.config, "jev", None),
+                                        proxy=self,
+                                        session_id=session_id,
+                                        request_id=request_id,
+                                        revisions=_JEV_COMPACTION_REVISIONS,
+                                        metrics=getattr(self, "metrics", None),
+                                    )
+                                    if _jev_reason == REASON_DROPPED:
+                                        # NOT a second outcome log: the
+                                        # orchestrator already reported the
+                                        # drop with revision, candidate, CCR
+                                        # hash and token estimate. This adds
+                                        # the one fact it structurally cannot
+                                        # know -- `client_frame_index`, the
+                                        # relay-local frame ordinal every other
+                                        # WS line and every wire-debug capture
+                                        # on this route is keyed by. Without it
+                                        # a committed drop cannot be tied back
+                                        # to a specific client frame. Emitted
+                                        # only on the rare committed-drop path,
+                                        # and carries no exception text, no
+                                        # server text and no credentials.
+                                        logger.info(
+                                            "[%s] WS /v1/responses jev compaction drop "
+                                            "frame=%d session_id=%s",
+                                            request_id,
+                                            client_frame_index,
+                                            session_id,
+                                        )
                                 (
                                     msg,
                                     _frame_modified,
@@ -9728,6 +9955,7 @@ class OpenAIHandlerMixin:
         # below this comment changes behaviour.
         from headroom.proxy.compress_turn import CompressTurnError, begin_compress_turn
         from headroom.proxy.gateway_responses import build_view as build_responses_view
+        from headroom.proxy.gateway_responses import carries_view as carries_responses_view
         from headroom.proxy.gateway_responses import is_responses_body
         from headroom.proxy.gateway_responses import mark_view as mark_responses_view
         from headroom.proxy.helpers import _read_request_json
@@ -9988,6 +10216,35 @@ class OpenAIHandlerMixin:
                         }
                     },
                 )
+            # Jev active retention (Track B) is opened by ONE request-level
+            # flag, on the turn the caller means it — never by configuration
+            # alone. Parsed here, next to the mode it depends on, and before
+            # any compression work so a malformed boundary costs nothing.
+            #
+            # Deliberately OUTSIDE any Jev-enabled guard: the gate is stdlib
+            # only and imports nothing from the rest of the jev package, so a
+            # malformed boundary is a 400 on every proxy, including the
+            # default one with HEADROOM_JEV_MODE=off. A request that asks for
+            # retention it cannot get must be told so, not silently served.
+            from headroom.proxy.jev.compress_gate import (
+                JEV_COMPRESS_BRANCH_ID,
+                JevGateError,
+                parse_compaction_boundary,
+            )
+
+            try:
+                jev_boundary = parse_compaction_boundary(compress_config, mode)
+            except JevGateError as jev_gate_error:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": jev_gate_error.message,
+                        }
+                    },
+                )
+
             if mode in ("lossy_inline", "lossless_then_lossy"):
                 pipeline = self._lossy_inline_pipeline()
             elif mode == "ccr":
@@ -10070,6 +10327,8 @@ class OpenAIHandlerMixin:
                     final,
                     result.tokens_before,
                     tokens_after,
+                    None,
+                    # No session, so no replay state and no generation of it.
                     None,
                 )
 
@@ -10177,12 +10436,25 @@ class OpenAIHandlerMixin:
                     # return time because whatever we hand back IS what the
                     # caller sends upstream.
                     session_tracker.record_returned(messages, final)
+                    # Read the generation this turn's own record_returned just
+                    # produced, still UNDER the lock. Sampling it later, on the
+                    # event loop, would leave a window for a concurrent turn to
+                    # record between the two — and the token would then vouch
+                    # for that turn's state instead of this one's.
+                    snapshot_revision = session_tracker.get_snapshot_revision()
                     info = {
                         "id": session_id,
                         "frozen_message_count": session_frozen,
                         "cached_prefix_replayed": turn.replayed,
                     }
-                    return result, final, raw_tokens_before, final_tokens_after, info
+                    return (
+                        result,
+                        final,
+                        raw_tokens_before,
+                        final_tokens_after,
+                        info,
+                        snapshot_revision,
+                    )
                 finally:
                     comp_cache.session_turn_lock.release()
 
@@ -10197,12 +10469,198 @@ class OpenAIHandlerMixin:
                 tokens_before,
                 tokens_after,
                 session_info,
+                session_snapshot_revision,
             ) = await self._run_compression_in_executor(
                 _run_session_turn if session_id else _run_stateless,
                 timeout=COMPRESSION_TIMEOUT_SECONDS,
             )
 
             ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
+
+            # Active retention runs AFTER Headroom's own compression and AFTER
+            # its CCR markers exist, on the messages the caller will actually
+            # forward: its savings are incremental on top of Headroom's,
+            # exactly as Phase 0a measured them, and never a substitute for
+            # them. A non-boundary turn does no work here at all — no import,
+            # no candidate selection, no extra tokenization.
+            jev_info: dict[str, Any] | None = None
+            if jev_boundary:
+                from headroom.proxy.jev.active_hook import run_jev_active_retention
+
+                # Jev is told the shape of the list it is actually shown. A
+                # Responses body reaches this point as its chat-shaped view
+                # (`build_responses_view` at the top of the handler), so it is
+                # named as such; every other body is classified from the
+                # FORWARDED list itself, not from the model name, because this
+                # route accepts both shapes whatever the model is called.
+                if carries_responses_view(body):
+                    jev_message_shape = "openai_responses"
+                else:
+                    jev_message_shape = _jev_message_shape(final_messages, model_name)
+
+                jev_result = await run_jev_active_retention(
+                    proxy=self,
+                    messages=final_messages,
+                    model=model_name,
+                    session_id=session_id,
+                    branch_id=JEV_COMPRESS_BRANCH_ID,
+                    # A compaction boundary rebuilds the prompt cache by
+                    # definition, so the session-derived freeze does not pin
+                    # history here. An explicit config.frozen_message_count
+                    # still does: the caller may know more about the provider
+                    # cache than we do.
+                    frozen_prefix=(frozen_message_count or 0),
+                    message_shape=jev_message_shape,
+                )
+                jev_info = {
+                    "boundary": True,
+                    "called": jev_result.called,
+                    "candidates": jev_result.candidates,
+                    "applied": jev_result.applied,
+                    "reason": jev_result.reason,
+                    "hashes": list(jev_result.hashes),
+                }
+                # `tokens_after` on the result is measured on the RETAINED
+                # messages and is meaningful only when something was applied —
+                # it is 0 on every other path. Overwriting the handler's own
+                # count with that placeholder would report a free lunch on a
+                # turn that changed nothing.
+                if jev_result.applied:
+                    # Everything the Jev mutation replaces, kept so the whole
+                    # mutation can be discarded as ONE unit if the replay
+                    # state cannot be moved with it (below).
+                    _pre_jev_messages = final_messages
+                    _pre_jev_tokens_after = tokens_after
+                    _pre_jev_ccr_hashes = ccr_hashes
+
+                    final_messages = jev_result.messages
+                    tokens_after = jev_result.tokens_after
+                    # Additive and de-duplicated, order preserved: Headroom's
+                    # own markers are still in the conversation and still
+                    # retrievable.
+                    ccr_hashes = list(dict.fromkeys([*ccr_hashes, *jev_result.hashes]))
+                    if comp_cache is not None and session_tracker is not None:
+                        _retained_messages = final_messages
+                        _retained_cache = comp_cache
+                        _retained_tracker = session_tracker
+
+                        def _rerecord_retained_session() -> bool:
+                            # Without this the session state still holds the
+                            # PRE-retention bytes while the caller forwards the
+                            # retained ones: the next turn would replay the old
+                            # prefix over the new one and bust the provider
+                            # cache on the very first turn after a compaction.
+                            #
+                            # TIMED acquire for the same reason the turn itself
+                            # uses one — an untimed wait parks an executor
+                            # worker behind a slow session and arms the
+                            # compression quarantine for ALL traffic.
+                            if not _retained_cache.session_turn_lock.acquire(
+                                timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
+                            ):
+                                raise TimeoutError(
+                                    f"session turn lock busy for {session_id!r} "
+                                    "(re-recording retained messages)"
+                                )
+                            try:
+                                # COMPARE-AND-SET. `_run_session_turn` released
+                                # this lock before the Jev call was awaited, so
+                                # a concurrent same-session turn can have
+                                # completed and recorded ITS state in the
+                                # meantime — this is the route the per-session
+                                # lock exists for. Only replace the state THIS
+                                # turn recorded; a newer turn's replay state is
+                                # what the caller most recently forwarded and
+                                # must never be rolled back to an older turn's
+                                # transcript.
+                                #
+                                # The GENERATION is the authority: two turns of
+                                # one session can record byte-identical
+                                # transcripts, and a value-only comparison
+                                # cannot tell that apart from nobody having
+                                # written (ABA). The value comparison is kept
+                                # alongside it because the two together are
+                                # strictly stronger than either — the recorded
+                                # snapshots are deep copies, so it is by value.
+                                if (
+                                    session_snapshot_revision is None
+                                    or _retained_tracker.get_snapshot_revision()
+                                    != session_snapshot_revision
+                                    or _retained_tracker.get_last_original_messages() != messages
+                                    or _retained_tracker.get_last_forwarded_messages()
+                                    != _pre_jev_messages
+                                ):
+                                    return False
+                                _retained_cache.update_from_result(messages, _retained_messages)
+                                _retained_tracker.record_returned(messages, _retained_messages)
+                                return True
+                            finally:
+                                _retained_cache.session_turn_lock.release()
+
+                        _rerecorded = False
+                        _rerecord_detail = "a newer turn already recorded this session"
+                        try:
+                            # `asyncio.to_thread`, deliberately NOT the
+                            # compression executor and with NO abandoning
+                            # timeout, for two independent reasons.
+                            #
+                            # 1. An abandoned worker can still commit. Neither
+                            #    helper can cancel a thread that has started,
+                            #    so a timeout here would hand the caller the
+                            #    PRE-retention bytes while the straggler later
+                            #    takes the lock and records the RETAINED ones —
+                            #    the caller forwards one transcript and the
+                            #    session replays another. That is precisely the
+                            #    desync this handler's own `except TimeoutError`
+                            #    branch refuses to create for a session call.
+                            #    Waiting means every outcome is observed.
+                            # 2. `_run_compression_in_executor` is not a neutral
+                            #    offload helper: an overrun leaves timeout debt
+                            #    and quarantines the pool, so a slow Jev step
+                            #    would switch off Headroom's own compression for
+                            #    unrelated traffic. Jev is additive to that
+                            #    compression, never able to degrade it.
+                            #
+                            # Waiting is safe because the callable is
+                            # self-bounding: one timed lock acquire plus two
+                            # recordings, no unbounded work.
+                            _rerecorded = await asyncio.to_thread(_rerecord_retained_session)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as rerecord_error:  # noqa: BLE001 - see below
+                            _rerecord_detail = _jev_log_safe_detail(
+                                rerecord_error, getattr(self.config, "jev", None)
+                            )
+                        if not _rerecorded:
+                            # FAIL OPEN. A busy lock, a quarantined executor or
+                            # a losing compare-and-set is a Jev step failing —
+                            # it must never turn a SUCCESSFUL Headroom
+                            # compression into a 503 (the handler's TimeoutError
+                            # branch would do exactly that for a session call).
+                            # Discard the mutation whole: the caller gets
+                            # Headroom's own output, which is precisely what
+                            # the session state still holds, so the two agree
+                            # again. The CCR entries staged for the abandoned
+                            # retention are harmless — nothing references them
+                            # and they expire on their lease.
+                            #
+                            # No `exc_info`: the formatter would render the
+                            # ORIGINAL exception text, defeating the scrubbing
+                            # in `_jev_log_safe_detail` for exactly the
+                            # exceptions that can carry the Jev endpoint or key.
+                            logger.warning(
+                                "[compress:%s] jev active retention: could not re-record "
+                                "the retained session state (%s); discarding the retention "
+                                "and returning Headroom's own compressed output",
+                                session_id,
+                                _rerecord_detail,
+                            )
+                            final_messages = _pre_jev_messages
+                            tokens_after = _pre_jev_tokens_after
+                            ccr_hashes = _pre_jev_ccr_hashes
+                            jev_info["applied"] = 0
+                            jev_info["hashes"] = []
+                            jev_info["reason"] = "rerecord_failed"
 
             tokens_saved = max(0, tokens_before - tokens_after)
             latency_ms = (time.time() - start_time) * 1000
@@ -10275,6 +10733,10 @@ class OpenAIHandlerMixin:
             }
             if session_info is not None:
                 _payload["session"] = session_info
+            # Only on a declared boundary turn: every other response is
+            # byte-identical to what this route returned before Track B.
+            if jev_info is not None:
+                _payload["jev"] = jev_info
             if _finished is not None and _finished.fields:
                 _payload.update(_finished.fields)
             return JSONResponse(_payload)

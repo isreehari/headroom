@@ -977,3 +977,43 @@ class TestClassifyCacheMiss:
             ).resolved_cache_ttl_seconds()
             == 3600
         )
+
+
+class TestSnapshotRevision:
+    """The generation token that makes an amend-my-own-record safe.
+
+    Values alone cannot answer "are these still the snapshots I recorded?" —
+    two turns of one session can record identical transcripts. The token can.
+    """
+
+    MSGS = [{"role": "user", "content": "hello"}]
+
+    def test_a_fresh_tracker_starts_at_zero(self):
+        assert PrefixCacheTracker("anthropic").get_snapshot_revision() == 0
+
+    def test_record_returned_bumps_the_revision_every_time(self):
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.record_returned(self.MSGS, self.MSGS)
+        first = tracker.get_snapshot_revision()
+        assert first == 1
+        # Re-recording the SAME values still bumps it: that is the whole
+        # point — an identical re-record is a different generation.
+        tracker.record_returned(self.MSGS, self.MSGS)
+        assert tracker.get_snapshot_revision() == first + 1
+        assert tracker.get_last_forwarded_messages() == self.MSGS
+
+    def test_update_from_response_bumps_the_revision_too(self):
+        """Every writer of the snapshots moves the generation, not just one."""
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.record_returned(self.MSGS, self.MSGS)
+        before = tracker.get_snapshot_revision()
+        tracker.update_from_response(cache_read_tokens=0, cache_write_tokens=0, messages=self.MSGS)
+        assert tracker.get_snapshot_revision() == before + 1
+
+    def test_reading_the_snapshots_does_not_move_the_revision(self):
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.record_returned(self.MSGS, self.MSGS)
+        before = tracker.get_snapshot_revision()
+        tracker.get_last_original_messages()
+        tracker.get_last_forwarded_messages()
+        assert tracker.get_snapshot_revision() == before

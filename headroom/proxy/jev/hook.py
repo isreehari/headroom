@@ -1,0 +1,298 @@
+"""The single call the provider handlers make into Jev shadow mode.
+
+The handlers get exactly one ``await`` and no error handling of their own. This
+adapter owns the whole failure surface: an unknown model, a missing tokenizer
+method, a runner bug, anything at all. Every one of those returns ``None`` and
+records ``shadow_fail_open``, so a Track A regression shows up as a counter
+rather than as a 500 on somebody's coding session.
+
+Two failure shapes are deliberately kept apart:
+
+* An **unusable context limit** (no limit source, an unrecognised model, a
+  ``None`` from ``ProxyConfig.get_context_limit``) is a *skip*, not a failure:
+  there is nothing to measure a threshold against. It is forwarded to the
+  runner as ``context_limit=0``, which is the runner's own
+  ``shadow_no_context_limit`` gate, so the skip stays visible under the metric
+  name that already exists instead of being miscounted as a fail-open.
+* A **raising** limit source or tokenizer is a real failure and fails open.
+
+Double counting is avoided by scope: :meth:`JevShadowRunner.maybe_run` already
+guards its own body and records ``shadow_fail_open`` itself, returning a
+``fail_open`` result rather than raising. That result is passed straight
+through; the ``except`` below only ever fires for work this adapter did
+*around* the runner (resolving the tokenizer and the context limit) or for a
+runner that raised in spite of its guard. So exactly one counter moves per
+failure.
+
+``asyncio.CancelledError`` is a ``BaseException`` and is deliberately not
+caught: a cancelled turn is the caller's cancellation, not a Jev failure.
+
+The call IS on the request path and adds at most ``HEADROOM_JEV_TIMEOUT_MS``
+(default 500ms) of latency, and only on the turns that pass the threshold and
+cooldown gates. Nothing it returns is applied to the forwarded request.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from typing import Any, cast
+
+from headroom.proxy.jev.client import scrub_secrets
+from headroom.proxy.jev.config import JevConfig
+from headroom.proxy.jev.shadow import JevShadowResult
+
+logger = logging.getLogger(__name__)
+
+#: Matches ``shadow.py``: a scrubbed error still gets a length bound before it
+#: reaches a log line.
+_MAX_ERROR_CHARS = 400
+
+#: Wall-clock bound on the Responses token recount
+#: (:func:`count_responses_tokens_offloaded`). Deliberately its own constant
+#: rather than ``COMPRESSION_TIMEOUT_SECONDS``: this is a shadow-mode
+#: measurement, and a count that takes longer than a few seconds is not worth
+#: having -- the turn is skipped as below-threshold, the leaked thread finishes
+#: on its own, and no shared state is touched.
+RESPONSES_RECOUNT_TIMEOUT_SECONDS = 5.0
+
+
+def _record(proxy: Any, event: str) -> None:
+    """Best-effort counter. A broken metrics backend is not a request failure.
+
+    The lookup is inside the suppression too: this runs from an ``except``
+    block, where raising again would defeat the whole point of failing open.
+    """
+    with contextlib.suppress(Exception):
+        metrics = getattr(proxy, "metrics", None)
+        if metrics is not None:
+            metrics.record_jev_event(event)
+
+
+def _config_for(proxy: Any, runner: Any) -> JevConfig:
+    """The config to scrub error text against.
+
+    Prefers the runner's own (it is the one holding the live key and endpoint),
+    then a config parked on the proxy, then an empty default so scrubbing still
+    happens -- against nothing -- rather than being skipped.
+    """
+    for owner, attr in ((runner, "config"), (proxy, "jev_config")):
+        candidate: Any = None
+        with contextlib.suppress(Exception):
+            candidate = getattr(owner, attr, None)
+        if isinstance(candidate, JevConfig):
+            return candidate
+    return JevConfig()
+
+
+def jev_shadow_enabled(proxy: Any) -> bool:
+    """Cheap, never-raising "is shadow mode on?" for handler-side gating.
+
+    Two attribute reads and no work. It exists so a handler can skip
+    *preparatory* work -- a token recount over a full transcript -- on the
+    default-off path, which is every request of an unconfigured proxy.
+
+    It is an optimisation gate only. :func:`run_jev_shadow_hook` re-checks the
+    same two attributes, owns the metrics and the fail-open path, and is still
+    called either way, so a wrong answer here costs at most a wasted count or
+    a less precise number -- never a behaviour change, and never a skipped
+    counter.
+    """
+    with contextlib.suppress(Exception):
+        runner = getattr(proxy, "jev_shadow", None)
+        return runner is not None and bool(getattr(runner, "enabled", False))
+    return False
+
+
+def responses_token_counts(items: Any, tokenizer: Any, tokens_saved: int) -> tuple[int, int]:
+    """``(optimized_tokens, original_tokens)`` for a ``/v1/responses`` turn.
+
+    The Responses handler cannot supply these itself. Its own pair is counted
+    from a *synthetic* ``messages`` list built from ``instructions`` plus a
+    **string** ``input`` (``if isinstance(input_data, str)``); for the
+    list-valued ``input`` Codex actually sends, that list is empty or
+    instructions-only, so both numbers are ~0 and
+    :meth:`JevShadowRunner._attempt` would take the
+    ``shadow_below_threshold`` exit on literally every turn -- Track A would
+    never observe the Responses path at all.
+
+    So the post-compression item list is counted here instead, with
+    ``count_messages_corrected``: a plain message counter reads only
+    ``content`` and prices a ``function_call_output`` item's ``output``
+    payload at zero, and ``output`` is the exact field candidate selection and
+    the projection operate on.
+
+    ``original`` is reconstructed as ``optimized + tokens_saved`` rather than
+    counted, mirroring the handler's own ``optimized = original - saved``
+    relation: the pre-compression item list is gone by this point, and a
+    baseline counted against a different list would make ``TH`` incomparable.
+
+    Fails open to ``(0, 0)`` -- a non-list ``input``, a tokenizer missing its
+    methods, any raise. ``0`` lands on the runner's below-threshold skip, so a
+    turn this cannot measure is skipped under a named gate instead of being
+    counted as a Jev failure. Nothing is awaited here, so
+    ``asyncio.CancelledError`` cannot arise.
+    """
+    if not isinstance(items, list):
+        return (0, 0)
+    try:
+        from headroom.proxy.jev.candidates import count_messages_corrected
+
+        count_text = getattr(tokenizer, "count_text", None)
+        count_messages = getattr(tokenizer, "count_messages", None)
+        if not callable(count_text) or not callable(count_messages):
+            return (0, 0)
+        optimized = max(
+            0,
+            int(
+                count_messages_corrected(
+                    items, count_messages=count_messages, count_text=count_text
+                )
+            ),
+        )
+    except Exception:  # noqa: BLE001 - fail open, same contract as the hook.
+        return (0, 0)
+    return (optimized, optimized + max(0, int(tokens_saved or 0)))
+
+
+async def count_responses_tokens_offloaded(
+    items: Any, tokenizer: Any, tokens_saved: int
+) -> tuple[int, int]:
+    """:func:`responses_token_counts`, off the event loop.
+
+    Counting a full Codex transcript is CPU-bound, and GH #1701 is the
+    standing rule in this codebase that such work does not run on the loop.
+
+    It runs on the default thread pool via ``asyncio.to_thread``, and
+    explicitly **not** on the proxy's compression executor. That executor is
+    not a neutral offload helper: a job that exceeds its timeout leaves
+    timeout debt and *quarantines* the pool
+    (``HeadroomProxy._run_compression_in_executor`` raises
+    ``CompressionQuarantinedError`` for every subsequent caller until the
+    leaked worker finishes or the cap elapses), so a slow Jev *telemetry*
+    count would switch off Headroom's own compression for unrelated requests.
+    Track A is additive to that compression and must never be able to
+    substitute for or degrade it. A thread leaked here occupies one default
+    pool slot until it finishes and touches no shared state -- strictly the
+    lesser harm.
+
+    Call sites gate on :func:`jev_shadow_enabled` first, so an unconfigured
+    proxy never gets here at all.
+
+    Fails open to ``(0, 0)`` on the timeout or any raise -- ``0`` lands on the
+    runner's ``shadow_below_threshold`` gate, so the turn is skipped rather
+    than mis-measured. Retrying inline after a timeout is deliberately *not*
+    done: that would put the very work this offloads back on the loop.
+    ``asyncio.CancelledError`` is a ``BaseException`` and propagates, as it
+    must.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(responses_token_counts, items, tokenizer, tokens_saved),
+            timeout=RESPONSES_RECOUNT_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - fail open, incl. asyncio.TimeoutError.
+        return (0, 0)
+
+
+def _resolve_context_limit(context_limit_source: Any, model: str) -> int:
+    """The model's context window, or ``0`` when there isn't a usable one.
+
+    ``context_limit_source`` is whatever the handler already holds --
+    ``proxy.anthropic_provider`` / ``proxy.openai_provider``, whose
+    ``get_context_limit`` returns ``int``, or a ``ProxyConfig``, whose
+    ``get_context_limit`` returns ``int | None``. A raising getter is left to
+    propagate to the caller's fail-open guard; everything else that cannot be
+    read as a positive whole number becomes ``0`` (the runner's skip gate).
+    ``bool`` is excluded explicitly: it is an ``int`` subclass and ``True``
+    would otherwise pass as a one-token context window.
+    """
+    getter = getattr(context_limit_source, "get_context_limit", None)
+    if not callable(getter):
+        return 0
+    limit = getter(model)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        return 0
+    return limit if limit > 0 else 0
+
+
+async def run_jev_shadow_hook(
+    proxy: Any,
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict[str, Any]] | None,
+    frozen_prefix: int,
+    optimized_tokens: int,
+    original_tokens: int = 0,
+    session_id: str,
+    tokenizer: Any,
+    message_shape: str,
+    request_id: str,
+    context_limit_source: Any,
+) -> JevShadowResult | None:
+    """Run one shadow attempt. Returns ``None`` when off or on any failure.
+
+    ``messages`` is forwarded by identity -- Track A measures the very list the
+    handler is about to send, and never mutates or copies it on the way in.
+
+    The off path (no runner, or a runner whose mode is not ``shadow``) returns
+    immediately and records nothing: it fires on every request of a feature
+    that is off by default, so a counter there would be pure noise.
+    """
+    runner: Any = None
+    try:
+        # Inside the guard on purpose: ``jev_shadow`` and ``enabled`` are
+        # attributes on objects this module does not own, and a descriptor
+        # that raises must fail open like everything else rather than take
+        # the request down before the guard starts.
+        runner = getattr(proxy, "jev_shadow", None)
+        if runner is None or not getattr(runner, "enabled", False):
+            return None
+
+        count_text = getattr(tokenizer, "count_text", None)
+        count_messages = getattr(tokenizer, "count_messages", None)
+        if not callable(count_text) or not callable(count_messages):
+            raise TypeError(
+                f"tokenizer {type(tokenizer).__name__} has no callable count_text/count_messages"
+            )
+        # ``proxy`` is untyped at the call site (the handlers hold a
+        # ``HeadroomProxy`` this package must not import), so the runner's
+        # declared return type is restated here rather than leaking ``Any``
+        # into every handler.
+        result = await runner.maybe_run(
+            provider=provider,
+            model=model,
+            # ``messages or []`` keeps the caller's object when there is one and
+            # hands the runner its own ``shadow_no_messages`` gate when there
+            # is not, rather than silently dropping the turn here.
+            messages=messages or [],
+            frozen_prefix=max(0, int(frozen_prefix or 0)),
+            optimized_tokens=max(0, int(optimized_tokens or 0)),
+            original_tokens=max(0, int(original_tokens or 0)),
+            context_limit=_resolve_context_limit(context_limit_source, model),
+            session_id=session_id,
+            count_text=count_text,
+            count_messages=count_messages,
+            message_shape=message_shape,
+        )
+        return cast("JevShadowResult | None", result)
+    except Exception as exc:  # noqa: BLE001 - fail open: Track A must never be
+        # the reason a proxied request fails. CancelledError is a
+        # BaseException and is deliberately not caught.
+        #
+        # The exception is arbitrary (a caller-supplied tokenizer, a provider
+        # object echoing a URL), so it goes through the same scrubber the
+        # client and the runner use before it reaches a log line. Scrub first,
+        # then truncate -- a key straddling the cut would otherwise survive as
+        # a prefix. ``exc_info`` is withheld on purpose: a traceback would put
+        # unscrubbed chained-exception text back into the log.
+        detail = "<unprintable exception>"
+        with contextlib.suppress(Exception):
+            detail = scrub_secrets(f"{type(exc).__name__}: {exc}", _config_for(proxy, runner))[
+                :_MAX_ERROR_CHARS
+            ]
+        logger.warning("[%s] jev shadow hook failed open: %s", request_id, detail)
+        _record(proxy, "shadow_fail_open")
+        return None

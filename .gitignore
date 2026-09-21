@@ -271,3 +271,8 @@ uv.lock
 .tokensave
 
 .codebase-memory/
+
+# Vendored third-party checkout for the one-off Jev plugin comparison spike
+# (benchmarks/.jev-plugin-compare/compare.mjs). The harness itself IS committed;
+# only the upstream fast-jev-compaction clone + its build output are not.
+benchmarks/.jev-plugin-compare/vendor/

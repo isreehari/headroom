@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "Pin for the vendored fast-jev-compaction checkout. `npm run setup` clones",
+    "exactly this revision (never the mutable default branch HEAD) and `npm run",
+    "verify-vendor` -- which run.sh calls before every comparison run -- rehashes",
+    "the vendored src/ tree against `srcSha256`, so a re-run cannot silently",
+    "measure a different library implementation.",
+    "",
+    "`rev` was resolved from `git ls-remote <repo> refs/heads/main` on 2026-09-20",
+    "and the already-vendored checkout was verified byte-identical to it",
+    "(`diff -r` over everything but node_modules/dist/.git/package-lock.json)."
+  ],
+  "repo": "https://github.com/tamaratran/fast-jev-compaction",
+  "rev": "e3f262a7f4d42bd8dd32ced30d26176f7cb545b0",
+  "revResolvedFrom": "refs/heads/main @ 2026-09-20",
+  "srcSha256": "276efbf283d6cac5ce64a2ae05144634a0c23f27beb77b7348f61941e7840073"
+}

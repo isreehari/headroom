@@ -34,6 +34,7 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -51,6 +52,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_SECONDS
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
+
+# Margin added on top of a retention lease (see CompressionStore.extend_ttl).
+# The deadline is computed from the clock *before* the write-back, so without
+# slack a write that lands in the next second leaves slightly less than the
+# leased window. One second is free (leases are hours) and makes the
+# "at least `ttl` from now" guarantee hold for the caller, not just for the
+# instant the TTL was computed.
+LEASE_SLACK_SECONDS = 1
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 # Previews carry verbatim tool-result content (post-redaction), which makes
@@ -427,6 +436,27 @@ class CompressionStore:
                         "Duplicate store for hash=%s, updating entry",
                         hash_key,
                     )
+                # One-way retention floor: a re-store may LENGTHEN an entry's
+                # life, never shorten it. The overwrite above installs a brand
+                # new entry with a fresh created_at and (usually) the default
+                # TTL, and the CCR mirror bridge re-stores the same
+                # explicit_hash on every turn a marker is re-encountered. That
+                # would silently wipe a retention lease taken by
+                # :meth:`extend_ttl` in an earlier turn, and the entry would
+                # then expire while its marker is still in the conversation —
+                # a guaranteed 404 on /v1/retrieve with no copy left anywhere,
+                # which is precisely what the lease exists to prevent.
+                #
+                # The DEADLINE is what is carried forward, not the raw ttl
+                # number: ttl is relative to created_at, and created_at has
+                # just moved to now, so reusing the old ttl would silently
+                # extend the deadline by the old entry's age. An already
+                # expired entry has no life to preserve (and must not be
+                # resurrected), so it is left to take the new TTL as written.
+                if not existing.is_expired():
+                    floor_ttl = math.ceil(existing.created_at + existing.ttl - entry.created_at)
+                    if floor_ttl > entry.ttl:
+                        entry.ttl = floor_ttl
                 # Mark old heap entry as stale since we're replacing it.
                 self._stale_heap_entries += 1
 
@@ -570,6 +600,42 @@ class CompressionStore:
             json.dumps(event, ensure_ascii=False, separators=(",", ":")),
         )
 
+    def peek(self, hash_key: str) -> CompressionEntry | None:
+        """Read an entry back WITHOUT logging it or counting it as a retrieval.
+
+        :meth:`retrieve` is the model-facing read: it emits a
+        ``headroom_retrieve`` log event carrying a redacted preview of the
+        original content (on by default — see :func:`_payload_preview_enabled`)
+        and calls :meth:`CompressionEntry.record_access`, which feeds the CCR
+        feedback/TOIN statistics. Both are correct for a real retrieval and
+        wrong for an internal integrity check.
+
+        Jev active retention has to read an entry back to prove the write was
+        acknowledged before it drops the only other copy of the content
+        (``headroom/proxy/jev/retention_ccr.py``). Doing that through
+        :meth:`retrieve` would write the retained payload into the log on every
+        staged candidate — breaking that path's identifiers-only logging
+        contract — and would score one phantom retrieval per candidate, skewing
+        the very metrics the feedback loop learns from.
+
+        Like :meth:`exists`, this is a pure probe: an expired entry reads as
+        ``None`` and is left in place rather than deleted.
+
+        Args:
+            hash_key: Key returned by :meth:`store`.
+
+        Returns:
+            A defensive copy of the entry when it exists and is live, else
+            ``None``. The copy matters for the same reason it does in
+            :meth:`retrieve`: the in-memory backend hands out the live object,
+            whose mutable fields could otherwise be changed under the caller.
+        """
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return None
+            return replace(entry, search_queries=list(entry.search_queries))
+
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.
 
@@ -630,6 +696,100 @@ class CompressionStore:
                 self._stale_heap_entries += 1
 
             return status
+
+    def extend_ttl(self, hash_key: str, ttl: int) -> bool:
+        """Guarantee a live entry survives at least ``ttl`` more seconds (retention lease).
+
+        Jev active retention drops a tool result out of the forwarded
+        conversation and leaves a ``Retrieve original: hash=`` marker in its
+        place. That entry then holds the only copy of the content, so it has to
+        outlive the session-scale default TTL an ordinary compression entry
+        gets (where the original is still sitting in the caller's transcript).
+
+        ``ttl`` is measured **from now**, not from the entry's creation. The
+        store's TTL is relative to ``created_at``
+        (:meth:`CompressionEntry.is_expired` is ``now - created_at > ttl``), so
+        writing ``ttl`` straight into the field would give an entry that is
+        already 20 minutes old only ``ttl`` minus 20 minutes of life. The
+        stored value is therefore raised to
+        ``ceil(age) + ttl + LEASE_SLACK_SECONDS``: ``ceil`` rounds the
+        sub-second remainder in the caller's favour (the field is an int and a
+        lease must never come up short), and the slack covers the time the
+        write-back itself takes, which would otherwise eat into a lease granted
+        within the same second.
+
+        Extension is ONE-WAY: a lease that would leave the entry with less life
+        than it already has is ignored (the call still succeeds). Ordinary
+        compression re-stores the same content on every turn a marker is
+        re-encountered, and letting one of those shorten a lease that retention
+        took would expire the entry while its marker is still in the
+        conversation — a guaranteed 404 on ``/v1/retrieve`` with no copy left
+        anywhere.
+
+        An expired entry is reported as a failure and left untouched: it is not
+        deleted (so this stays a non-destructive probe, like :meth:`exists`) and
+        above all not resurrected, because its content is already unreachable
+        through :meth:`retrieve`.
+
+        The acknowledgement is verified, not assumed: a write is re-read through
+        the backend before the call reports success. ``SQLiteBackend.set``
+        swallows transient database errors (logging and returning normally), so
+        without the read-back this could report a lease that the persisted row
+        never took, and retention would drop the only copy of the content on
+        the strength of it.
+
+        Args:
+            hash_key: Key returned by :meth:`store`.
+            ttl: Seconds from now the entry must remain retrievable for. ``0``
+                is a valid no-op lease (it can never shorten anything).
+
+        Returns:
+            True when the entry exists, is not expired, and the backend has
+            confirmed on re-read that it is now good for at least ``ttl`` more
+            seconds. False when the entry is missing, already expired, or the
+            extension did not stick — the caller must then keep the original
+            content instead of replacing it with a marker.
+
+        Raises:
+            ValueError: ``ttl`` is negative.
+        """
+        if ttl < 0:
+            raise ValueError(f"ttl must be non-negative, got {ttl!r}")
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return False
+            # Age can only grow, so anchoring on it keeps the deadline
+            # (created_at + ttl) at least `ttl` seconds ahead of *this* moment.
+            required = math.ceil(time.time() - entry.created_at) + ttl + LEASE_SLACK_SECONDS
+            if entry.ttl >= required:
+                return True
+
+            entry.ttl = required
+            # Write back through the backend: the in-memory backend hands out
+            # the live object, but SQLiteBackend deserializes a fresh copy per
+            # get() and only refreshes the `ttl` column its purge query (and
+            # startup sweep) reads on set(), so the lease survives a restart as
+            # well as an opportunistic purge. created_at is untouched, so the
+            # eviction heap stays valid.
+            self._backend.set(hash_key, entry)
+
+            # Acknowledged read-back. On SQLite this is a real round trip to
+            # the row; on the in-memory backend it returns the same object and
+            # is trivially true.
+            stored = self._backend.get(hash_key)
+            if stored is None or stored.is_expired() or stored.ttl < required:
+                logger.warning(
+                    "CCR retention lease not acknowledged for hash=%s "
+                    "(requested_ttl=%d required=%d stored_ttl=%s); the backend "
+                    "write did not stick — caller must keep the original content",
+                    hash_key,
+                    ttl,
+                    required,
+                    "missing" if stored is None else stored.ttl,
+                )
+                return False
+            return True
 
     def get_stats(self) -> dict[str, Any]:
         """Get store statistics for monitoring."""

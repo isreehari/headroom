@@ -15,6 +15,7 @@ from typing import Any, Literal
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
+from headroom.proxy.jev.config import JevConfig
 from headroom.proxy.model_router import ModelRouterConfig
 from headroom.rollout import RolloutSnapshot, resolve_rollout
 
@@ -545,6 +546,13 @@ class ProxyConfig:
     # the worker receiving the admin request would observe the update.
     worker_processes: int = 1
 
+    # Jev retention-decision integration (Track A shadow mode). Default off;
+    # resolved from HEADROOM_JEV_* at the composition root. Declared last, like
+    # worker_processes above, so no existing positional constructor field
+    # shifts. Validated in __post_init__ — an enabled mode with no API key is a
+    # startup error, not a silent no-op.
+    jev: JevConfig = field(default_factory=JevConfig)
+
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:
             self.rollout = resolve_rollout()
@@ -566,6 +574,9 @@ class ProxyConfig:
             raise ValueError(
                 "rate_limit_requests_per_minute must be >= 1 when rate_limit_enabled=True"
             )
+        # Jev: default-off, but strict once switched on (missing key, bad
+        # endpoint, out-of-range knobs all fail startup here).
+        self.jev.validate()
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:

@@ -77,6 +77,63 @@ def _append_metric(
 PROXY_SAVINGS_FLUSH_EVERY = 25
 
 
+#: Every integer total the /stats `jev` block reports. The allowlist is the
+#: contract: a caller that mistypes a field name gets it dropped, not silently
+#: added as a new key nobody reads, and a dashboard can rely on every field
+#: being present (zero-valued) from the first request.
+JEV_ACCOUNTING_FIELDS: tuple[str, ...] = (
+    # Call outcomes. `calls_completed` + `calls_timed_out` + `calls_rejected`
+    # partition the calls that finished; `calls_failed` is the sum of the last
+    # two, kept as its own field so "any failure" is one series to alert on.
+    "calls_attempted",
+    "calls_completed",
+    "calls_failed",
+    "calls_timed_out",
+    "calls_rejected",
+    # Candidate volume. `candidates` is everything selected, `candidates_sent`
+    # the subset the measured request budget actually asked about, and
+    # `candidates_trimmed` the difference. A high trim rate means the request
+    # budget is the binding constraint rather than Jev's judgement, which is a
+    # different problem from Jev keeping everything.
+    "candidates",
+    "candidates_sent",
+    "candidates_trimmed",
+    "candidate_tokens",
+    # Answers: Jev's DECISION tallies, not what was carried out. A candidate
+    # Jev said `drop` to whose CCR commit then failed still counts here as a
+    # drop, because that is what Jev decided.
+    "keep",
+    "truncate",
+    "drop",
+    # What was actually carried out: candidates whose slot was really
+    # rewritten. The gap between `drop` + `truncate` and `applied` is a
+    # partial-staging failure, which is otherwise invisible from outside.
+    "applied",
+    # Token accounting: T0 / TH / TP for the shadow projection, and the
+    # separate TH/TF pair for what active retention really changed.
+    "tokens_baseline",
+    "tokens_headroom",
+    "tokens_projected",
+    "tokens_active_baseline",
+    "tokens_final",
+    # The `*_estimated` twins. Every token counter above holds a TOKENIZER
+    # measurement and nothing else; a track with no tokenizer in reach (Track
+    # C, deciding at a WebSocket frame boundary, where a candidate's size is
+    # `bytes // 4`) reports into these instead. Blending the two would leave
+    # an operator unable to say what unit a number is in, which is worse than
+    # two honest series, so the units are never summed together. Each name
+    # here is exactly its measured counterpart plus `_estimated`.
+    "candidate_tokens_estimated",
+    "tokens_active_baseline_estimated",
+    "tokens_final_estimated",
+    # CCR: acknowledged means a verified read-back and a lease (Task 13).
+    "ccr_staged",
+    "ccr_acknowledged",
+    "ccr_failed",
+    "fallbacks",
+)
+
+
 class PrometheusMetrics:
     """Prometheus-compatible metrics."""
 
@@ -170,6 +227,17 @@ class PrometheusMetrics:
         # out while its worker kept running; ``skipped`` means later work was
         # rejected before executor admission behind that worker.
         self.compression_quarantine_by_event: dict[str, int] = defaultdict(int)
+
+        # Jev retention (Track A shadow mode) lifecycle events, keyed by event
+        # name. Every exit from the shadow hook lands in exactly one bucket —
+        # including each fail-open — so a shadow deployment that silently never
+        # calls Jev is visible as a counter, not only as an absent log line.
+        self.jev_events_by_event: dict[str, int] = defaultdict(int)
+
+        # Jev retention token accounting for the /stats `jev` block. TH/TP are
+        # summed here; TF lands in `tokens_final`. TP is NEVER added to the
+        # realized-savings series — see jev_snapshot().
+        self.jev_totals: dict[str, int] = defaultdict(int)
 
         # These counters are mutated from compression worker threads and the
         # event-loop thread, while export()/reset_runtime() read and clear them.
@@ -366,6 +434,8 @@ class PrometheusMetrics:
                 self.upstream_connection_errors_by_provider.clear()
                 self.kompress_size_gate_by_outcome.clear()
                 self.compression_quarantine_by_event.clear()
+                self.jev_events_by_event.clear()
+                self.jev_totals.clear()
 
             self.codex_ws_units_total = 0
             self.codex_ws_units_modified_total = 0
@@ -576,6 +646,79 @@ class PrometheusMetrics:
         """
         with self._obs_counter_lock:
             self.compression_failed_by_reason[reason or "error"] += 1
+
+    def record_jev_event(self, event: str) -> None:
+        """Record one Jev retention lifecycle event, bucketed by ``event``.
+
+        Called from ``headroom/proxy/jev/shadow.py`` and
+        ``headroom/proxy/jev/hook.py`` with names like ``shadow_below_threshold``,
+        ``shadow_cooldown``, ``shadow_no_candidates``, ``shadow_call_attempted``,
+        ``shadow_call_error``, ``shadow_stale_revision``, ``shadow_projected``
+        and ``shadow_fail_open``. Those names are internal constants, never
+        request data, but the key is still coerced to a plain ``str`` (empty or
+        ``None`` becomes ``"unknown"``) so no caller can plant a non-string key
+        that breaks the export's text format. Guarded by ``_obs_counter_lock``
+        for the same reason as ``record_compression_failed``.
+        """
+        with self._obs_counter_lock:
+            self.jev_events_by_event[str(event) if event else "unknown"] += 1
+
+    def record_jev_accounting(self, **fields: int) -> None:
+        """Add Jev retention totals for the ``/stats`` ``jev`` block.
+
+        Accepts only the names in :data:`JEV_ACCOUNTING_FIELDS`; anything else
+        is dropped. Nothing here may raise: this runs on the request path and
+        on the Codex WebSocket relay, and an accounting bug must cost a number
+        on a dashboard, never a turn. A value that will not coerce to ``int``
+        is dropped for the same reason. Guarded by ``_obs_counter_lock``, like
+        every other off-thread observer counter.
+        """
+        with self._obs_counter_lock:
+            for name, value in fields.items():
+                if name not in JEV_ACCOUNTING_FIELDS:
+                    continue
+                try:
+                    self.jev_totals[name] += int(value)
+                except (TypeError, ValueError):
+                    continue
+
+    def jev_snapshot(self) -> dict[str, Any]:
+        """Totals for the ``/stats`` ``jev`` block, plus the two derived savings.
+
+        ``projected_savings`` is ``TH - TP`` — Track A's shadow projection,
+        what active mode *would* have saved on the turns it was asked about. It
+        is reported here and only here: the design doc requires it to stay out
+        of the realized savings the ledger and ``/stats-history`` persist.
+
+        ``realized_savings`` is ``TH - TF`` measured on the content active
+        retention actually rewrote (``tokens_active_baseline`` against
+        ``tokens_final``). The two pairs never mix: a projection and a
+        measurement are different claims about different turns, and adding them
+        would overstate both.
+
+        ``realized_savings_estimated`` is the same subtraction over the
+        ``*_estimated`` counters: the saving claimed by a track that had no
+        tokenizer in reach and priced its candidate at ``bytes // 4`` (Track C,
+        at a WebSocket frame boundary). It is a saving that really happened
+        whose SIZE is an estimate, so it is reported beside ``realized_savings``
+        rather than added to it — one blended number would leave an operator
+        unable to say what unit either half was in.
+        """
+        with self._obs_counter_lock:
+            totals: dict[str, Any] = {
+                name: int(self.jev_totals.get(name, 0)) for name in JEV_ACCOUNTING_FIELDS
+            }
+            events = dict(self.jev_events_by_event)
+        totals["projected_savings"] = max(0, totals["tokens_headroom"] - totals["tokens_projected"])
+        totals["realized_savings"] = max(
+            0, totals["tokens_active_baseline"] - totals["tokens_final"]
+        )
+        totals["realized_savings_estimated"] = max(
+            0,
+            totals["tokens_active_baseline_estimated"] - totals["tokens_final_estimated"],
+        )
+        totals["events"] = events
+        return totals
 
     def record_upstream_connection_error(self, provider: str) -> None:
         """Record one exhausted-retries upstream transport failure.
@@ -1436,6 +1579,8 @@ class PrometheusMetrics:
                 upstream_conn_errors = dict(self.upstream_connection_errors_by_provider)
                 kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
                 compression_quarantine = dict(self.compression_quarantine_by_event)
+                jev_events = dict(self.jev_events_by_event)
+                jev_totals = dict(self.jev_totals)
 
             if upstream_conn_errors:
                 lines.extend(
@@ -1488,6 +1633,37 @@ class PrometheusMetrics:
                         f'headroom_compression_quarantine_total{{event="{_escape_label_value(event)}"}} {count}'
                     )
                 lines.append("")
+
+            if jev_events:
+                lines.extend(
+                    [
+                        "# HELP headroom_jev_events_total Jev retention lifecycle events by event name; every shadow-hook exit, including fail-opens, is counted here",
+                        "# TYPE headroom_jev_events_total counter",
+                    ]
+                )
+                for event, count in jev_events.items():
+                    lines.append(
+                        f'headroom_jev_events_total{{event="{_escape_label_value(event)}"}} {count}'
+                    )
+                lines.append("")
+
+            # One series, one label — an operator graphs `drop` or
+            # `calls_timed_out` without Headroom minting a metric name per
+            # field, and a field added to JEV_ACCOUNTING_FIELDS appears here
+            # with no export change. Every field is emitted even at zero, so a
+            # dashboard panel exists from the first scrape.
+            lines.extend(
+                [
+                    "# HELP headroom_jev_accounting_total Jev retention accounting totals by field; token letters are T0=tokens_baseline, TH=tokens_headroom/tokens_active_baseline, TP=tokens_projected, TF=tokens_final. TP is a projection and is never part of the realized saving (tokens_active_baseline - tokens_final). Token fields hold tokenizer measurements; the matching *_estimated fields hold bytes//4 estimates from tracks with no tokenizer in reach, and the two are never summed together",
+                    "# TYPE headroom_jev_accounting_total counter",
+                ]
+            )
+            for _field in JEV_ACCOUNTING_FIELDS:
+                lines.append(
+                    f'headroom_jev_accounting_total{{field="{_field}"}} '
+                    f"{int(jev_totals.get(_field, 0))}"
+                )
+            lines.append("")
 
             lines.extend(
                 [

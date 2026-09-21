@@ -31,9 +31,14 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
-        exclude: ^experiments/
+        exclude: ^experiments/|\.md$
       - id: ruff-format
-        exclude: ^experiments/
+        # ruff-format also formats Python fences embedded in Markdown; that
+        # rewrite is unsafe for illustrative/incomplete snippets in docs and
+        # plans (e.g. it silently turned `jev=JevConfig.from_env(),` into
+        # `jev = (JevConfig.from_env(),)`, changing what the example means).
+        # Markdown files are prose, not lint targets -- exclude them.
+        exclude: ^experiments/|\.md$
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.14.1
     hooks:

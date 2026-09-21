@@ -303,11 +303,20 @@ class TestCompressEndpointCompression:
             transforms_summary={"test_transform": 1},
             markers_inserted=[],
         )
-        # The executor callable returns the 5-tuple contract of
-        # _run_stateless/_run_session_turn:
-        # (result, final_messages, tokens_before, tokens_after, session_info).
+        # The executor callable returns the 6-tuple contract of
+        # _run_stateless/_run_session_turn: (result, final_messages,
+        # tokens_before, tokens_after, session_info, session_snapshot_revision).
+        # The last element is the tracker generation a session turn recorded
+        # under its lock; a stateless turn has no replay state, so it is None.
         run_compression = AsyncMock(
-            return_value=(result, result.messages, result.tokens_before, result.tokens_after, None)
+            return_value=(
+                result,
+                result.messages,
+                result.tokens_before,
+                result.tokens_after,
+                None,
+                None,
+            )
         )
         record_outcome = AsyncMock()
         monkeypatch.setattr(proxy, "_run_compression_in_executor", run_compression)
@@ -354,13 +363,14 @@ class TestCompressEndpointCompression:
         monkeypatch.setattr(
             proxy,
             "_run_compression_in_executor",
-            # Same 5-tuple contract as _run_stateless (see above).
+            # Same 6-tuple contract as _run_stateless (see above).
             AsyncMock(
                 return_value=(
                     result,
                     result.messages,
                     result.tokens_before,
                     result.tokens_after,
+                    None,
                     None,
                 )
             ),
