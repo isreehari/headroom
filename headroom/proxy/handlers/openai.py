@@ -83,6 +83,12 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.image_isolation import run_image_compression_isolated
+from headroom.proxy.jev.compaction_hook import (
+    REASON_DROPPED,
+    apply_jev_compaction_boundary,
+    resolve_jev_client,
+)
+from headroom.proxy.jev.compaction_state import JevCompactionRevisionStore
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
 from headroom.proxy.passthrough import (
@@ -107,6 +113,12 @@ _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
+# Track C: compaction revisions already decided, keyed by
+# `previous_response_id`. Module-level so it survives both across frames of one
+# session and across reconnects -- the WS `session_id` is a fresh uuid4 per
+# socket, so it deliberately plays no part in the key. Bounded, so a long-lived
+# proxy cannot grow it without limit.
+_JEV_COMPACTION_REVISIONS = JevCompactionRevisionStore()
 # The WS->HTTP fallback streams SSE, so `read` is the gap BETWEEN events, not a
 # cap on the whole response: 120s of silence from a live Codex turn means the
 # upstream is gone, not thinking. That is this path's own bound and is
@@ -8487,6 +8499,33 @@ class OpenAIHandlerMixin:
                                         else None
                                     )
                                     msg = await _prepare_memory_frame(_inbound_frame_body, msg)
+                                    # Track C: Codex's native compaction
+                                    # boundary is WS-only and carries exactly
+                                    # one candidate. Runs after the memory
+                                    # rewrite and before compression so Jev
+                                    # sees (and CCR stages) the ORIGINAL tool
+                                    # output rather than an already-compressed
+                                    # marker. Returns `msg` byte-identical
+                                    # unless an acknowledged CCR commit
+                                    # succeeded; owns its own gating, timeout,
+                                    # logging and metrics; never raises.
+                                    msg, _jev_reason = await apply_jev_compaction_boundary(
+                                        msg,
+                                        jev_config=getattr(self.config, "jev", None),
+                                        client=resolve_jev_client(self),
+                                        session_id=session_id,
+                                        request_id=request_id,
+                                        revisions=_JEV_COMPACTION_REVISIONS,
+                                        metrics=getattr(self, "metrics", None),
+                                    )
+                                    if _jev_reason == REASON_DROPPED:
+                                        logger.info(
+                                            "[%s] WS /v1/responses jev compaction drop "
+                                            "frame=%d session_id=%s",
+                                            request_id,
+                                            client_frame_index,
+                                            session_id,
+                                        )
                                 (
                                     msg,
                                     _frame_modified,
