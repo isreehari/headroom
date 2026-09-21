@@ -451,14 +451,27 @@ def test_detection_does_not_mutate_the_frame_it_inspects() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_the_module_is_a_stdlib_only_leaf() -> None:
-    """Import isolation, exactly as Track B's ``compress_gate`` keeps it.
+def test_the_module_imports_only_stdlib_and_the_ccr_tool_name() -> None:
+    """Import isolation, in the form Track B's ``compress_gate`` keeps it.
 
     The relay must be able to import this module on every WS connection without
-    dragging in the ``jev`` package, the proxy, or any third-party dependency --
-    ``HEADROOM_JEV_MODE`` is unset by default and an unconfigured proxy must pay
-    nothing. Checked structurally on the source so the prose above, which names
-    ``headroom`` and ``jev``, cannot satisfy or trip it.
+    dragging in the ``jev`` package, the rest of the proxy, or any third-party
+    dependency -- ``HEADROOM_JEV_MODE`` is unset by default and an unconfigured
+    proxy must pay nothing.
+
+    Exactly one crossing is allowed, and only for one name: ``CCR_TOOL_NAME``
+    from ``headroom.ccr``, which Task 22's ``has_recovery_tool`` matches
+    against. It adds no load -- ``headroom.ccr`` is already imported at module
+    level by ``headroom/proxy/server.py`` and
+    ``headroom/proxy/handlers/openai.py``, so it is resident before this module
+    can be reached -- and binding the constant is what stops a renamed recovery
+    tool from silently switching the gate off, which a copied string literal
+    would do. The rule is narrowed to that single name rather than widened to
+    ``headroom``, so the discipline still bites.
+
+    `hashlib` and `json` joined the stdlib set with Task 21's content-bound
+    replacement. Checked structurally on the source so the prose above, which
+    names ``headroom``, ``ccr`` and ``jev``, cannot satisfy or trip it.
     """
     import headroom.proxy.jev.compaction as compaction_module
 
@@ -470,11 +483,15 @@ def test_the_module_is_a_stdlib_only_leaf() -> None:
         elif isinstance(node, ast.ImportFrom):
             if node.level:  # a relative import is by definition a package import
                 imported.add(".")
-            elif node.module:
-                imported.add(node.module.split(".")[0])
-    # `hashlib` and `json` joined the set with Task 21's content-bound
-    # replacement: both are stdlib, so the leaf discipline is unchanged -- no
-    # `headroom`, no `jev`, no relative import, no third-party package.
+                continue
+            module = node.module or ""
+            if module == "headroom.ccr":
+                assert sorted(alias.name for alias in node.names) == ["CCR_TOOL_NAME"], ast.dump(
+                    node
+                )
+                assert all(alias.asname is None for alias in node.names)
+                continue
+            imported.add(module.split(".")[0])
     assert imported <= {
         "__future__",
         "dataclasses",

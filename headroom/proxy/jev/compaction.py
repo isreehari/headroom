@@ -11,11 +11,22 @@ untouched.
 
 Two disciplines this module keeps, and the reasons they are not negotiable:
 
-* **Stdlib-only leaf.** Like Track B's ``compress_gate``, this module imports
-  nothing from the rest of the ``jev`` package and nothing from the proxy. The
-  relay must be able to reach detection cheaply on a connection where
-  ``HEADROOM_JEV_MODE`` is unset -- the default -- and an unconfigured proxy
-  must pay nothing for Jev's existence.
+* **Near-leaf: stdlib, plus one shared constant.** Like Track B's
+  ``compress_gate``, this module imports nothing from the rest of the ``jev``
+  package and nothing from the proxy. The relay must be able to reach detection
+  cheaply on a connection where ``HEADROOM_JEV_MODE`` is unset -- the default --
+  and an unconfigured proxy must pay nothing for Jev's existence.
+
+  The single crossing is ``CCR_TOOL_NAME`` from ``headroom.ccr``, which
+  ``has_recovery_tool`` matches against. It costs nothing: ``headroom.ccr`` is
+  already in the relay's module-level import graph (``headroom/proxy/server.py``
+  and ``headroom/proxy/handlers/openai.py`` both import it at import time), so
+  by the time this module can be reached it is loaded anyway. Copying the string
+  instead would be the more expensive choice in the way that matters -- a
+  renamed recovery tool would leave this gate matching the old name, silently
+  answering "no recovery tool" forever, which is this gate's own failure mode
+  turned inside out. ``headroom.ccr`` imports nothing from ``headroom.proxy.jev``
+  (directly or transitively), so the binding introduces no cycle.
 * **Fail closed, never raise.** These functions run inline in the relay's hot
   path on arbitrary, attacker-reachable JSON. Unlike the ``/v1/compress`` gate,
   which raises a typed error so the handler can answer 400, there is no caller
@@ -29,6 +40,8 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
+
+from headroom.ccr import CCR_TOOL_NAME
 
 COMPACTION_TRIGGER_ITEM_TYPE = "compaction_trigger"
 
@@ -359,3 +372,97 @@ def replace_candidate_output(
         return False
     item[candidate.output_field] = replacement
     return True
+
+
+def _tool_names(tools: Any) -> list[str]:
+    """Collect tool names from a Responses (flat) or chat (nested) tool list.
+
+    Responses tool defs are flat -- ``{"type": "function", "name": ...}`` --
+    while chat-completions defs nest the name under ``function``. Both reach the
+    WS Responses path in practice, so both are read, exactly as
+    ``_has_headroom_retrieve_tool_responses`` in the OpenAI handler does.
+
+    Every value is ``isinstance``-checked before it is returned: these names go
+    on to ``==`` and ``str.endswith``, and a ``name`` decoded from client JSON
+    as an array or object would otherwise reach ``endswith`` and raise inside
+    the relay's hot path. Non-dict entries are skipped rather than rejected --
+    junk beside a real declaration must not cost the frame its recovery tool.
+    """
+    names: list[str] = []
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+        function = tool.get("function")
+        if isinstance(function, dict):
+            nested = function.get("name")
+            if isinstance(nested, str) and nested:
+                names.append(nested)
+    return names
+
+
+def _is_recovery_tool_name(name: str) -> bool:
+    """Whether ``name`` denotes the CCR retrieval tool, namespaced or not.
+
+    An MCP-served retrieve tool reaches the model under a server prefix
+    (``mcp__Headroom__headroom_retrieve``); it is the same recovery path, so the
+    prefix must not read as a different tool. Mirrors the namespaced match the
+    Responses handler already applies in ``headroom/proxy/handlers/openai.py``.
+
+    ``CCR_TOOL_NAME`` is read from ``headroom.ccr`` at call time and never
+    copied, so renaming the tool moves this gate with it.
+    """
+    return name == CCR_TOOL_NAME or name.endswith(f"__{CCR_TOOL_NAME}")
+
+
+def has_recovery_tool(inner: Any) -> bool:
+    """Whether this frame advertises the CCR retrieval tool to the model.
+
+    The fail-open gate for Track C, and the reason the rest of the track is
+    allowed to exist: retention replaces a tool output with a retrieval marker,
+    and a marker the model cannot redeem is not compression but permanent data
+    loss. So the only safe answer when anything is unclear -- a frame that is
+    not a dict, a ``tools`` value that is not a list, an entry whose ``name``
+    decoded to something that is not a string -- is ``False``, which leaves the
+    original content in place and relays the frame untouched.
+
+    Both encodings are checked, because missing either one is a silent failure
+    in opposite directions:
+
+    * the classic top-level ``tools`` array; and
+    * the Codex >= 0.149.0 ``additional_tools`` carrier item inside ``input``
+      (see ``_lift_codex_additional_tools`` in
+      ``headroom/proxy/handlers/openai.py``), which is where current Codex
+      clients put their tool definitions. Missing it would turn Track C off for
+      them with no visible symptom.
+
+    Only that carrier type counts. A ``tools`` key on any other item is not a
+    declaration Codex makes, and honouring it would let transcript content the
+    client controls unlock a drop the model cannot redeem.
+
+    Read-only: ``inner`` is held by reference and is relayed onward, so nothing
+    here writes to it. Like the rest of this module the function never raises --
+    the item ``type`` is ``isinstance``-guarded before it is compared, which is
+    the same unhashable-``type`` family that has twice crashed detection on
+    client JSON.
+    """
+    if not isinstance(inner, dict):
+        return False
+    if any(_is_recovery_tool_name(name) for name in _tool_names(inner.get("tools"))):
+        return True
+    items = inner.get("input")
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if not isinstance(item_type, str) or item_type != ADDITIONAL_TOOLS_ITEM_TYPE:
+            continue
+        if any(_is_recovery_tool_name(name) for name in _tool_names(item.get("tools"))):
+            return True
+    return False
