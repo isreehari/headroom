@@ -242,6 +242,128 @@ Some settings can be configured via environment variables:
 | `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](#session-beta-header-tracking). | `enabled` |
 | `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
 
+## Jev Retention (default off)
+
+Jev is a third-party retention-decision service (TypeSafe System One). When it is
+enabled, Headroom asks it -- per historical **tool result**, *after* Headroom's own
+deterministic compression has already run -- whether that result must stay verbatim,
+can be truncated, or can be replaced by a retrievable CCR marker. It is **additive**
+to Headroom's compression and never a substitute for it: the deterministic pipeline
+runs on every turn whatever Jev answers, and Jev only ever operates on the output
+that pipeline already produced.
+
+**Default off.** With no `HEADROOM_JEV_*` variable exported, the proxy behaves exactly
+as it does today: `JevConfig.from_env` returns the default configuration and stops,
+without reading any other `HEADROOM_JEV_*` variable. A typo in, say,
+`HEADROOM_JEV_TIMEOUT_MS` therefore cannot stop an unconfigured proxy booting -- the
+one exception is `HEADROOM_JEV_MODE` itself, which is always parsed and rejected if it
+is not one of the three modes.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HEADROOM_JEV_MODE` | `off`, `shadow` or `active`. `off`: no other `HEADROOM_JEV_*` variable is read at all. `shadow`: Jev is called and a projection is recorded, but the forwarded request is never modified. `active`: decisions are applied, and only at a declared compaction boundary -- `POST /v1/compress` with `config.jev_compaction_boundary=true` (Track B), or Codex's native WebSocket compaction (Track C). The two are exclusive: `active` does **not** also run the shadow projection. | `off` |
+| `HEADROOM_JEV_API_KEY` | API key. Required whenever the mode is not `off`: `JevConfig.validate()` raises from `ProxyConfig.__post_init__`, so the proxy refuses to start rather than silently no-opping. It travels only in the client's `Authorization` header; it is excluded from the dataclass `repr`, from `JevConfig.redacted()`, from the `/stats` payload and from the multi-worker config payload, and is **never logged**. | - |
+| `HEADROOM_JEV_ENDPOINT` | Jev API endpoint. Must be an `http(s)` URL. Everywhere it is surfaced -- log lines, scrubbed exception text, `/stats` -- it passes through `redact_endpoint()` and is shown as scheme + host + path only, so userinfo (`user:pw@`) and any query string are replaced with `<redacted>`. | `https://api.typesafe.ai/v1/systemone` |
+| `HEADROOM_JEV_MODEL` | Jev model name, passed in the request payload. | `jev-latest` |
+| `HEADROOM_JEV_TIMEOUT_MS` | Hard bound (>= 1) on the whole Jev round trip, applied by all three tracks. This is added latency on the turns that actually call Jev, so keep it small. | `500` |
+| `HEADROOM_JEV_THRESHOLD_PERCENT` | 1..100. **Shadow mode only** (it is read nowhere else in the codebase): skip the call until post-Headroom tokens reach this percentage of the model's context window. | `80` |
+| `HEADROOM_JEV_COOLDOWN_TURNS` | >= 0. **Shadow mode only**: turns to wait before another call on the same `(session, branch)`. Only turns that reach the cooldown gate count against it. | `5` |
+| `HEADROOM_JEV_MAX_CANDIDATE_TOKENS` | >= 1. Per-candidate ceiling on how much content is shown to Jev. In shadow and Track B it bounds each candidate's view at `tokens x 4` characters; at the Codex boundary (Track C) the same `x 4` factor makes it a UTF-8 **byte** ceiling on the extracted candidate. | `20000` |
+| `HEADROOM_JEV_MAX_CANDIDATES` | >= 1. Maximum candidates selected per call, oldest first. Applies in shadow mode and to Track B; Track C's boundary carries exactly one candidate, so it is not used there. | `12` |
+| `HEADROOM_JEV_MAX_STATE_TOKENS` | >= 1. Ceiling on the **measured** serialized request, in shadow mode and Track B. Jev rejects an oversized request outright -- the whole call is lost, not just the overflow -- so the request is trimmed (candidates dropped, then views thinned) until it really fits. Raise it together with `HEADROOM_JEV_MAX_CANDIDATES` if you want a bigger request at a boundary. Not used by Track C. | `8000` |
+
+`HEADROOM_JEV_MODE` is always validated; every other value above is validated at
+startup only when the mode is not `off`. An out-of-range value fails the proxy's
+configuration check rather than being clamped.
+
+### What leaves this machine
+
+When the mode is not `off`, Headroom sends the Jev endpoint a request containing:
+
+- the **content of the selected tool results** themselves -- an OpenAI Chat
+  `role: "tool"` message, a Responses `function_call_output` /
+  `custom_tool_call_output` item, or an Anthropic `tool_result` block -- each
+  truncated to `HEADROOM_JEV_MAX_CANDIDATE_TOKENS` and, in shadow/Track B, further
+  trimmed to fit `HEADROOM_JEV_MAX_STATE_TOKENS`;
+- per-candidate metadata: candidate type, tool call id, estimated token count and the
+  SHA-256 of the *full* content, plus -- in shadow and Track B -- the role,
+  message/block index, distance from the end of the conversation and byte length;
+- conversation identifiers, none of them anonymized or rewritten by Headroom: the
+  session id this conversation is tracked under (on `/v1/compress` it is the one the
+  caller sent), a branch id (a SHA-256 of the session id and the protected prefix in
+  shadow/Track B; the raw Codex `previous_response_id` at the WebSocket boundary), a
+  revision hash, the provider and upstream model names, the Jev model name and
+  message counts;
+- fixed English instructions and the keep/truncate/drop criteria.
+
+Candidates are only ever tool results. In shadow mode and Track B they must also lie
+outside the protected prefix and outside the last 6 messages; Track C's boundary
+carries exactly the one tool output Codex is compacting. User messages, assistant
+messages, system prompts and tool *call* arguments are not part of the payload.
+
+Nothing is scrubbed on the way out. Per the design doc: *"No PII anonymization claim;
+Jev is a retention-decision service only."* If your tool output would contain secrets,
+customer data or anything else you would not hand to a third-party API, do not enable
+this feature on that traffic.
+
+### It fails open, everywhere
+
+Every gate that can go wrong forwards Headroom's ordinary compressed output unchanged:
+a timeout, a transport or TLS failure, a 4xx/5xx, a malformed or unreadable answer, an
+answer for a candidate that was not asked about, a `truncate` verdict at a boundary
+that only offers keep/drop, a stale (already-decided) revision, a candidate that does
+not fit the request budget, a frame that does not advertise the `headroom_retrieve`
+recovery tool, a missing session identity, and any failed CCR write, read-back or
+lease. Anything ambiguous is read as `keep`, which is the direction that changes
+nothing. Shadow mode additionally cannot affect a request at all: it measures its
+projection on a private deep copy and never mutates the message list it is given.
+
+Each of those exits records an event on `headroom_jev_events_total{event}`, and the
+aggregate is on `/stats` under `jev` (with `config` reported through
+`JevConfig.redacted()`), so a deployment that silently never calls Jev shows up as a
+counter rather than as an absent log line.
+
+### Nothing is deleted in active mode
+
+Before a tool result is truncated or replaced, the original is written to the CCR
+store under a hash bound to `(session, branch, content)`, read back and compared byte
+for byte, and given a **24-hour** retention lease; only then is the slot rewritten. A
+candidate without an acknowledged, leased entry keeps its original content whatever
+Jev answered, and the message envelope is always preserved -- a `drop` replaces the
+*content* with a `[N tokens compressed to 0. ... Retrieve more: hash=...]` marker that
+the model redeems with the `headroom_retrieve` tool or `POST /v1/retrieve`, so a tool
+result is never removed and never orphans its tool call.
+
+See [CCR](ccr.md#jev-active-retention-v1compress) for the `/v1/compress` boundary
+request shape and lease semantics, and [Proxy](proxy.md#jev-compaction-boundary-codex-websocket)
+for the Codex WebSocket boundary.
+
+### Reading the numbers on `/stats`
+
+Three savings figures under `jev`, and they are deliberately never summed:
+
+- `projected_savings` -- shadow mode's projection (`TH - TP`): what active mode
+  *would* have saved. It is reported here and nowhere else; it is never added to
+  realized savings and never reaches the savings ledger or `/stats-history`.
+- `realized_savings` -- `TH - TF` over the content active retention actually
+  rewrote, measured with a real tokenizer. Only Track B contributes to it; shadow
+  mode rewrites nothing, so it has no realized saving at all.
+- `realized_savings_estimated` -- the same subtraction for Track C, which runs at a
+  WebSocket frame boundary with no tokenizer in reach and prices its candidate at
+  `bytes // 4`. The saving is real; its *size* is an estimate, which is why it sits
+  beside `realized_savings` instead of inside it. An operator has to read both
+  numbers to see the total effect.
+
+### Multi-process and benchmark deployments
+
+The proxy hands its configuration to worker processes through the
+`HEADROOM_PROXY_CONFIG_JSON` environment variable, which is readable from the process
+table on most platforms. The Jev block is deliberately **left out** of that payload so
+the API key cannot leak there; each worker rebuilds it with `JevConfig.from_env()`
+instead. Any multi-worker or benchmark deployment must therefore export the
+`HEADROOM_JEV_*` variables into the process environment -- setting them only in the
+parent's in-memory config will leave the workers with Jev off.
+
 ## Settings GUI
 
 A web-based settings interface is available at `http://127.0.0.1:<port>/dashboard/settings` for configuring every safe `HEADROOM_*` proxy knob without hand-exporting environment variables, plus an **Endpoints** group for custom Anthropic/OpenAI upstream base URLs (`ANTHROPIC_TARGET_API_URL` / `OPENAI_TARGET_API_URL`) and extra headers merged into (and overriding) forwarded requests -- e.g. for a corporate gateway or Azure Foundry deployment that needs a different endpoint plus one extra auth header. Fields are split into a **Settings** tab (commonly-tuned: compression ratio, budget, rate limits, verbosity) and an **Advanced** tab (everything else, including Endpoints). Third-party credentials such as `OPENAI_API_KEY`/`AWS_*` are never exposed here; the two extra-headers fields are the only secret-typed fields in the panel and render masked once set, with a "Clear stored value" action to remove them -- resaving the page without touching a masked field never overwrites the real stored value.
