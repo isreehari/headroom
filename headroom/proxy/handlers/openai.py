@@ -6119,14 +6119,15 @@ class OpenAIHandlerMixin:
         #
         # `jev_shadow_enabled` gates the recount, not the hook: the recount is
         # CPU-bound over the whole transcript, and Jev is off by default, so an
-        # unconfigured proxy must not pay for it (and when it IS on, the count
-        # goes to the bounded compression executor, per GH #1701 — never on the
-        # loop). The hook itself is still awaited unconditionally so its
+        # unconfigured proxy must not pay for it. When it IS on the count runs
+        # off the loop (GH #1701) on the default thread pool — NOT on the
+        # compression executor, whose timeout path quarantines compression for
+        # everyone. The hook itself is still awaited unconditionally so its
         # fail-open metric keeps covering this path.
         _jev_optimized, _jev_original = optimized_tokens, original_tokens
         if isinstance(_jev_input, list) and jev_shadow_enabled(self):
             _jev_optimized, _jev_original = await count_responses_tokens_offloaded(
-                self, _jev_input, tokenizer, tokens_saved
+                _jev_input, tokenizer, tokens_saved
             )
         await run_jev_shadow_hook(
             self,

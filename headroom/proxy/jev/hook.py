@@ -34,6 +34,7 @@ cooldown gates. Nothing it returns is applied to the forwarded request.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from typing import Any, cast
@@ -47,6 +48,14 @@ logger = logging.getLogger(__name__)
 #: Matches ``shadow.py``: a scrubbed error still gets a length bound before it
 #: reaches a log line.
 _MAX_ERROR_CHARS = 400
+
+#: Wall-clock bound on the Responses token recount
+#: (:func:`count_responses_tokens_offloaded`). Deliberately its own constant
+#: rather than ``COMPRESSION_TIMEOUT_SECONDS``: this is a shadow-mode
+#: measurement, and a count that takes longer than a few seconds is not worth
+#: having -- the turn is skipped as below-threshold, the leaked thread finishes
+#: on its own, and no shared state is touched.
+RESPONSES_RECOUNT_TIMEOUT_SECONDS = 5.0
 
 
 def _record(proxy: Any, event: str) -> None:
@@ -148,49 +157,43 @@ def responses_token_counts(items: Any, tokenizer: Any, tokens_saved: int) -> tup
 
 
 async def count_responses_tokens_offloaded(
-    owner: Any, items: Any, tokenizer: Any, tokens_saved: int
+    items: Any, tokenizer: Any, tokens_saved: int
 ) -> tuple[int, int]:
     """:func:`responses_token_counts`, off the event loop.
 
     Counting a full Codex transcript is CPU-bound, and GH #1701 is the
-    standing rule in this codebase that such work does not run on the loop:
-    an unbounded on-loop load froze the whole server. It goes to the owner's
-    *bounded* compression executor -- the same one
-    ``headroom.proxy.token_counting`` uses for the handler's own counts --
-    rather than a raw ``asyncio.to_thread``, which is unbounded and would
-    compete with that executor for the same CPU on exactly the large
-    transcripts this matters for.
+    standing rule in this codebase that such work does not run on the loop.
+
+    It runs on the default thread pool via ``asyncio.to_thread``, and
+    explicitly **not** on the proxy's compression executor. That executor is
+    not a neutral offload helper: a job that exceeds its timeout leaves
+    timeout debt and *quarantines* the pool
+    (``HeadroomProxy._run_compression_in_executor`` raises
+    ``CompressionQuarantinedError`` for every subsequent caller until the
+    leaked worker finishes or the cap elapses), so a slow Jev *telemetry*
+    count would switch off Headroom's own compression for unrelated requests.
+    Track A is additive to that compression and must never be able to
+    substitute for or degrade it. A thread leaked here occupies one default
+    pool slot until it finishes and touches no shared state -- strictly the
+    lesser harm.
 
     Call sites gate on :func:`jev_shadow_enabled` first, so an unconfigured
     proxy never gets here at all.
 
-    Fails open to ``(0, 0)`` on a missing executor path failure, a timeout, or
-    any raise -- ``0`` lands on the runner's ``shadow_below_threshold`` gate,
-    i.e. the turn is skipped rather than mis-measured. Falling back to an
-    inline count on timeout is deliberately *not* done: that would put the
-    very work this offloads back on the loop. ``asyncio.CancelledError`` is a
-    ``BaseException`` and propagates, as it must.
+    Fails open to ``(0, 0)`` on the timeout or any raise -- ``0`` lands on the
+    runner's ``shadow_below_threshold`` gate, so the turn is skipped rather
+    than mis-measured. Retrying inline after a timeout is deliberately *not*
+    done: that would put the very work this offloads back on the loop.
+    ``asyncio.CancelledError`` is a ``BaseException`` and propagates, as it
+    must.
     """
-    runner = getattr(owner, "_run_compression_in_executor", None)
-    if not callable(runner):
-        # No executor on this owner (a bare test double, an embedded runtime):
-        # the count is the same pure function, just not offloaded.
-        return responses_token_counts(items, tokenizer, tokens_saved)
     try:
-        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-
-        result = await runner(
-            lambda: responses_token_counts(items, tokenizer, tokens_saved),
-            timeout=float(COMPRESSION_TIMEOUT_SECONDS),
+        return await asyncio.wait_for(
+            asyncio.to_thread(responses_token_counts, items, tokenizer, tokens_saved),
+            timeout=RESPONSES_RECOUNT_TIMEOUT_SECONDS,
         )
     except Exception:  # noqa: BLE001 - fail open, incl. asyncio.TimeoutError.
         return (0, 0)
-    # ``runner`` is an attribute of an object this module does not own, so its
-    # return value is validated rather than trusted.
-    if isinstance(result, tuple) and len(result) == 2:
-        with contextlib.suppress(Exception):
-            return (max(0, int(result[0])), max(0, int(result[1])))
-    return (0, 0)
 
 
 def _resolve_context_limit(context_limit_source: Any, model: str) -> int:

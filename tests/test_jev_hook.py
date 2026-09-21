@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import logging
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -624,7 +628,7 @@ async def test_the_off_path_does_no_tokenisation_at_all() -> None:
     items = _responses_items()
 
     if isinstance(items, list) and jev_shadow_enabled(proxy):
-        await count_responses_tokens_offloaded(proxy, items, tokenizer, 250)
+        await count_responses_tokens_offloaded(items, tokenizer, 250)
     assert tokenizer.text_calls == 0
     assert tokenizer.message_calls == 0
 
@@ -632,80 +636,119 @@ async def test_the_off_path_does_no_tokenisation_at_all() -> None:
     # above is load-bearing rather than vacuous.
     on = FakeProxy(JevShadowRunner(JevConfig(mode="shadow", api_key="sk-test")), FakeMetrics())
     if isinstance(items, list) and jev_shadow_enabled(on):
-        await count_responses_tokens_offloaded(on, items, tokenizer, 250)
+        await count_responses_tokens_offloaded(items, tokenizer, 250)
     assert tokenizer.message_calls == 1
 
 
-class _RecordingOwner:
-    """Stands in for the handler: a bounded compression executor, like the real one."""
-
-    def __init__(self, fail: BaseException | None = None) -> None:
-        self.calls = 0
-        self.timeouts: list[float] = []
-        self.fail = fail
-
-    async def _run_compression_in_executor(self, fn: Any, *, timeout: float) -> Any:
-        self.calls += 1
-        self.timeouts.append(timeout)
-        if self.fail is not None:
-            raise self.fail
-        return fn()
-
-
-async def test_the_recount_goes_to_the_compression_executor() -> None:
+async def test_the_recount_runs_off_the_loop_and_returns_the_same_numbers() -> None:
     from headroom.proxy.jev.hook import count_responses_tokens_offloaded, responses_token_counts
 
-    owner = _RecordingOwner()
+    seen: list[str] = []
+
+    class ThreadNotingTokenizer(FakeTokenizer):
+        def count_messages(self, messages: list[dict[str, Any]]) -> int:
+            seen.append(threading.current_thread().name)
+            return super().count_messages(messages)
+
     items = _responses_items()
-    got = await count_responses_tokens_offloaded(owner, items, FakeTokenizer(), 250)
-    assert owner.calls == 1
-    assert owner.timeouts and owner.timeouts[0] > 0
-    # Same numbers as the pure helper: offloading changes where, not what.
+    got = await count_responses_tokens_offloaded(items, ThreadNotingTokenizer(), 250)
+    # Offloading changes where the work happens, not what it returns.
     assert got == responses_token_counts(items, FakeTokenizer(), 250)
+    assert seen and seen[0] != threading.current_thread().name
 
 
-async def test_the_recount_counts_inline_when_the_owner_has_no_executor() -> None:
-    from headroom.proxy.jev.hook import count_responses_tokens_offloaded, responses_token_counts
+async def test_the_recount_never_touches_the_compression_executor() -> None:
+    """Regression guard, and the reason this helper does not use it.
 
-    items = _responses_items()
-    assert await count_responses_tokens_offloaded(
-        object(), items, FakeTokenizer(), 250
-    ) == responses_token_counts(items, FakeTokenizer(), 250)
+    ``HeadroomProxy._run_compression_in_executor`` is not a neutral offload
+    helper: a job that overruns its timeout leaves timeout debt and puts the
+    pool in quarantine, so every later *real* compression call raises
+    ``CompressionQuarantinedError`` and is skipped. Routing a Jev telemetry
+    count through it would let shadow mode switch off Headroom's own
+    compression for unrelated requests -- the exact inversion of "additive to
+    Headroom's compression, never a substitute for it".
+    """
+    import headroom.proxy.jev.hook as hook_module
+
+    tree = ast.parse(inspect.getsource(hook_module))
+    # Structural, so the prose above (which names it) does not trip the test:
+    # an attribute access, or the name as a `getattr` string literal.
+    assert not [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "_run_compression_in_executor"
+    ]
+    banned = {"_run_compression_in_executor", "COMPRESSION_TIMEOUT_SECONDS"}
+    assert not [
+        node for node in ast.walk(tree) if isinstance(node, ast.Constant) and node.value in banned
+    ]
+    assert not [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id in banned]
+    assert not [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.name in banned
+    ]
 
 
-@pytest.mark.parametrize("failure", [TimeoutError(), RuntimeError("executor down")])
-async def test_a_failing_executor_fails_open_without_recounting_on_the_loop(
-    failure: BaseException,
-) -> None:
-    """(0, 0) hits the runner's below-threshold skip; it must NOT retry inline."""
-    from headroom.proxy.jev.hook import count_responses_tokens_offloaded
+async def test_a_slow_recount_times_out_and_fails_open() -> None:
+    from headroom.proxy.jev import hook as hook_module
 
-    tokenizer = _CountingTokenizer()
-    owner = _RecordingOwner(fail=failure)
-    assert await count_responses_tokens_offloaded(owner, _responses_items(), tokenizer, 250) == (
-        0,
-        0,
-    )
-    assert tokenizer.text_calls == 0
-    assert tokenizer.message_calls == 0
+    def _never_returns(items: Any, tokenizer: Any, tokens_saved: int) -> tuple[int, int]:
+        time.sleep(0.6)
+        return (999, 999)  # pragma: no cover - the wait_for fires first
+
+    original = hook_module.responses_token_counts
+    hook_module.responses_token_counts = _never_returns  # type: ignore[assignment]
+    original_timeout = hook_module.RESPONSES_RECOUNT_TIMEOUT_SECONDS
+    hook_module.RESPONSES_RECOUNT_TIMEOUT_SECONDS = 0.02
+    try:
+        # Fails open rather than raising, and does not retry the count inline.
+        assert await hook_module.count_responses_tokens_offloaded(
+            _responses_items(), FakeTokenizer(), 250
+        ) == (0, 0)
+    finally:
+        hook_module.responses_token_counts = original  # type: ignore[assignment]
+        hook_module.RESPONSES_RECOUNT_TIMEOUT_SECONDS = original_timeout
+
+
+def test_the_recount_timeout_is_a_named_bound() -> None:
+    from headroom.proxy.jev.hook import RESPONSES_RECOUNT_TIMEOUT_SECONDS
+
+    # A shadow-mode measurement that takes longer than this is not worth
+    # having; it must also not be so tight that a normal transcript trips it.
+    assert 1.0 <= RESPONSES_RECOUNT_TIMEOUT_SECONDS <= 30.0
+
+
+async def test_a_raising_recount_fails_open() -> None:
+    from headroom.proxy.jev import hook as hook_module
+
+    def _explodes(items: Any, tokenizer: Any, tokens_saved: int) -> tuple[int, int]:
+        raise RuntimeError("boom")
+
+    original = hook_module.responses_token_counts
+    hook_module.responses_token_counts = _explodes  # type: ignore[assignment]
+    try:
+        assert await hook_module.count_responses_tokens_offloaded(
+            _responses_items(), FakeTokenizer(), 250
+        ) == (0, 0)
+    finally:
+        hook_module.responses_token_counts = original  # type: ignore[assignment]
 
 
 async def test_cancellation_is_not_swallowed_by_the_offload() -> None:
-    from headroom.proxy.jev.hook import count_responses_tokens_offloaded
+    from headroom.proxy.jev import hook as hook_module
 
-    owner = _RecordingOwner(fail=asyncio.CancelledError())
-    with pytest.raises(asyncio.CancelledError):
-        await count_responses_tokens_offloaded(owner, _responses_items(), FakeTokenizer(), 250)
+    def _cancels(items: Any, tokenizer: Any, tokens_saved: int) -> tuple[int, int]:
+        raise asyncio.CancelledError
 
-
-@pytest.mark.parametrize("bogus", [None, "nope", (1,), (1, 2, 3), ("a", "b")])
-async def test_a_nonsense_executor_result_fails_open(bogus: Any) -> None:
-    from headroom.proxy.jev.hook import count_responses_tokens_offloaded
-
-    class BogusOwner:
-        async def _run_compression_in_executor(self, fn: Any, *, timeout: float) -> Any:
-            return bogus
-
-    assert await count_responses_tokens_offloaded(
-        BogusOwner(), _responses_items(), FakeTokenizer(), 250
-    ) == (0, 0)
+    original = hook_module.responses_token_counts
+    hook_module.responses_token_counts = _cancels  # type: ignore[assignment]
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await hook_module.count_responses_tokens_offloaded(
+                _responses_items(), FakeTokenizer(), 250
+            )
+    finally:
+        hook_module.responses_token_counts = original  # type: ignore[assignment]
