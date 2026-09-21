@@ -123,6 +123,7 @@ The older conversation turns, system prompt, and tool definitions — the provid
 | **Multi-Turn Context Tracking** | Tracks compressed content across turns, proactively expands when relevant |
 | **Hash-Keyed Retrieval** | `headroom_retrieve(hash)` always returns the full original content |
 | **Feedback Learning** | Learns from retrieval patterns to improve future compression |
+| **Jev Active Retention** | On a declared compaction boundary, a remote decision service picks which historical tool results become retrieval markers ([below](#jev-active-retention-v1compress)) |
 
 ## Configuration
 
@@ -136,6 +137,62 @@ headroom proxy --no-ccr
 # Disable proactive expansion of previously-compressed content
 headroom proxy --no-ccr-proactive-expansion
 ```
+
+### Jev active retention (`/v1/compress`)
+
+A caller that owns its own compaction lifecycle can ask Headroom to go further
+than deterministic compression on a single turn: Jev decides, per historical
+tool result, whether it must stay verbatim, can be truncated, or can be replaced
+by a retrieval marker. It runs after Headroom's own compression, never instead
+of it, so a marker resolves to exactly the bytes that turn would otherwise have
+forwarded.
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [],
+  "config": {
+    "mode": "ccr",
+    "session_id": "caller-owned-session-id",
+    "jev_compaction_boundary": true
+  }
+}
+```
+
+All three fields are required together: `mode="ccr"` because the replacement is
+a CCR marker, and `session_id` because every retained original is bound to
+`(session_id, branch_id, content hash)`. Any other combination is a 400.
+
+Nothing is deleted. A retained original is written to the CCR store, read back
+to confirm the write was acknowledged, and given a 24-hour retention lease
+BEFORE the conversation is rewritten; if any of those steps fails the original
+content is forwarded untouched. That read-back uses `CompressionStore.peek()`,
+the non-logging, non-access-counting probe — `retrieve()` is the model-facing
+read, which logs a redacted payload preview and bumps the entry's access count,
+so it must never be used to check that a write landed. Retrieval is the ordinary
+`POST /v1/retrieve` path — the marker is an ordinary `Retrieve original: hash=`
+marker, and the hashes also come back in the response's `ccr_hashes`.
+
+The lease is measured from the moment it is taken, not from the entry's
+creation, and it is one-way: a later re-store of the same content may LENGTHEN
+an entry's remaining life but can never SHORTEN it. That floor is what keeps a
+lease alive, because ordinary CCR re-stores the same hash on every turn its
+marker is re-encountered and would otherwise reset a 24-hour lease back to the
+session-scale default TTL. The consequence for future callers is that
+`store(ttl=...)` can only raise a live entry's deadline — code that genuinely
+needs to shorten a TTL must not go through it.
+
+A lease bounds expiry, not capacity. The store still evicts by `created_at` when
+it is full, so heavy unrelated traffic can drop a leased entry before its lease
+runs out; size the store accordingly when retention is switched on.
+
+Requires `HEADROOM_JEV_MODE=active` (default `off`) plus `HEADROOM_JEV_API_KEY`.
+With Jev off or in shadow mode the flag is a documented no-op: the response's
+`jev` block reports `"reason": "jev_inactive"` and nothing is rewritten.
+
+A boundary turn deliberately rewrites history the caller has already forwarded,
+so it busts the provider prompt cache for that prefix. That is what a compaction
+event is; do not set the flag on ordinary turns.
 
 ## Why This Matters
 
