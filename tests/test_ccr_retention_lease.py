@@ -21,12 +21,18 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from headroom.cache import compression_store
 from headroom.cache.backends import InMemoryBackend, SQLiteBackend
-from headroom.cache.compression_store import CompressionStore
+from headroom.cache.compression_store import (
+    LEASE_SLACK_SECONDS,
+    CompressionEntry,
+    CompressionStore,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -78,6 +84,21 @@ def _backdate(store: CompressionStore, hash_key: str, seconds: float) -> None:
     backend.set(hash_key, entry)
 
 
+def _set_created_at(store: CompressionStore, hash_key: str, created_at: float) -> None:
+    """Pin an entry's creation time so its age is exact under a frozen clock."""
+    backend = store._backend  # noqa: SLF001 - test needs to forge entry age
+    entry = backend.get(hash_key)
+    assert entry is not None
+    entry.created_at = created_at
+    backend.set(hash_key, entry)
+
+
+def _stored_ttl(store: CompressionStore, hash_key: str) -> int:
+    entry = store._backend.get(hash_key)  # noqa: SLF001 - bypasses TTL checks on purpose
+    assert entry is not None
+    return entry.ttl
+
+
 def test_extend_ttl_lengthens_a_live_entry(store: CompressionStore) -> None:
     hash_key = store.store(ORIGINAL, "compressed")
     assert store.extend_ttl(hash_key, 86_400) is True
@@ -95,6 +116,26 @@ def test_extend_ttl_leases_from_now_not_from_creation(store: CompressionStore) -
     # 83400s, and the marker would outlive its content by most of a day.
     assert store.get_entry_status(hash_key)["ttl_seconds"] >= 3_000 + 86_400
     assert _remaining(store, hash_key) >= 86_400
+
+
+def test_extend_ttl_grants_slack_beyond_the_requested_window(
+    store: CompressionStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lease clears `ttl` with margin, so a slow write cannot eat into it.
+
+    The deadline is computed from the clock read *before* the write-back; with
+    no slack, a write that lands in the next second leaves marginally less than
+    the leased window. The clock is frozen here so the arithmetic is exact
+    rather than "somewhere in a one-second band".
+    """
+    hash_key = store.store(ORIGINAL, "compressed", ttl=3_600)
+    frozen = time.time()
+    monkeypatch.setattr(compression_store.time, "time", lambda: frozen)
+    _set_created_at(store, hash_key, frozen - 100.0)  # age is exactly 100s
+
+    assert store.extend_ttl(hash_key, 86_400) is True
+    assert store.get_entry_status(hash_key)["ttl_seconds"] == 100 + 86_400 + LEASE_SLACK_SECONDS
+    assert _remaining(store, hash_key) == pytest.approx(86_400 + LEASE_SLACK_SECONDS)
 
 
 def test_extend_ttl_never_shortens(store: CompressionStore) -> None:
@@ -155,6 +196,93 @@ def test_extend_ttl_preserves_the_rest_of_the_entry(store: CompressionStore) -> 
     assert entry.original_content == ORIGINAL
     assert entry.tool_name == "Read"
     assert entry.retrieval_count == 2  # one before the lease, one just now
+
+
+class _BusyOnInsertConnection:
+    """Wraps a live connection and fails writes with a transient error."""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        if sql.lstrip().upper().startswith("INSERT"):
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+def test_extend_ttl_reports_a_transient_sqlite_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A swallowed backend write must NOT be reported as a held lease.
+
+    ``SQLiteBackend.set`` catches transient ``sqlite3.DatabaseError`` (busy /
+    locked under multi-worker contention), logs it and returns normally. Track
+    B binds a marker and drops the original only on an acknowledged lease, so
+    a silently lost write has to surface as False, not True.
+    """
+    backend = SQLiteBackend(tmp_path / "ccr_lease_busy.db")
+    store = CompressionStore(default_ttl=60, enable_feedback=False, backend=backend)
+    try:
+        hash_key = store.store(ORIGINAL, "compressed", ttl=60)
+        with monkeypatch.context() as m:
+            # sqlite3.Connection.execute is read-only, so swap the whole
+            # connection for a proxy that fails only the INSERT.
+            m.setattr(backend, "_conn", _BusyOnInsertConnection(backend._conn))  # noqa: SLF001
+            assert store.extend_ttl(hash_key, 86_400) is False
+
+        # The row is untouched and still has its original TTL: nothing was
+        # half-applied, and the caller is free to retry.
+        assert _stored_ttl(store, hash_key) == 60
+        assert store.retrieve(hash_key) is not None
+    finally:
+        _close(store)
+
+
+class _DroppingBackend(InMemoryBackend):
+    """A backend that silently discards writes and never aliases its entries.
+
+    Stands in for any backend whose ``set`` can fail quietly (SQLite already
+    does, by design). Copying on ``get`` is what makes the read-back a real
+    check rather than an inspection of the object the caller just mutated.
+    """
+
+    def get(self, hash_key: str) -> CompressionEntry | None:
+        entry = super().get(hash_key)
+        return None if entry is None else replace(entry)
+
+    def set(self, hash_key: str, entry: CompressionEntry) -> None:
+        return None
+
+
+def test_extend_ttl_reports_a_write_that_vanishes() -> None:
+    """Any backend that drops the write (not just SQLite) must fail the lease."""
+    backend = _DroppingBackend()
+    store = CompressionStore(default_ttl=60, enable_feedback=False, backend=backend)
+    # store() goes through the same dropped set(), so seed the entry directly.
+    InMemoryBackend.set(
+        backend,
+        "h",
+        CompressionEntry(
+            hash="h",
+            original_content=ORIGINAL,
+            compressed_content="compressed",
+            original_tokens=10,
+            compressed_tokens=2,
+            original_item_count=1,
+            compressed_item_count=1,
+            tool_name="Read",
+            tool_call_id=None,
+            query_context=None,
+            created_at=time.time(),
+            ttl=60,
+        ),
+    )
+
+    assert store.extend_ttl("h", 86_400) is False
+    assert _stored_ttl(store, "h") == 60
 
 
 def test_extend_ttl_persists_to_the_sqlite_ttl_column(tmp_path: Path) -> None:

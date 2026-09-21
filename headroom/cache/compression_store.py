@@ -53,6 +53,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_SECONDS
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
 
+# Margin added on top of a retention lease (see CompressionStore.extend_ttl).
+# The deadline is computed from the clock *before* the write-back, so without
+# slack a write that lands in the next second leaves slightly less than the
+# leased window. One second is free (leases are hours) and makes the
+# "at least `ttl` from now" guarantee hold for the caller, not just for the
+# instant the TTL was computed.
+LEASE_SLACK_SECONDS = 1
+
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 # Previews carry verbatim tool-result content (post-redaction), which makes
 # proxy.log too sensitive for users to share in bug reports. Set to
@@ -645,10 +653,13 @@ class CompressionStore:
         store's TTL is relative to ``created_at``
         (:meth:`CompressionEntry.is_expired` is ``now - created_at > ttl``), so
         writing ``ttl`` straight into the field would give an entry that is
-        already 20 minutes old only ``ttl`` minus 20 minutes of life left. The
-        stored value is therefore raised to ``ceil(age) + ttl``; ``ceil``
-        rounds the sub-second remainder in the caller's favour, since the field
-        is an int and a lease must never come up short.
+        already 20 minutes old only ``ttl`` minus 20 minutes of life. The
+        stored value is therefore raised to
+        ``ceil(age) + ttl + LEASE_SLACK_SECONDS``: ``ceil`` rounds the
+        sub-second remainder in the caller's favour (the field is an int and a
+        lease must never come up short), and the slack covers the time the
+        write-back itself takes, which would otherwise eat into a lease granted
+        within the same second.
 
         Extension is ONE-WAY: a lease that would leave the entry with less life
         than it already has is ignored (the call still succeeds). Ordinary
@@ -663,15 +674,23 @@ class CompressionStore:
         above all not resurrected, because its content is already unreachable
         through :meth:`retrieve`.
 
+        The acknowledgement is verified, not assumed: a write is re-read through
+        the backend before the call reports success. ``SQLiteBackend.set``
+        swallows transient database errors (logging and returning normally), so
+        without the read-back this could report a lease that the persisted row
+        never took, and retention would drop the only copy of the content on
+        the strength of it.
+
         Args:
             hash_key: Key returned by :meth:`store`.
             ttl: Seconds from now the entry must remain retrievable for. ``0``
                 is a valid no-op lease (it can never shorten anything).
 
         Returns:
-            True when the entry exists, is not expired, and is now guaranteed
-            for at least ``ttl`` more seconds. False when the entry is missing
-            or already expired — the caller must then keep the original
+            True when the entry exists, is not expired, and the backend has
+            confirmed on re-read that it is now good for at least ``ttl`` more
+            seconds. False when the entry is missing, already expired, or the
+            extension did not stick — the caller must then keep the original
             content instead of replacing it with a marker.
 
         Raises:
@@ -685,16 +704,34 @@ class CompressionStore:
                 return False
             # Age can only grow, so anchoring on it keeps the deadline
             # (created_at + ttl) at least `ttl` seconds ahead of *this* moment.
-            required = math.ceil(time.time() - entry.created_at) + ttl
-            if entry.ttl < required:
-                entry.ttl = required
-                # Write back through the backend: the in-memory backend hands
-                # out the live object, but SQLiteBackend deserializes a fresh
-                # copy per get() and only refreshes the `ttl` column its purge
-                # query (and startup sweep) reads on set(), so the lease
-                # survives a restart as well as an opportunistic purge.
-                # created_at is untouched, so the eviction heap stays valid.
-                self._backend.set(hash_key, entry)
+            required = math.ceil(time.time() - entry.created_at) + ttl + LEASE_SLACK_SECONDS
+            if entry.ttl >= required:
+                return True
+
+            entry.ttl = required
+            # Write back through the backend: the in-memory backend hands out
+            # the live object, but SQLiteBackend deserializes a fresh copy per
+            # get() and only refreshes the `ttl` column its purge query (and
+            # startup sweep) reads on set(), so the lease survives a restart as
+            # well as an opportunistic purge. created_at is untouched, so the
+            # eviction heap stays valid.
+            self._backend.set(hash_key, entry)
+
+            # Acknowledged read-back. On SQLite this is a real round trip to
+            # the row; on the in-memory backend it returns the same object and
+            # is trivially true.
+            stored = self._backend.get(hash_key)
+            if stored is None or stored.is_expired() or stored.ttl < required:
+                logger.warning(
+                    "CCR retention lease not acknowledged for hash=%s "
+                    "(requested_ttl=%d required=%d stored_ttl=%s); the backend "
+                    "write did not stick — caller must keep the original content",
+                    hash_key,
+                    ttl,
+                    required,
+                    "missing" if stored is None else stored.ttl,
+                )
+                return False
             return True
 
     def get_stats(self) -> dict[str, Any]:
