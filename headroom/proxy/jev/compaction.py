@@ -25,6 +25,8 @@ Two disciplines this module keeps, and the reasons they are not negotiable:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -173,3 +175,155 @@ def detect_compaction_boundary(inner: Any) -> JevCompactionBoundary | None:
         candidate_index=candidate_index,
         item_count=len(items),
     )
+
+
+# The body fields a tool-output item may carry, in the order they are scanned.
+# `output` is the shape Phase 0b observed on `custom_tool_call_output`;
+# `content` is the alternative the Responses vocabulary allows for the other
+# allowlisted output types. Exactly one of them is staged per candidate, and
+# `replace_candidate_output` requires the same one to still be the winner.
+_CANDIDATE_TEXT_FIELDS = ("output", "content")
+
+
+@dataclass(frozen=True)
+class JevCompactionCandidate:
+    """The single tool output a compaction boundary carries."""
+
+    candidate_id: str
+    item_index: int
+    item_type: str
+    call_id: str
+    output_field: str
+    output_text: str
+    content_sha256: str
+    estimated_tokens: int
+
+
+def _candidate_output_text(item: dict[str, Any]) -> tuple[str, str] | None:
+    """Return ``(field name, text)`` for the item's body, or None.
+
+    A structured body is canonicalized with sorted keys so the same decoded
+    value always hashes the same way between extraction and replacement.
+    Serialization itself is attacker-reachable -- a self-referential object
+    raises ``ValueError``, mixed-type keys defeat ``sort_keys`` with a
+    ``TypeError``, deep nesting raises ``RecursionError`` -- so a body that
+    cannot be canonicalized is simply not a candidate.
+    """
+    for field_name in _CANDIDATE_TEXT_FIELDS:
+        value = item.get(field_name)
+        if isinstance(value, str) and value:
+            return field_name, value
+        if isinstance(value, (dict, list)) and value:
+            try:
+                return field_name, json.dumps(
+                    value, ensure_ascii=False, sort_keys=True, default=str
+                )
+            except Exception:
+                return None
+    return None
+
+
+def extract_compaction_candidate(
+    inner: Any,
+    boundary: JevCompactionBoundary,
+    *,
+    max_candidate_bytes: int,
+) -> JevCompactionCandidate | None:
+    """Extract the boundary's single candidate, or None to fail open to keep.
+
+    ``max_candidate_bytes`` is a UTF-8 byte ceiling (0 or less disables it)
+    derived from ``HEADROOM_JEV_MAX_CANDIDATE_TOKENS`` by the caller.
+    ``estimated_tokens`` is an estimate used only for the CCR entry's
+    bookkeeping and for the question text -- Track C's real savings are reported
+    by the existing WS usage accounting, never from this number.
+
+    ``boundary.candidate_index`` addresses the ORIGINAL ``input`` list, so the
+    item is read by direct subscript; nothing is filtered first. The frame is
+    never mutated here. Like the rest of this module the function never raises:
+    every subscript, length and membership test is guarded, and an item whose
+    ``type`` decoded to an unhashable JSON array or object is declined before it
+    can reach the allowlist's ``in``.
+    """
+    if not isinstance(inner, dict):
+        return None
+    items = inner.get("input")
+    if not isinstance(items, list):
+        return None
+    if not 0 <= boundary.candidate_index < len(items):
+        return None
+    item = items[boundary.candidate_index]
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    # Guards the membership test below: an unhashable `type` raises
+    # `TypeError: unhashable type` inside the relay's hot path. CPython
+    # special-cases `set`, so only `list` and `dict` actually raise -- which is
+    # exactly why the guard is `isinstance(..., str)` and not a try/except
+    # around the `in`.
+    if not isinstance(item_type, str) or item_type not in JEV_TOOL_OUTPUT_ITEM_TYPES:
+        return None
+    call_id = item.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    found = _candidate_output_text(item)
+    if found is None:
+        return None
+    output_field, output_text = found
+    encoded = output_text.encode("utf-8", "replace")
+    if max_candidate_bytes > 0 and len(encoded) > max_candidate_bytes:
+        return None
+    digest = hashlib.sha256(encoded).hexdigest()
+    return JevCompactionCandidate(
+        candidate_id=f"cand_{digest[:16]}",
+        item_index=boundary.candidate_index,
+        item_type=item_type,
+        call_id=call_id,
+        output_field=output_field,
+        output_text=output_text,
+        content_sha256=digest,
+        estimated_tokens=max(1, len(encoded) // 4),
+    )
+
+
+def replace_candidate_output(
+    inner: Any,
+    candidate: JevCompactionCandidate,
+    replacement: str,
+) -> bool:
+    """Swap the candidate's body for ``replacement`` in place.
+
+    Returns False -- changing nothing -- unless the item still sits at the same
+    index, still has the same type, the same ``call_id`` and the same body
+    field, and still hashes to the content that was staged in CCR. That binding
+    is what stops a rewrite between extraction and commit from replacing content
+    whose original was never stored. ``call_id`` is part of it because content
+    alone is not identity: two calls of the same tool can return byte-identical
+    output, and the marker staged under one call's identity must not land on the
+    other's slot.
+
+    A mismatch is a normal outcome, not an error: the caller keeps the original
+    frame and relays it untouched. ``inner`` is the object
+    ``unwrap_response_create`` handed back BY REFERENCE, so the single
+    assignment below lands directly in the frame about to be relayed -- and is
+    the only write this module ever performs.
+    """
+    if not isinstance(inner, dict):
+        return False
+    items = inner.get("input")
+    if not isinstance(items, list):
+        return False
+    if not 0 <= candidate.item_index < len(items):
+        return False
+    item = items[candidate.item_index]
+    if not isinstance(item, dict) or item.get("type") != candidate.item_type:
+        return False
+    if item.get("call_id") != candidate.call_id:
+        return False
+    found = _candidate_output_text(item)
+    if found is None or found[0] != candidate.output_field:
+        return False
+    digest = hashlib.sha256(found[1].encode("utf-8", "replace")).hexdigest()
+    if digest != candidate.content_sha256:
+        return False
+    item[candidate.output_field] = replacement
+    return True

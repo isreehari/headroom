@@ -472,4 +472,13 @@ def test_the_module_is_a_stdlib_only_leaf() -> None:
                 imported.add(".")
             elif node.module:
                 imported.add(node.module.split(".")[0])
-    assert imported <= {"__future__", "dataclasses", "typing"}, imported
+    # `hashlib` and `json` joined the set with Task 21's content-bound
+    # replacement: both are stdlib, so the leaf discipline is unchanged -- no
+    # `headroom`, no `jev`, no relative import, no third-party package.
+    assert imported <= {
+        "__future__",
+        "dataclasses",
+        "hashlib",
+        "json",
+        "typing",
+    }, imported
