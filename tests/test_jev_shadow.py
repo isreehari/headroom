@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from typing import Any
 
 import pytest
@@ -378,6 +379,34 @@ async def test_a_broken_tokenizer_fails_open_instead_of_taking_the_turn_down() -
     assert "RuntimeError" in result.error
     assert client.calls == 0
     assert "shadow_fail_open" in metrics.events
+
+
+async def test_the_fail_open_error_and_log_are_scrubbed_of_credentials(caplog) -> None:
+    # The caught exception is arbitrary -- a caller-supplied tokenizer can put
+    # the endpoint (userinfo, query token) or the API key straight into its
+    # message, and the result's `error` reaches /stats and the logs.
+    config = JevConfig(
+        mode="shadow",
+        api_key="sk-super-secret-key",
+        endpoint="https://user:pw@jev.example.com/v1/systemone?token=leaky",
+        threshold_percent=50,
+        max_state_tokens=100000,
+    )
+
+    def boom(_text: str) -> int:
+        raise RuntimeError(f"boom {config.endpoint} {config.api_key}")
+
+    runner = JevShadowRunner(config, client=FakeClient(), metrics=FakeMetrics())
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy.jev.shadow"):
+        result = await _run(runner, count_text=boom)
+
+    assert result.reason == "fail_open"
+    assert result.error is not None
+    assert "RuntimeError" in result.error
+    for secret in (config.api_key, "token=leaky", "user:pw"):
+        assert secret not in result.error
+        assert all(secret not in record.getMessage() for record in caplog.records)
+    assert "jev.example.com" in result.error  # still diagnosable
 
 
 async def test_cancellation_is_never_treated_as_a_jev_failure() -> None:

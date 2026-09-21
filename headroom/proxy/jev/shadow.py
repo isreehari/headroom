@@ -50,7 +50,7 @@ from headroom.proxy.jev.candidates import (
     select_candidates,
     text_of,
 )
-from headroom.proxy.jev.client import JevClient, build_request_payload
+from headroom.proxy.jev.client import JevClient, build_request_payload, scrub_secrets
 from headroom.proxy.jev.config import JevConfig
 from headroom.proxy.jev.identity import (
     DEFAULT_MAX_BRANCHES,
@@ -260,7 +260,14 @@ class JevShadowRunner:
         except Exception as exc:  # noqa: BLE001 - a bookkeeping bug must not
             # take a proxied request down. CancelledError is a BaseException
             # and is deliberately not caught here.
-            detail = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
+            #
+            # The exception is arbitrary: a caller-supplied tokenizer or an
+            # injected client can put the configured endpoint (userinfo, query
+            # token) or the API key straight into its message, so the same
+            # scrubber the client's error paths use runs here too. Scrub
+            # first, then truncate -- a key straddling the cut would otherwise
+            # survive as a prefix.
+            detail = scrub_secrets(f"{type(exc).__name__}: {exc}", self._config)[:_MAX_ERROR_CHARS]
             logger.warning("jev shadow failed open: %s", detail, exc_info=True)
             return self._skip("fail_open", event="shadow_fail_open", error=detail)
 
@@ -374,6 +381,8 @@ class JevShadowRunner:
             self._note_cooldown(key, 0)
 
         if answer.error is not None:
+            # Already scrubbed: every path that sets ``JevAnswer.error`` runs
+            # the string through ``scrub_secrets`` inside the client.
             logger.info("jev shadow call failed open: %s", answer.error)
             return self._skip(
                 "call_error",

@@ -31,7 +31,7 @@ request path:
   own cancellation would be a bug, not a fail-open.
 * The API key travels in a header and is never logged. The endpoint may carry
   credentials in its userinfo or a token in its query string, so every error
-  string is scrubbed through :func:`_scrub` (endpoint via ``redact_endpoint``,
+  string is scrubbed through :func:`scrub_secrets` (endpoint via ``redact_endpoint``,
   plus the key itself) before it leaves this module.
 """
 
@@ -74,8 +74,13 @@ def build_request_payload(
     return {STATE_FIELD: state, "model": config.model, QUESTIONS_FIELD: questions}
 
 
-def _scrub(text: str, config: JevConfig) -> str:
+def scrub_secrets(text: str, config: JevConfig) -> str:
     """Strip anything credential-bearing out of a string bound for an error.
+
+    Public because it is not only this module's transport errors that can carry
+    the endpoint or the key: ``shadow.py``'s fail-open handler stringifies an
+    arbitrary exception (a caller-supplied tokenizer, an injected client) and
+    has to scrub it the same way before it reaches a log or a result.
 
     Two sources leak: httpx echoes the request URL into most of its exception
     messages, and a gateway can echo the ``Authorization`` header or the full
@@ -178,14 +183,14 @@ class JevClient:
         except Exception as exc:  # timeout, DNS, TLS, connection reset
             answer.latency_ms = (time.perf_counter() - started) * 1000.0
             # httpx error strings routinely embed the request URL.
-            answer.error = _scrub(f"{type(exc).__name__}: {exc}", self._config)
+            answer.error = scrub_secrets(f"{type(exc).__name__}: {exc}", self._config)
             return answer
         answer.latency_ms = (time.perf_counter() - started) * 1000.0
 
         if response.status_code >= 400:
             # Scrub before truncating: a key straddling the cut would otherwise
             # survive as a prefix.
-            detail = _scrub(response.text, self._config)[:_MAX_ERROR_CHARS]
+            detail = scrub_secrets(response.text, self._config)[:_MAX_ERROR_CHARS]
             answer.error = f"HTTP {response.status_code}: {detail}"
             return answer
 
@@ -210,7 +215,7 @@ class JevClient:
             # Keys only: a value could be anything the server chose to echo.
             # The keys are server-controlled too, so they get scrubbed like
             # every other string this module puts into an error.
-            answer.error = _scrub(
+            answer.error = scrub_secrets(
                 f"no dict at '{ANSWERS_FIELD}' (keys were {sorted(map(str, body))[:12]}); "
                 "falling back to keep for every candidate",
                 self._config,
