@@ -4,16 +4,22 @@ A retention feature that sends tool output to a third-party API and can replace
 it with a retrieval marker is exactly the kind of thing an operator must be able
 to read about before switching it on, so an undocumented knob here is a defect.
 
-These tests are *drift detectors*, not proofreaders. What they bind to the code:
-the set of ``HEADROOM_JEV_*`` names, every default value, the mode vocabulary,
-the retention-lease duration, the ``/stats`` field names and the multi-worker
-config env var -- each read out of the source at test time, so adding a knob or
-changing a default without touching the wiki fails here.
+These tests are *drift detectors*, not proofreaders. What they bind to the code,
+each side EXTRACTED at test time rather than hardcoded: the set of
+``HEADROOM_JEV_*`` names, every default value (exact, not substring), the mode
+vocabulary, the retention-lease duration (digit-bounded, so ``4-hour`` cannot
+match inside ``24-hour``), the savings figures ``jev_snapshot`` derives, the
+``/stats`` route's wiring to it, and the multi-worker config env var. Adding a
+knob, changing a default or renaming a reported figure without touching the wiki
+fails here.
 
-What they cannot check, and what no test in this file should be read as
-proving: that the English prose around those values is *true*. Whether
-"fails open" describes what the code does is a claim about behaviour, verified
-by the Track A/B/C test suites, not by string matching in a Markdown file.
+Two tests check behaviour rather than text: that ``repr`` and ``redacted()``
+really do withhold the API key and the endpoint's credentials.
+
+What the rest cannot check, and what no test here should be read as proving:
+that the English prose around those values is *true*. Whether "fails open"
+describes what the code does is a claim about behaviour, verified by the Track
+A/B/C suites, not by string matching in a Markdown file.
 """
 
 from __future__ import annotations
@@ -54,6 +60,18 @@ def _jev_section() -> str:
     body = doc[start + 1 :]
     end = body.find("\n## ", len(SECTION_HEADING))
     return body if end == -1 else body[:end]
+
+
+def _subsection(heading_fragment: str) -> str:
+    """One ``###`` subsection of the Jev section, up to the next heading."""
+    section = _jev_section()
+    match = re.search(rf"^### .*{re.escape(heading_fragment)}.*$", section, re.MULTILINE)
+    assert match is not None, (
+        f"the {SECTION_HEADING} section has no '### ...{heading_fragment}...' subsection"
+    )
+    rest = section[match.end() :]
+    end = re.search(r"^#{2,3} ", rest, re.MULTILINE)
+    return rest if end is None else rest[: end.start()]
 
 
 def _env_name_for(field_name: str) -> str:
@@ -123,13 +141,18 @@ def test_the_documented_table_is_exactly_the_set_of_jevconfig_fields() -> None:
     [f.name for f in dataclasses.fields(JevConfig) if f.name not in _NON_ENV_FIELDS],
 )
 def test_documented_default_matches_the_code_default(field_name: str) -> None:
-    """The table's Default cell carries the value ``JevConfig()`` actually has.
+    """The table's Default cell equals the value ``JevConfig()`` actually has.
 
-    ``api_key`` defaults to the empty string -- there is no value to print --
-    so its row is required to say the knob is required instead. For every other
-    field this is a substring check against the real default, so bumping
-    ``DEFAULT_JEV_TIMEOUT_MS`` without editing the wiki fails here. It does NOT
-    prove the Description cell is accurate, only the Default cell.
+    The comparison is EXACT on the cell's text with its Markdown backticks
+    stripped, not a substring: a substring check would let a code default of
+    ``50`` go on matching a stale documented ``500``.
+
+    ``api_key`` has no printable default, so its row is required to say the
+    knob is required -- and required in the affirmative, since a bare
+    ``"required" in text`` check would also accept "not required".
+
+    It does NOT prove the Description cell is accurate, only the Default cell
+    (and, for ``api_key``, that its description is not negated).
     """
     rows = _table_rows()
     name = _env_name_for(field_name)
@@ -142,15 +165,24 @@ def test_documented_default_matches_the_code_default(field_name: str) -> None:
             "this test assumes api_key has no usable default; it now defaults "
             f"to {default_value!r} and the wiki row must be revisited"
         )
-        assert "equired" in description, (
+        assert re.search(r"\brequired\b", description, re.IGNORECASE), (
             "HEADROOM_JEV_API_KEY has no default, so its row must say it is "
             f"required; description reads: {description!r}"
         )
+        negated = re.search(
+            r"\b(not required|no longer required|optional)\b", description, re.IGNORECASE
+        )
+        assert negated is None, (
+            "HEADROOM_JEV_API_KEY's row says it is NOT required, but "
+            "JevConfig.validate() raises without it whenever the mode is not "
+            f"'off'; offending wording: {negated.group(0)!r}"  # type: ignore[union-attr]
+        )
         return
 
-    assert str(default_value) in default_cell, (
-        f"{name} defaults to {default_value!r} in JevConfig but the wiki's "
-        f"Default cell reads {default_cell!r}"
+    documented = default_cell.strip().strip("`").strip()
+    assert documented == str(default_value), (
+        f"{name} defaults to {str(default_value)!r} in JevConfig but the "
+        f"wiki's Default cell reads {documented!r}"
     )
 
 
@@ -179,30 +211,79 @@ def test_the_documented_lease_duration_matches_the_code() -> None:
         "the lease is no longer a whole number of hours; the wiki's "
         f"'{hours}-hour' phrasing needs revisiting"
     )
-    assert f"{hours}-hour" in _jev_section(), (
+    # Digit-bounded on BOTH sides. A bare substring check would let a code
+    # value of 4 hours go on matching a stale documented "24-hour", and a
+    # value of 2 hours match a stale "24-hour" the other way round.
+    section = _jev_section()
+    assert re.search(rf"(?<!\d){hours}-hour(?!s?\d)", section), (
         f"JEV_RETENTION_LEASE_SECONDS is {JEV_RETENTION_LEASE_SECONDS}s "
-        f"({hours}h) but the section does not say '{hours}-hour'"
+        f"({hours}h) but the section states no '{hours}-hour' lease"
+    )
+    stale = {
+        match.group(1)
+        for match in re.finditer(r"\b(\d+)-hour\b", section)
+        if match.group(1) != str(hours)
+    }
+    assert not stale, (
+        f"the section also states {sorted(stale)} -hour durations while the "
+        f"lease is {hours}h; one of them is stale"
     )
 
 
-def test_the_stats_field_names_the_section_cites_are_real() -> None:
-    """``projected_savings`` / ``realized_savings*`` are really built by ``/stats``.
+def test_the_savings_names_cited_in_the_section_match_jev_snapshot() -> None:
+    """The savings figures the section cites are exactly those ``jev_snapshot`` derives.
 
-    Read out of ``jev_snapshot``'s source, so renaming a key there without
-    editing the wiki fails. It proves the names exist in that function, not
-    that the section's explanation of what they mean is right.
+    Both sides are EXTRACTED, neither is hardcoded: the cited names come from
+    the backticked ``*_savings*`` identifiers in the section's ``/stats``
+    subsection, and the produced names from the ``totals["..."] = `` lines in
+    ``PrometheusMetrics.jev_snapshot``. Set equality, so citing a figure that
+    no longer exists and adding a figure nobody documented both fail here.
+
+    Scope, deliberately narrower than the old name of this test: this reads
+    ``jev_snapshot``'s SOURCE and does not exercise the ``/stats`` route. That
+    the route actually serves these values is
+    ``tests/test_jev_stats_block.py``; that the route composes this function is
+    the separate wiring test below.
     """
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
     snapshot_source = inspect.getsource(PrometheusMetrics.jev_snapshot)
-    section = _jev_section()
-    for name in ("projected_savings", "realized_savings", "realized_savings_estimated"):
-        assert f'"{name}"' in snapshot_source, (
-            f"{name} is cited in the wiki but jev_snapshot() no longer sets it"
-        )
-        assert f"`{name}`" in section, (
-            f"jev_snapshot() reports {name} but the {SECTION_HEADING} section does not mention it"
-        )
+    produced = {
+        name
+        for name in re.findall(r'totals\[\s*"([a-z_]+)"\s*\]\s*=', snapshot_source)
+        if "savings" in name
+    }
+    assert produced, "jev_snapshot() no longer derives any *_savings total"
+
+    stats_subsection = _subsection("Reading the numbers")
+    cited = set(re.findall(r"`([a-z_]*savings[a-z_]*)`", stats_subsection))
+
+    assert cited == produced, (
+        "the section's /stats subsection and jev_snapshot() disagree about the "
+        f"savings figures; cited-but-not-produced={sorted(cited - produced)}, "
+        f"produced-but-not-cited={sorted(produced - cited)}"
+    )
+
+
+def test_the_stats_route_really_composes_jev_snapshot() -> None:
+    """``/stats`` builds its ``jev`` block from ``jev_snapshot()`` + ``redacted()``.
+
+    A source-level wiring check on ``server.py``, which is what lets the
+    section talk about these figures as things an operator reads off
+    ``/stats``. It does NOT issue a request; ``tests/test_jev_stats_block.py``
+    exercises the route.
+    """
+    server_source = (REPO_ROOT / "headroom" / "proxy" / "server.py").read_text(encoding="utf-8")
+    assert re.search(
+        r'"jev":\s*\{\s*\*\*proxy\.metrics\.jev_snapshot\(\),\s*'
+        r'"config":\s*proxy\.config\.jev\.redacted\(\),',
+        server_source,
+    ), (
+        "the /stats payload no longer builds its 'jev' block from "
+        "jev_snapshot() plus JevConfig.redacted(); the wiki's claims about "
+        "the /stats figures and about the endpoint being redacted there need "
+        "rechecking"
+    )
 
 
 def test_the_multi_worker_config_env_var_name_is_the_real_one() -> None:
@@ -223,15 +304,13 @@ def test_the_multi_worker_config_env_var_name_is_the_real_one() -> None:
     )
 
 
-def test_redacted_really_omits_the_key_the_section_promises_it_omits() -> None:
-    """``repr`` and ``redacted()`` behave exactly as the section describes them.
+def test_repr_and_redacted_withhold_the_key_and_the_endpoint_credentials() -> None:
+    """Neither ``repr`` nor ``redacted()`` renders the key or endpoint secrets.
 
-    This one checks BEHAVIOUR, not prose: these are the two mechanisms the
-    section names by hand, so the claim and the code are asserted together.
-    The key is absent from both. The ENDPOINT is only redacted by
-    ``redacted()`` -- the dataclass ``repr`` prints it verbatim, userinfo and
-    query included -- which is asserted here so the wiki cannot quietly start
-    claiming otherwise.
+    BEHAVIOUR, not prose. ``repr`` matters as much as ``redacted()``: it is
+    what a stray ``logger.debug("%r", config)`` and every traceback frame
+    holding the config will print, so an endpoint carrying credentials in its
+    userinfo or a token in its query must not survive it either.
 
     Scope: these two methods only. The ``/stats`` payload
     (``tests/test_jev_stats_block.py``) and the multi-worker payload
@@ -240,23 +319,42 @@ def test_redacted_really_omits_the_key_the_section_promises_it_omits() -> None:
     config = JevConfig(
         mode="shadow",
         api_key="sk-jev-doc-test-secret",
-        endpoint="https://user:pw@jev.example/v1/systemone?token=abc",
+        endpoint="https://user:pw@jev.example/v1/systemone?token=abc123",
     )
-    redacted = config.redacted()
-    rendered = repr(sorted(redacted.items()))
-    assert "sk-jev-doc-test-secret" not in rendered + repr(config), (
-        "JevConfig.redacted()/repr() leaked the API key, which the wiki says "
-        "never leaves the process"
-    )
-    assert "pw@" not in rendered and "token=abc" not in rendered, (
-        f"JevConfig.redacted() leaked endpoint userinfo or query: {rendered}"
-    )
-    assert redacted["api_key_configured"] is True
-    # The counterpart the wiki must not overstate: the raw repr is NOT redacted.
-    assert "token=abc" in repr(config), (
-        "JevConfig's repr no longer prints the endpoint verbatim; the wiki "
-        "says only redacted() redacts it and must be updated"
-    )
+    rendered_repr = repr(config)
+    rendered_redacted = repr(sorted(config.redacted().items()))
+
+    for label, rendered in (("repr", rendered_repr), ("redacted()", rendered_redacted)):
+        assert "sk-jev-doc-test-secret" not in rendered, (
+            f"JevConfig.{label} leaked the API key, which must never reach a "
+            f"log line, an exception message or a serialized payload: {rendered}"
+        )
+        assert "pw@" not in rendered, (
+            f"JevConfig.{label} leaked the endpoint's userinfo credentials: {rendered}"
+        )
+        assert "token=abc123" not in rendered, (
+            f"JevConfig.{label} leaked the endpoint's query token: {rendered}"
+        )
+
+    # Redaction, not deletion: the host must still be there to debug against.
+    assert "jev.example" in rendered_repr and "jev.example" in rendered_redacted
+    assert config.redacted()["api_key_configured"] is True
+
+
+def test_the_section_names_the_two_mechanisms_that_withhold_the_secrets() -> None:
+    """The prose credits the mechanisms the test above exercises.
+
+    The behavioural test proves the code is safe; this proves the wiki tells
+    an operator *why*, by naming ``redact_endpoint()``, ``JevConfig.redacted()``
+    and the ``repr``. It is presence-checking, so it cannot tell a correct
+    explanation from an incorrect one that uses the same words.
+    """
+    section = _jev_section()
+    for mechanism in ("`redact_endpoint()`", "`JevConfig.redacted()`", "`repr`"):
+        assert mechanism in section, (
+            f"the {SECTION_HEADING} section never names {mechanism}, so its "
+            "secret-handling claims are unattributed"
+        )
 
 
 def test_privacy_and_fail_open_are_disclosed() -> None:

@@ -107,6 +107,59 @@ def test_repr_never_contains_the_api_key() -> None:
     assert "shadow" in shown
 
 
+def test_repr_never_contains_endpoint_credentials() -> None:
+    """The other half of the same leak: ``repr=False`` on the key stopped short.
+
+    An operator-supplied ``HEADROOM_JEV_ENDPOINT`` may carry credentials in its
+    userinfo or a token in its query -- that is why ``redact_endpoint`` exists
+    -- and the generated dataclass repr printed the field verbatim, so the same
+    stray ``logger.debug("%r", config)`` that cannot leak the key could leak
+    those. This asserts the display only; ``redacted()``, the ``/stats`` block
+    and the multi-worker payload each have their own tests.
+    """
+    config = JevConfig(
+        mode="shadow",
+        api_key="sk-super-secret",
+        endpoint="https://user:pw@api.example.invalid:8443/v1/systemone?token=abc",
+    )
+    shown = repr(config)
+    assert "pw@" not in shown
+    assert "user:pw" not in shown
+    assert "token=abc" not in shown
+    assert "sk-super-secret" not in shown
+    # Redaction, not suppression: host, port and path stay debuggable, and the
+    # key's PRESENCE is still reported the way ``redacted()`` reports it.
+    assert "api.example.invalid:8443/v1/systemone" in shown
+    assert "api_key_configured=True" in shown
+
+
+def test_repr_does_not_raise_on_an_unrenderable_endpoint() -> None:
+    """A ``__repr__`` runs inside exception rendering, so it must never raise.
+
+    It must also never fall back to printing the raw value. A non-``str``
+    endpoint is reachable from an untyped caller constructing ``JevConfig``
+    directly.
+    """
+    shown = repr(JevConfig(mode="shadow", api_key="k", endpoint=None))  # type: ignore[arg-type]
+    assert "JevConfig(" in shown
+    assert "None" not in shown.split("model=")[0]
+
+
+def test_repr_change_did_not_alter_equality_or_hashing() -> None:
+    """Only display was changed: the key is still part of identity.
+
+    Guards the obvious wrong fix -- dropping the field or excluding it from
+    ``eq`` -- which would make two configs with different credentials compare
+    equal and collide in a dict.
+    """
+    base = JevConfig(mode="shadow", api_key="sk-a")
+    same = JevConfig(mode="shadow", api_key="sk-a")
+    other = JevConfig(mode="shadow", api_key="sk-b")
+    assert base == same
+    assert base != other
+    assert len({base, same, other}) == 2
+
+
 def test_redact_endpoint_strips_userinfo_and_query() -> None:
     assert (
         redact_endpoint("https://user:pw@api.example.invalid:8443/v1/systemone?token=abc")

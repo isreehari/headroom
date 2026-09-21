@@ -11,8 +11,14 @@ than failing open: a shadow run that silently no-ops because
 ``HEADROOM_JEV_API_KEY`` was never exported would report "no savings" for a
 reason that has nothing to do with Jev.
 
-The API key lives on this object but never leaves it. :meth:`JevConfig.redacted`
-is the only serialization path and reports presence, never the value.
+Two fields on this object are credential-bearing, and neither is ever rendered
+raw. The API key never leaves it at all: :meth:`JevConfig.redacted` is the only
+serialization path and reports presence, never the value. The endpoint may
+carry credentials in its userinfo or a token in its query string, so both
+:meth:`JevConfig.redacted` and :meth:`JevConfig.__repr__` put it through
+:func:`redact_endpoint` first -- the repr because it is what a stray
+``logger.debug("%r", config)`` and every traceback frame holding a
+``ProxyConfig`` will print.
 """
 
 from __future__ import annotations
@@ -78,14 +84,15 @@ def _env_int(src: Mapping[str, str], name: str, default: int, *, minimum: int) -
     return value
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class JevConfig:
     """Resolved Jev settings. Constructed once at the configuration boundary."""
 
     mode: str = "off"
-    # ``repr=False``: the default dataclass repr would print the key verbatim,
-    # so a stray ``logger.debug("%r", config)`` or a traceback frame holding the
-    # config would leak it. Equality still compares it; only display drops it.
+    # ``repr=False`` is belt-and-braces under the hand-written ``__repr__``
+    # below (which never reads this field at all). It is kept so that deleting
+    # that method degrades to the key being omitted rather than printed.
+    # Equality still compares it; only display drops it.
     api_key: str = field(default="", repr=False)
     endpoint: str = DEFAULT_JEV_ENDPOINT
     model: str = DEFAULT_JEV_MODEL
@@ -95,6 +102,45 @@ class JevConfig:
     max_candidate_tokens: int = DEFAULT_JEV_MAX_CANDIDATE_TOKENS
     max_candidates: int = DEFAULT_JEV_MAX_CANDIDATES
     max_state_tokens: int = DEFAULT_JEV_MAX_STATE_TOKENS
+
+    def __repr__(self) -> str:
+        """Display form. Renders neither the API key nor a raw endpoint.
+
+        ``repr=False`` on ``api_key`` alone stopped one field short. The
+        endpoint is the other credential-bearing field on this object -- a
+        custom ``HEADROOM_JEV_ENDPOINT`` may carry userinfo or a token in its
+        query string, which is precisely why :func:`redact_endpoint` exists --
+        and the generated repr printed it verbatim. That repr is what a stray
+        ``logger.debug("%r", config)`` emits, and what every traceback frame
+        holding a ``ProxyConfig`` renders, so it is the single most likely way
+        for the endpoint to reach a log line.
+
+        The host is deliberately kept: this is redaction so the object stays
+        debuggable, not suppression. Only display changes -- equality and
+        hashing are still the dataclass's own, over every field including the
+        key.
+
+        A ``__repr__`` must never raise: it runs inside exception rendering,
+        where an exception of its own would replace the diagnostic it was
+        called to produce. :func:`redact_endpoint` already absorbs a malformed
+        URL, so the guard below is for a non-``str`` endpoint reaching an
+        untyped caller's ``JevConfig``, and it falls back to a placeholder --
+        never to the raw value.
+        """
+        try:
+            endpoint = redact_endpoint(self.endpoint)
+        except Exception:  # noqa: BLE001 - a repr must never raise, nor leak
+            endpoint = "<unrenderable endpoint>"
+        return (
+            f"{type(self).__name__}(mode={self.mode!r}, endpoint={endpoint!r}, "
+            f"model={self.model!r}, timeout_ms={self.timeout_ms!r}, "
+            f"threshold_percent={self.threshold_percent!r}, "
+            f"cooldown_turns={self.cooldown_turns!r}, "
+            f"max_candidate_tokens={self.max_candidate_tokens!r}, "
+            f"max_candidates={self.max_candidates!r}, "
+            f"max_state_tokens={self.max_state_tokens!r}, "
+            f"api_key_configured={bool(self.api_key)!r})"
+        )
 
     @property
     def enabled(self) -> bool:
