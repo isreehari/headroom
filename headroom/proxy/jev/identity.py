@@ -43,12 +43,18 @@ def _canonical_root(branch_root: list[dict[str, Any]] | None) -> str:
     because the project gate is fail-open: a pathological root (uncomparable
     dict keys, a self-referential structure) must degrade to a still-
     deterministic id rather than take the caller down.
+
+    ``ensure_ascii`` stays on deliberately. ``json.loads`` accepts a lone
+    surrogate escape, so a client-controlled message can carry an unpaired
+    surrogate into this function; escaping it here keeps the result UTF-8
+    encodable for the caller's ``hashlib`` feed. The escaping is deterministic,
+    so branch ids stay stable.
     """
     try:
         return json.dumps(
             branch_root or [],
             sort_keys=True,
-            ensure_ascii=False,
+            ensure_ascii=True,
             separators=(",", ":"),
             default=str,
         )

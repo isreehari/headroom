@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from headroom.proxy.jev.identity import (
@@ -96,6 +98,21 @@ def test_ids_are_fail_open_on_pathological_inputs() -> None:
     assert len(branch_id_for("s", uncomparable_keys)) == 24  # type: ignore[arg-type]
 
     assert len(revision_for([object()])) == 32  # type: ignore[list-item]
+
+
+def test_ids_survive_a_lone_surrogate_in_the_request_body() -> None:
+    # json.loads accepts an unpaired surrogate escape, so a client can put one
+    # in a message; the resulting str is not UTF-8 encodable.
+    lone_surrogate = json.loads('"\\ud800 lone surrogate"')
+    root = [{"role": "system", "content": lone_surrogate}]
+
+    branch_id = branch_id_for("s", root)
+    assert len(branch_id) == 24
+    assert branch_id == branch_id_for("s", root)
+
+    revision = revision_for([lone_surrogate])
+    assert len(revision) == 32
+    assert revision == revision_for([lone_surrogate])
 
 
 def test_branch_key_pairs_session_and_branch() -> None:
