@@ -171,6 +171,12 @@ class PrometheusMetrics:
         # rejected before executor admission behind that worker.
         self.compression_quarantine_by_event: dict[str, int] = defaultdict(int)
 
+        # Jev retention (Track A shadow mode) lifecycle events, keyed by event
+        # name. Every exit from the shadow hook lands in exactly one bucket —
+        # including each fail-open — so a shadow deployment that silently never
+        # calls Jev is visible as a counter, not only as an absent log line.
+        self.jev_events_by_event: dict[str, int] = defaultdict(int)
+
         # These counters are mutated from compression worker threads and the
         # event-loop thread, while export()/reset_runtime() read and clear them.
         # asyncio.Lock can't be taken off-loop, so guard them with a plain
@@ -366,6 +372,7 @@ class PrometheusMetrics:
                 self.upstream_connection_errors_by_provider.clear()
                 self.kompress_size_gate_by_outcome.clear()
                 self.compression_quarantine_by_event.clear()
+                self.jev_events_by_event.clear()
 
             self.codex_ws_units_total = 0
             self.codex_ws_units_modified_total = 0
@@ -576,6 +583,22 @@ class PrometheusMetrics:
         """
         with self._obs_counter_lock:
             self.compression_failed_by_reason[reason or "error"] += 1
+
+    def record_jev_event(self, event: str) -> None:
+        """Record one Jev retention lifecycle event, bucketed by ``event``.
+
+        Called from ``headroom/proxy/jev/shadow.py`` and
+        ``headroom/proxy/jev/hook.py`` with names like ``shadow_below_threshold``,
+        ``shadow_cooldown``, ``shadow_no_candidates``, ``shadow_call_attempted``,
+        ``shadow_call_error``, ``shadow_stale_revision``, ``shadow_projected``
+        and ``shadow_fail_open``. Those names are internal constants, never
+        request data, but the key is still coerced to a plain ``str`` (empty or
+        ``None`` becomes ``"unknown"``) so no caller can plant a non-string key
+        that breaks the export's text format. Guarded by ``_obs_counter_lock``
+        for the same reason as ``record_compression_failed``.
+        """
+        with self._obs_counter_lock:
+            self.jev_events_by_event[str(event) if event else "unknown"] += 1
 
     def record_upstream_connection_error(self, provider: str) -> None:
         """Record one exhausted-retries upstream transport failure.
@@ -1436,6 +1459,7 @@ class PrometheusMetrics:
                 upstream_conn_errors = dict(self.upstream_connection_errors_by_provider)
                 kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
                 compression_quarantine = dict(self.compression_quarantine_by_event)
+                jev_events = dict(self.jev_events_by_event)
 
             if upstream_conn_errors:
                 lines.extend(
@@ -1486,6 +1510,19 @@ class PrometheusMetrics:
                 for event, count in compression_quarantine.items():
                     lines.append(
                         f'headroom_compression_quarantine_total{{event="{_escape_label_value(event)}"}} {count}'
+                    )
+                lines.append("")
+
+            if jev_events:
+                lines.extend(
+                    [
+                        "# HELP headroom_jev_events_total Jev retention lifecycle events by event name; every shadow-hook exit, including fail-opens, is counted here",
+                        "# TYPE headroom_jev_events_total counter",
+                    ]
+                )
+                for event, count in jev_events.items():
+                    lines.append(
+                        f'headroom_jev_events_total{{event="{_escape_label_value(event)}"}} {count}'
                     )
                 lines.append("")
 
