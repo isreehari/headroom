@@ -309,6 +309,103 @@ async def test_every_ambiguous_answer_keeps_as_a_batch() -> None:
         )
 
 
+# --------------------------------------------------------------------------
+# The answer object is adversarial too, not just the client.
+#
+# ``getattr`` degrades a MISSING field to ``keep``, but it does not degrade a
+# field that RAISES -- it re-raises. The answer is whatever came back from the
+# network client, so reading it is as much a fail-open surface as calling the
+# client was, and a propagating exception here would both break the module's
+# headline contract and hand the relay an UNSCRUBBED ``str(exc)``.
+# --------------------------------------------------------------------------
+
+
+async def test_an_answer_whose_error_property_raises_keeps() -> None:
+    class _RaisingError:
+        @property
+        def error(self) -> Any:
+            raise RuntimeError("sk-jev-LEAKED-FROM-A-PROPERTY")
+
+        @property
+        def decisions(self) -> Any:
+            return {}
+
+    assert await _decide(_Client(_RaisingError())) == JEV_DECISION_KEEP
+
+
+async def test_an_answer_whose_decisions_property_raises_keeps() -> None:
+    class _RaisingDecisions:
+        error = None
+
+        @property
+        def decisions(self) -> Any:
+            raise RuntimeError("sk-jev-LEAKED-FROM-A-PROPERTY")
+
+    assert await _decide(_Client(_RaisingDecisions())) == JEV_DECISION_KEEP
+
+
+async def test_an_answer_whose_decisions_lookup_raises_keeps() -> None:
+    class _RaisingMapping(dict):  # type: ignore[type-arg]
+        def get(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sk-jev-LEAKED-FROM-A-LOOKUP")
+
+    assert await _decide(_Client(_Answer(decisions=_RaisingMapping()))) == JEV_DECISION_KEEP
+
+
+async def test_an_answer_whose_nested_choice_lookup_raises_keeps() -> None:
+    class _RaisingInner(dict):  # type: ignore[type-arg]
+        def get(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sk-jev-LEAKED-FROM-A-NESTED-LOOKUP")
+
+    candidate, _ = _candidate_and_boundary()
+    answer = _Answer(decisions={candidate.candidate_id: _RaisingInner()})
+    assert await _decide(_Client(answer)) == JEV_DECISION_KEEP
+
+
+async def test_an_answer_whose_verdict_strip_raises_keeps() -> None:
+    class _RaisingStr(str):
+        def strip(self, *args: Any, **kwargs: Any) -> str:
+            raise RuntimeError("sk-jev-LEAKED-FROM-A-VERDICT")
+
+    candidate, _ = _candidate_and_boundary()
+    answer = _Answer(decisions={candidate.candidate_id: _RaisingStr("drop")})
+    assert await _decide(_Client(answer)) == JEV_DECISION_KEEP
+
+
+async def test_a_raising_answer_property_leaks_nothing_to_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret_key = "sk-jev-SUPERSECRET-0123456789"
+    secret_endpoint = "https://jev.internal.example/v1/decide"
+    config = JevConfig(mode="active", api_key=secret_key, endpoint=secret_endpoint)
+
+    class _RaisingError:
+        @property
+        def error(self) -> Any:
+            raise RuntimeError(f"GET {secret_endpoint} Bearer {secret_key}")
+
+    client = _Client(_RaisingError())
+    client._config = config  # type: ignore[attr-defined]
+
+    with caplog.at_level(logging.DEBUG, logger="headroom.proxy.jev.compaction_decision"):
+        assert await _decide(client) == JEV_DECISION_KEEP
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret_key not in rendered
+    assert secret_endpoint not in rendered
+    assert "RuntimeError" in rendered
+
+
+async def test_cancellation_from_the_answer_parse_still_propagates() -> None:
+    # The parse guard must not swallow cancellation either.
+    class _CancellingAnswer:
+        @property
+        def error(self) -> Any:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _decide(_Client(_CancellingAnswer()))
+
+
 async def test_a_client_without_a_decide_attribute_keeps() -> None:
     class _NotAClient:
         pass

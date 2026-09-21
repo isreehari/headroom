@@ -230,6 +230,13 @@ def _parse_decision(answer: Any, candidate_id: str) -> str:
     for an id we did not ask about is not our verdict, and ``truncate`` -- a
     real Track A option -- is not on offer at a compaction boundary, so both
     land on ``keep`` by the same rule: only the exact string ``drop`` drops.
+
+    This function may still RAISE, and its caller guards it for that reason.
+    ``getattr`` degrades a *missing* attribute to the default, but it does not
+    degrade one that raises -- a property, a ``__getattr__``, a mapping whose
+    ``get`` is overridden, a ``str`` subclass with a hostile ``strip``: each of
+    those propagates. The answer object is whatever came back from the network
+    client, so it is exactly as adversarial as the call was.
     """
     if answer is None:
         return JEV_DECISION_KEEP
@@ -257,10 +264,13 @@ async def decide_single_candidate(
 ) -> str:
     """Ask Track A's Jev client one question. Never raises; keeps on doubt.
 
-    Returns exactly ``"keep"`` or ``"drop"``. Building the state, reaching the
-    client's ``decide`` attribute and calling it are all inside the guard: a
-    client that does not have the method, whose attribute raises, or whose
-    signature does not match is an odd client, and an odd client means ``keep``.
+    Returns exactly ``"keep"`` or ``"drop"``. Every step is guarded, in two
+    separate guards. Building the state, reaching the client's ``decide``
+    attribute and calling it sit under the timeout guard: a client that does
+    not have the method, whose attribute raises, or whose signature does not
+    match is an odd client, and an odd client means ``keep``. Reading the
+    answer sits under a second, narrow guard, because ``getattr`` does not
+    degrade an attribute that *raises* -- see :func:`_parse_decision`.
 
     :class:`asyncio.CancelledError` is re-raised explicitly. It is a
     ``BaseException``, so the ``except Exception`` below does not catch it, but
@@ -316,4 +326,21 @@ async def decide_single_candidate(
             _scrubbed_detail(client, exc),
         )
         return JEV_DECISION_KEEP
-    return _parse_decision(result, candidate.candidate_id)
+
+    # Reading the answer gets its OWN guard rather than being folded into the
+    # one above. Two reasons: the parse is local work that `timeout_seconds` has
+    # no business bounding, and a `TimeoutError` raised by a hostile answer
+    # object must not be able to masquerade as the call having timed out. It
+    # still fails open to `keep`, and its detail is scrubbed on the same path as
+    # every other failure here -- an unscrubbed `str(exc)` escaping to the relay
+    # would be a leak from precisely the object the network handed back.
+    try:
+        return _parse_decision(result, candidate.candidate_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "jev compaction: decision answer could not be read (%s); keeping candidate",
+            _scrubbed_detail(client, exc),
+        )
+        return JEV_DECISION_KEEP
