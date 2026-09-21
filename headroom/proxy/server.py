@@ -147,6 +147,7 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.jev.config import JevConfig
+from headroom.proxy.jev.shadow import JevShadowRunner
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.malloc_trim import trim_periodically
@@ -889,6 +890,13 @@ class HeadroomProxy(
         # Cost-aware model routing (issue #1706). Disabled unless configured, so
         # the default request path is unchanged.
         self.model_router = ModelRouter(config.model_router)
+
+        # Jev retention, Track A (shadow). Constructed unconditionally so the
+        # handlers have one object to call; `enabled` is False unless
+        # HEADROOM_JEV_MODE=shadow, and a disabled runner returns immediately
+        # without touching the network (its client lazily dials, so an off
+        # runner never opens a connection).
+        self.jev_shadow = JevShadowRunner(config.jev, metrics=self.metrics)
 
         # Initialize transforms based on routing mode.
         #
@@ -2231,6 +2239,11 @@ class HeadroomProxy(
         if self.http_client:
             await self.http_client.aclose()
             self.http_client = None
+
+        # The Jev client owns its own pool (a 500ms retention call must not
+        # share timeouts with a 300s model call), so it closes separately.
+        with contextlib.suppress(Exception):
+            await self.jev_shadow.aclose()
 
         if self.memory_handler and hasattr(self.memory_handler, "close"):
             await self.memory_handler.close()
