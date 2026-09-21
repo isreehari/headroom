@@ -48,6 +48,7 @@ import inspect
 import logging
 from typing import Any
 
+from headroom.proxy.jev.accounting import classify_call_error, record_jev_accounting
 from headroom.proxy.jev.client import scrub_secrets
 from headroom.proxy.jev.compaction import JevCompactionBoundary, JevCompactionCandidate
 from headroom.proxy.jev.config import redact_endpoint
@@ -221,6 +222,34 @@ def _scrubbed_detail(client: Any, exc: BaseException) -> str:
         return type(exc).__name__
 
 
+def _answer_error(answer: Any) -> str | None:
+    """The answer's error text, or ``None`` when it reported none.
+
+    ``getattr`` degrades a *missing* attribute but not one that raises, and
+    this object came off the network, so the read is guarded. An unreadable
+    answer is not a clean answer: it is reported as an error string so the
+    call is accounted for as a failure rather than silently as a success.
+    """
+    try:
+        error = getattr(answer, "error", None)
+        return str(error) if error else None
+    except Exception:  # noqa: BLE001 - an unreadable answer is a failed call
+        return "unreadable answer"
+
+
+def _record_call_outcome(metrics: Any, error: str | None) -> None:
+    """Account for one finished call, split timeout vs rejection once."""
+    if error is None:
+        record_jev_accounting(metrics, calls_completed=1)
+        return
+    record_jev_accounting(
+        metrics,
+        calls_failed=1,
+        fallbacks=1,
+        **{classify_call_error(error) or "calls_rejected": 1},
+    )
+
+
 def _parse_decision(answer: Any, candidate_id: str) -> str:
     """Read one decision off a ``JevAnswer``. Anything ambiguous means keep.
 
@@ -261,6 +290,7 @@ async def decide_single_candidate(
     session_id: str,
     model: str | None,
     timeout_seconds: float,
+    metrics: Any = None,
 ) -> str:
     """Ask Track A's Jev client one question. Never raises; keeps on doubt.
 
@@ -276,7 +306,16 @@ async def decide_single_candidate(
     ``BaseException``, so the ``except Exception`` below does not catch it, but
     the clause is written out because swallowing cancellation would leak a task
     past the relay's shutdown -- a branch-wide invariant, not a local choice.
+
+    This is also the only place in Track C that can tell a timeout from a
+    rejection -- the return value is deliberately a bare ``"keep"``/``"drop"``
+    with the reason thrown away -- so the call outcome is accounted for here,
+    through the same recorder and the same
+    :func:`~headroom.proxy.jev.accounting.classify_call_error` Tracks A and B
+    use. ``metrics`` is optional and every recording call is unconditionally
+    swallowed, so accounting can never turn a decision into an exception.
     """
+    record_jev_accounting(metrics, calls_attempted=1)
     try:
         state = build_single_candidate_state(
             candidate, boundary, session_id=session_id, model=model
@@ -312,15 +351,18 @@ async def decide_single_candidate(
         if inspect.isawaitable(result):
             result = await asyncio.wait_for(result, timeout=max(0.0, deadline - loop.time()))
     except (asyncio.TimeoutError, TimeoutError):
+        record_jev_accounting(metrics, calls_timed_out=1, calls_failed=1, fallbacks=1)
         logger.info(
             "jev compaction: decision timed out after %.2fs; keeping candidate",
             timeout_seconds,
         )
         return JEV_DECISION_KEEP
     except asyncio.CancelledError:
-        # Not a degradation: the relay is tearing this connection down.
+        # Not a degradation: the relay is tearing this connection down, so it
+        # is deliberately NOT accounted for as a failed call.
         raise
     except Exception as exc:
+        record_jev_accounting(metrics, calls_rejected=1, calls_failed=1, fallbacks=1)
         logger.warning(
             "jev compaction: decision call failed (%s); keeping candidate",
             _scrubbed_detail(client, exc),
@@ -334,6 +376,11 @@ async def decide_single_candidate(
     # still fails open to `keep`, and its detail is scrubbed on the same path as
     # every other failure here -- an unscrubbed `str(exc)` escaping to the relay
     # would be a leak from precisely the object the network handed back.
+    #
+    # The call is accounted for BEFORE the parse: an answer carrying an error
+    # is a failed call whatever the parse then makes of it, and a parse that
+    # blows up must not be able to count the call twice.
+    _record_call_outcome(metrics, _answer_error(result))
     try:
         return _parse_decision(result, candidate.candidate_id)
     except asyncio.CancelledError:

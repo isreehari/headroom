@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from headroom.cache.compression_store import get_compression_store
+from headroom.proxy.jev.accounting import classify_call_error, record_jev_accounting
 from headroom.proxy.jev.active import decide_active_retention
 from headroom.proxy.jev.candidates import count_messages_corrected
 from headroom.proxy.jev.client import JevClient, scrub_secrets
@@ -107,6 +108,18 @@ def _record(proxy: Any, event: str) -> None:
         recorder = getattr(metrics, "record_jev_event", None)
         if recorder is not None:
             recorder(event)
+
+
+def _record_accounting(proxy: Any, **fields: int) -> None:
+    """Add to the shared /stats totals. Never raises (see accounting.py).
+
+    The ``proxy.metrics`` lookup is suppressed here for the same reason
+    ``accounting.record_jev_accounting`` guards its own: a property on a
+    caller-supplied proxy object can raise, and this is called from the
+    fail-open path where an escaping exception would defeat the point.
+    """
+    with contextlib.suppress(Exception):
+        record_jev_accounting(getattr(proxy, "metrics", None), **fields)
 
 
 def _active_config(proxy: Any) -> JevConfig | None:
@@ -232,12 +245,42 @@ async def run_jev_active_retention(
                 decision.error,
                 total,
             )
+            _record_accounting(
+                proxy,
+                calls_attempted=1,
+                calls_failed=1,
+                fallbacks=1,
+                candidates=len(decision.candidates),
+                **{classify_call_error(decision.error) or "calls_rejected": 1},
+            )
             return _unchanged("call_failed", candidates=total, called=decision.called)
         if not decision.called:
             # Candidates were selected but the measured request budget admitted
             # none, so Jev was never asked. Nothing to retain.
             _record(proxy, "active_no_candidates")
             return _unchanged("not_asked", candidates=total)
+
+        # The call itself is accounted for here, once, on the single path
+        # where it is known to have been made and to have come back clean.
+        # `keep`/`truncate`/`drop` are Jev's DECISIONS; what was carried out is
+        # `applied`, recorded further down, and the gap between the two is a
+        # partial-staging failure.
+        tallies = {"keep": 0, "truncate": 0, "drop": 0}
+        for cand in decision.candidates:
+            decided = decision.decisions.get(cand.candidate_id, "keep")
+            if decided in tallies:
+                tallies[decided] += 1
+        _record_accounting(
+            proxy,
+            calls_attempted=1,
+            calls_completed=1,
+            candidates=len(decision.candidates),
+            candidates_sent=len(decision.candidates),
+            candidate_tokens=sum(c.est_tokens for c in decision.candidates),
+            keep=tallies["keep"],
+            truncate=tallies["truncate"],
+            drop=tallies["drop"],
+        )
 
         removable = [
             cand
@@ -271,6 +314,19 @@ async def run_jev_active_retention(
             )
             if lease is not None:
                 leases[cand.candidate_id] = lease
+
+        # `ccr_staged` counts staging ATTEMPTS; a lease is Task 13's proof that
+        # the write was read back and verified, so it is what `acknowledged`
+        # means. The gap between the two is the signal that a CCR backend is
+        # quietly losing writes, and it is recorded here — before the
+        # short-circuit below — so a total staging failure is counted exactly
+        # like a partial one.
+        _record_accounting(
+            proxy,
+            ccr_staged=len(removable),
+            ccr_acknowledged=len(leases),
+            ccr_failed=max(0, len(removable) - len(leases)),
+        )
 
         if not leases:
             _record(proxy, "active_no_lease")
@@ -309,6 +365,21 @@ async def run_jev_active_retention(
         )
 
         _record(proxy, "active_applied")
+        # TF needs its own TH or it says nothing: measure the SAME message list
+        # the same way, before retention was applied, and report the pair. TH
+        # as Track A measured it on shadow turns is not a baseline for the
+        # different turns active retention ran on, which is why
+        # `tokens_active_baseline` exists as a field of its own.
+        _record_accounting(
+            proxy,
+            applied=len(applied_ids),
+            tokens_active_baseline=count_messages_corrected(
+                messages,
+                count_messages=tokenizer.count_messages,
+                count_text=tokenizer.count_text,
+            ),
+            tokens_final=tokens_after,
+        )
         logger.info(
             "jev active retention: applied %d of %d candidate(s) (%d staged); tokens_after=%d",
             len(applied_ids),

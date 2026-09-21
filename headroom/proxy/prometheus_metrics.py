@@ -77,6 +77,55 @@ def _append_metric(
 PROXY_SAVINGS_FLUSH_EVERY = 25
 
 
+#: Every integer total the /stats `jev` block reports. The allowlist is the
+#: contract: a caller that mistypes a field name gets it dropped, not silently
+#: added as a new key nobody reads, and a dashboard can rely on every field
+#: being present (zero-valued) from the first request.
+JEV_ACCOUNTING_FIELDS: tuple[str, ...] = (
+    # Call outcomes. `calls_completed` + `calls_timed_out` + `calls_rejected`
+    # partition the calls that finished; `calls_failed` is the sum of the last
+    # two, kept as its own field so "any failure" is one series to alert on.
+    "calls_attempted",
+    "calls_completed",
+    "calls_failed",
+    "calls_timed_out",
+    "calls_rejected",
+    # Candidate volume. `candidates` is everything selected, `candidates_sent`
+    # the subset the measured request budget actually asked about.
+    "candidates",
+    "candidates_sent",
+    "candidate_tokens",
+    # Answers: Jev's DECISION tallies, not what was carried out. A candidate
+    # Jev said `drop` to whose CCR commit then failed still counts here as a
+    # drop, because that is what Jev decided.
+    "keep",
+    "truncate",
+    "drop",
+    # What was actually carried out: candidates whose slot was really
+    # rewritten. The gap between `drop` + `truncate` and `applied` is a
+    # partial-staging failure, which is otherwise invisible from outside.
+    "applied",
+    # Token accounting: T0 / TH / TP for the shadow projection, and the
+    # separate TH/TF pair for what active retention really changed.
+    "tokens_baseline",
+    "tokens_headroom",
+    "tokens_projected",
+    "tokens_active_baseline",
+    "tokens_final",
+    # How much of `tokens_active_baseline - tokens_final` came from a
+    # `bytes // 4` ESTIMATE rather than a tokenizer measurement. Track B
+    # measures both sides with the model's tokenizer and contributes nothing
+    # here; Track C decides at a WS frame boundary where no tokenizer is in
+    # reach, so all of its contribution is estimated and says so.
+    "realized_savings_estimated",
+    # CCR: acknowledged means a verified read-back and a lease (Task 13).
+    "ccr_staged",
+    "ccr_acknowledged",
+    "ccr_failed",
+    "fallbacks",
+)
+
+
 class PrometheusMetrics:
     """Prometheus-compatible metrics."""
 
@@ -176,6 +225,11 @@ class PrometheusMetrics:
         # including each fail-open — so a shadow deployment that silently never
         # calls Jev is visible as a counter, not only as an absent log line.
         self.jev_events_by_event: dict[str, int] = defaultdict(int)
+
+        # Jev retention token accounting for the /stats `jev` block. TH/TP are
+        # summed here; TF lands in `tokens_final`. TP is NEVER added to the
+        # realized-savings series — see jev_snapshot().
+        self.jev_totals: dict[str, int] = defaultdict(int)
 
         # These counters are mutated from compression worker threads and the
         # event-loop thread, while export()/reset_runtime() read and clear them.
@@ -373,6 +427,7 @@ class PrometheusMetrics:
                 self.kompress_size_gate_by_outcome.clear()
                 self.compression_quarantine_by_event.clear()
                 self.jev_events_by_event.clear()
+                self.jev_totals.clear()
 
             self.codex_ws_units_total = 0
             self.codex_ws_units_modified_total = 0
@@ -599,6 +654,57 @@ class PrometheusMetrics:
         """
         with self._obs_counter_lock:
             self.jev_events_by_event[str(event) if event else "unknown"] += 1
+
+    def record_jev_accounting(self, **fields: int) -> None:
+        """Add Jev retention totals for the ``/stats`` ``jev`` block.
+
+        Accepts only the names in :data:`JEV_ACCOUNTING_FIELDS`; anything else
+        is dropped. Nothing here may raise: this runs on the request path and
+        on the Codex WebSocket relay, and an accounting bug must cost a number
+        on a dashboard, never a turn. A value that will not coerce to ``int``
+        is dropped for the same reason. Guarded by ``_obs_counter_lock``, like
+        every other off-thread observer counter.
+        """
+        with self._obs_counter_lock:
+            for name, value in fields.items():
+                if name not in JEV_ACCOUNTING_FIELDS:
+                    continue
+                try:
+                    self.jev_totals[name] += int(value)
+                except (TypeError, ValueError):
+                    continue
+
+    def jev_snapshot(self) -> dict[str, Any]:
+        """Totals for the ``/stats`` ``jev`` block, plus the two derived savings.
+
+        ``projected_savings`` is ``TH - TP`` — Track A's shadow projection,
+        what active mode *would* have saved on the turns it was asked about. It
+        is reported here and only here: the design doc requires it to stay out
+        of the realized savings the ledger and ``/stats-history`` persist.
+
+        ``realized_savings`` is ``TH - TF`` measured on the content active
+        retention actually rewrote (``tokens_active_baseline`` against
+        ``tokens_final``). The two pairs never mix: a projection and a
+        measurement are different claims about different turns, and adding them
+        would overstate both.
+
+        ``realized_savings_estimated`` is the part of ``realized_savings``
+        derived from a ``bytes // 4`` estimate rather than a tokenizer
+        measurement — Track C's whole contribution, since a WS frame boundary
+        has no tokenizer in reach. It is reported so an operator can see how
+        much of the realized number is measured and how much is estimated.
+        """
+        with self._obs_counter_lock:
+            totals: dict[str, Any] = {
+                name: int(self.jev_totals.get(name, 0)) for name in JEV_ACCOUNTING_FIELDS
+            }
+            events = dict(self.jev_events_by_event)
+        totals["projected_savings"] = max(0, totals["tokens_headroom"] - totals["tokens_projected"])
+        totals["realized_savings"] = max(
+            0, totals["tokens_active_baseline"] - totals["tokens_final"]
+        )
+        totals["events"] = events
+        return totals
 
     def record_upstream_connection_error(self, provider: str) -> None:
         """Record one exhausted-retries upstream transport failure.
@@ -1460,6 +1566,7 @@ class PrometheusMetrics:
                 kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
                 compression_quarantine = dict(self.compression_quarantine_by_event)
                 jev_events = dict(self.jev_events_by_event)
+                jev_totals = dict(self.jev_totals)
 
             if upstream_conn_errors:
                 lines.extend(
@@ -1525,6 +1632,24 @@ class PrometheusMetrics:
                         f'headroom_jev_events_total{{event="{_escape_label_value(event)}"}} {count}'
                     )
                 lines.append("")
+
+            # One series, one label — an operator graphs `drop` or
+            # `calls_timed_out` without Headroom minting a metric name per
+            # field, and a field added to JEV_ACCOUNTING_FIELDS appears here
+            # with no export change. Every field is emitted even at zero, so a
+            # dashboard panel exists from the first scrape.
+            lines.extend(
+                [
+                    "# HELP headroom_jev_accounting_total Jev retention accounting totals by field; token letters are T0=tokens_baseline, TH=tokens_headroom/tokens_active_baseline, TP=tokens_projected, TF=tokens_final. TP is a projection and is never part of the realized saving (tokens_active_baseline - tokens_final); realized_savings_estimated is the part of that realized saving derived from a bytes//4 estimate rather than a tokenizer measurement",
+                    "# TYPE headroom_jev_accounting_total counter",
+                ]
+            )
+            for _field in JEV_ACCOUNTING_FIELDS:
+                lines.append(
+                    f'headroom_jev_accounting_total{{field="{_field}"}} '
+                    f"{int(jev_totals.get(_field, 0))}"
+                )
+            lines.append("")
 
             lines.extend(
                 [

@@ -52,6 +52,7 @@ import logging
 from typing import Any
 
 from headroom.cache.compression_store import get_compression_store
+from headroom.proxy.jev.accounting import record_jev_accounting
 from headroom.proxy.jev.client import scrub_secrets
 from headroom.proxy.jev.compaction import (
     detect_compaction_boundary,
@@ -385,9 +386,28 @@ async def apply_jev_compaction_boundary(
             session_id=session_id,
             model=getattr(jev_config, "model", None),
             timeout_seconds=_timeout_seconds(jev_config),
+            # `decide_single_candidate` is the only place that can tell a
+            # timeout from a rejection, so the call-outcome accounting lives
+            # there; the candidate, decision and CCR numbers are recorded here.
+            metrics=metrics,
+        )
+        # Candidate volume is recorded ONCE, here, for the one candidate that
+        # was actually asked about -- not per exit. Recording it on the drop
+        # path only would undercount `candidates` and lose `candidate_tokens`
+        # entirely whenever the CCR commit fails.
+        #
+        # `estimated_tokens` is `bytes // 4` (see compaction.py). It is an
+        # estimate, never a measurement, and everything derived from it below
+        # is declared as such through `realized_savings_estimated`.
+        record_jev_accounting(
+            metrics,
+            candidates=1,
+            candidates_sent=1,
+            candidate_tokens=candidate.estimated_tokens,
         )
         if decision != JEV_DECISION_DROP:
             _record_jev_event(metrics, "compaction_keep")
+            record_jev_accounting(metrics, keep=1)
             logger.debug(
                 "[%s] jev compaction: keep for candidate %s", request_id, candidate.candidate_id
             )
@@ -417,6 +437,10 @@ async def apply_jev_compaction_boundary(
         # so a False here also leaves the parsed frame untouched.
         if lease is None or not replace_candidate_output(inner, candidate, lease.marker):
             _record_jev_event(metrics, "compaction_ccr_failed")
+            # `drop` is the DECISION tally, so it is counted even though the
+            # commit failed; `applied` stays at zero, which is what says the
+            # decision was not carried out.
+            record_jev_accounting(metrics, drop=1, ccr_staged=1, ccr_failed=1)
             logger.warning(
                 "[%s] jev compaction: retention not committed for candidate %s; keeping original",
                 request_id,
@@ -433,6 +457,26 @@ async def apply_jev_compaction_boundary(
             frame = inner
         rewritten = json.dumps(frame)
         _record_jev_event(metrics, "compaction_dropped")
+        # Track C decides about ONE candidate, so its baseline/final pair is
+        # candidate-scoped rather than turn-scoped: the frame's own totals are
+        # already accounted for by the existing WS usage path, and subtracting
+        # a whole-frame TF from a candidate-sized TH would be meaningless.
+        #
+        # Both sides are `bytes // 4` estimates -- there is no tokenizer in
+        # reach at a WS frame boundary -- so the whole of this contribution to
+        # `realized_savings` is also reported as `realized_savings_estimated`.
+        # It is a saving that really happened; its SIZE is an estimate.
+        marker_tokens = max(1, len(lease.marker) // 4)
+        record_jev_accounting(
+            metrics,
+            drop=1,
+            applied=1,
+            ccr_staged=1,
+            ccr_acknowledged=1,
+            tokens_active_baseline=candidate.estimated_tokens,
+            tokens_final=marker_tokens,
+            realized_savings_estimated=max(0, candidate.estimated_tokens - marker_tokens),
+        )
         logger.info(
             "[%s] jev compaction boundary: dropped 1 candidate session_id=%s "
             "revision=%s candidate=%s hash=%s est_tokens~%d",

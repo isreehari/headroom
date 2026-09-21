@@ -43,6 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.proxy.jev.accounting import classify_call_error, record_jev_accounting
 from headroom.proxy.jev.candidates import (
     RECENT_TAIL_EXCLUSION,
     JevCandidate,
@@ -224,6 +225,10 @@ class JevShadowRunner:
         with contextlib.suppress(Exception):
             self._metrics.record_jev_event(event)
 
+    def _record_accounting(self, **fields: int) -> None:
+        """Add to the shared /stats totals. Never raises (see accounting.py)."""
+        record_jev_accounting(self._metrics, **fields)
+
     def _skip(self, reason: str, *, event: str | None = None, **fields: Any) -> JevShadowResult:
         if event is not None:
             self._record(event)
@@ -401,6 +406,16 @@ class JevShadowRunner:
             # Already scrubbed: every path that sets ``JevAnswer.error`` runs
             # the string through ``scrub_secrets`` inside the client.
             logger.info("jev shadow call failed open: %s", answer.error)
+            self._record_accounting(
+                calls_attempted=1,
+                calls_failed=1,
+                fallbacks=1,
+                candidates=len(eligible),
+                candidates_sent=len(sent),
+                # A timeout and a refusal are different operational problems;
+                # `calls_failed` stays the sum so one series still covers both.
+                **{classify_call_error(answer.error) or "calls_rejected": 1},
+            )
             return self._skip(
                 "call_error",
                 event="shadow_call_error",
@@ -442,6 +457,23 @@ class JevShadowRunner:
             # The old metadata-keep-v2 bias: unseen results always come back
             # "keep". Worth a counter, not a failure.
             self._record("shadow_all_keep")
+
+        self._record_accounting(
+            calls_attempted=1,
+            calls_completed=1,
+            candidates=len(eligible),
+            candidates_sent=len(sent),
+            candidate_tokens=sum(cand.est_tokens for cand in sent),
+            keep=tallies["keep"],
+            truncate=tallies["truncate"],
+            drop=tallies["drop"],
+            # T0 as the caller measured it, TH and TP as this turn measured
+            # them. TP is a projection: it is kept away from tokens_final and
+            # `applied` stays at zero, because Track A rewrote nothing.
+            tokens_baseline=max(0, int(original_tokens or 0)),
+            tokens_headroom=th,
+            tokens_projected=tp,
+        )
 
         return JevShadowResult(
             ran=True,

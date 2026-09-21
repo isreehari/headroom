@@ -4788,6 +4788,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "compressed_tokens_cached": compression_stats.get("total_compressed_tokens", 0),
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
             },
+            # Jev retention (design doc, "Dashboard and Metrics"). `config` is
+            # the redacted view — mode, model and a scheme+host+path endpoint
+            # label, never the API key. `projected_savings` is TP and is
+            # deliberately absent from `savings` / `savings_history`: a shadow
+            # projection is not a realized saving.
+            "jev": {
+                **proxy.metrics.jev_snapshot(),
+                "config": proxy.config.jev.redacted(),
+            },
             "compression_cache": compression_cache_stats,
             # Per-language AST compression pauses. Empty on a healthy install;
             # non-empty is the explanation for a savings drop in one language.
