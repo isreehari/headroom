@@ -159,9 +159,17 @@ forwarded.
 }
 ```
 
-All three fields are required together: `mode="ccr"` because the replacement is
-a CCR marker, and `session_id` because every retained original is bound to
-`(session_id, branch_id, content hash)`. Any other combination is a 400.
+`jev_compaction_boundary` is optional and defaults to false; omitting it (or
+sending it as `false`) leaves the request exactly as it is today. Sending it as
+`true` is what pulls the other two fields in: `mode` must be `"ccr"`, because
+the replacement is a CCR marker and the other modes emit no markers and write
+nothing to the CCR store, and `session_id` must be a non-empty string, because
+every retained original is bound to `(session_id, branch_id, candidate hash)`.
+A boundary turn missing either of those is a 400, as is a
+`jev_compaction_boundary` that is anything other than JSON `true` or `false` —
+`1` and `"true"` are rejected rather than read as consent to drop tool output.
+Those checks run on every request, so a malformed boundary is a 400 even on a
+proxy with Jev switched off.
 
 Nothing is deleted. A retained original is written to the CCR store, read back
 to confirm the write was acknowledged, and given a 24-hour retention lease
@@ -188,7 +196,10 @@ runs out; size the store accordingly when retention is switched on.
 
 Requires `HEADROOM_JEV_MODE=active` (default `off`) plus `HEADROOM_JEV_API_KEY`.
 With Jev off or in shadow mode the flag is a documented no-op: the response's
-`jev` block reports `"reason": "jev_inactive"` and nothing is rewritten.
+`jev` block reports `"reason": "jev_inactive"`, and the turn is byte-identical
+to the same request without the flag. That means no ADDITIONAL Jev rewrite —
+Headroom's own deterministic compression still runs in full, exactly as it does
+on every other turn.
 
 A boundary turn deliberately rewrites history the caller has already forwarded,
 so it busts the provider prompt cache for that prefix. That is what a compaction

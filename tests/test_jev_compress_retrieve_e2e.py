@@ -150,10 +150,19 @@ def test_boundary_marker_resolves_on_v1_retrieve(jev_active: None) -> None:
         assert json.loads(retrieved_content) == json.loads(original_tool_content)
 
 
-def test_jev_off_leaves_the_boundary_turn_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture
+def jev_off(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HEADROOM_JEV_MODE", "off")
     monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
     reset_compression_store()
+    yield
+    # Cleared on every outcome, pass or fail: a bare call at the end of the
+    # test body would be skipped by the first failing assertion and leak this
+    # test's entries into the process-global store.
+    reset_compression_store()
+
+
+def test_jev_off_leaves_the_boundary_turn_untouched(jev_off: None) -> None:
     config = ProxyConfig(
         optimize=True,
         cache_enabled=False,
@@ -166,6 +175,20 @@ def test_jev_off_leaves_the_boundary_turn_untouched(monkeypatch: pytest.MonkeyPa
     with TestClient(
         create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
     ) as client:
+        # The same turn without the flag, on its own session. Headroom's own
+        # deterministic pass runs either way, so THIS is what an unchanged
+        # boundary turn has to equal -- not the raw input.
+        baseline = client.post(
+            "/v1/compress",
+            json={
+                "model": "gpt-4o",
+                "messages": _messages(),
+                "config": {"mode": "ccr", "session_id": "baseline-session-id"},
+            },
+        )
+        assert baseline.status_code == 200, baseline.text
+        assert "jev" not in baseline.json()
+
         resp = client.post(
             "/v1/compress",
             json={
@@ -179,6 +202,11 @@ def test_jev_off_leaves_the_boundary_turn_untouched(monkeypatch: pytest.MonkeyPa
             },
         )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["jev"]["reason"] == "jev_inactive"
-    assert resp.json()["jev"]["applied"] == 0
-    reset_compression_store()
+    payload = resp.json()
+    assert payload["jev"]["reason"] == "jev_inactive"
+    assert payload["jev"]["applied"] == 0
+    # Reporting `jev_inactive` is not enough: the turn must also BE inactive.
+    # Everything the caller acts on is byte-identical to the non-boundary turn.
+    assert payload["messages"] == baseline.json()["messages"]
+    assert payload["tokens_after"] == baseline.json()["tokens_after"]
+    assert payload["ccr_hashes"] == baseline.json()["ccr_hashes"]
