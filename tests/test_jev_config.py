@@ -133,16 +133,69 @@ def test_repr_never_contains_endpoint_credentials() -> None:
     assert "api_key_configured=True" in shown
 
 
-def test_repr_does_not_raise_on_an_unrenderable_endpoint() -> None:
-    """A ``__repr__`` runs inside exception rendering, so it must never raise.
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        None,
+        b"https://user:pw@api.example.invalid/path?token=abc",
+        12345,
+        object(),
+        ["https://user:pw@api.example.invalid/path?token=abc"],
+    ],
+    ids=["none", "bytes", "int", "object", "list"],
+)
+def test_repr_neither_raises_nor_leaks_on_a_non_str_endpoint(endpoint: object) -> None:
+    """A non-``str`` endpoint is refused, not passed to ``redact_endpoint``.
 
-    It must also never fall back to printing the raw value. A non-``str``
-    endpoint is reachable from an untyped caller constructing ``JevConfig``
-    directly.
+    ``JevConfig`` is constructed in-process by callers and tests, not parsed
+    from a wire payload, so a wrong-typed field needs no attacker. ``bytes`` is
+    the case that matters most: ``urlsplit`` accepts it, so whether the raw
+    value survives depends on CPython internals rather than on this module.
+
+    Both halves are asserted: the repr does not raise, AND no fragment of the
+    credential-bearing value appears in it.
     """
-    shown = repr(JevConfig(mode="shadow", api_key="k", endpoint=None))  # type: ignore[arg-type]
-    assert "JevConfig(" in shown
-    assert "None" not in shown.split("model=")[0]
+    shown = repr(JevConfig(mode="shadow", api_key="k", endpoint=endpoint))  # type: ignore[arg-type]
+    assert shown.startswith("JevConfig(")
+    assert "user:pw" not in shown
+    assert "token=abc" not in shown
+    assert "api.example.invalid" not in shown
+
+
+def test_repr_does_not_raise_when_the_api_key_object_rejects_bool() -> None:
+    """``bool(self.api_key)`` is the last field rendered, so it is guarded.
+
+    An unguarded truthiness test there would discard the entire repr -- and it
+    runs inside exception rendering, where that means losing the diagnostic
+    the repr was called to produce.
+    """
+
+    class HostileKey:
+        def __bool__(self) -> bool:
+            raise RuntimeError("boom")
+
+        def __repr__(self) -> str:  # pragma: no cover - must never be reached
+            return "sk-leaked-through-repr"
+
+    shown = repr(JevConfig(mode="shadow", api_key=HostileKey()))  # type: ignore[arg-type]
+    assert shown.startswith("JevConfig(")
+    assert "sk-leaked-through-repr" not in shown
+    assert "unreadable" in shown
+
+
+def test_repr_falls_back_safely_when_another_field_cannot_be_rendered() -> None:
+    """``!r`` on any field invokes that object's own repr, which can raise.
+
+    The whole assembly is wrapped for that reason. The fallback names the type
+    and nothing else -- a rendering that cannot be proven clean is not printed.
+    """
+
+    class HostileModel(str):
+        def __repr__(self) -> str:
+            raise RuntimeError("boom")
+
+    shown = repr(JevConfig(mode="shadow", api_key="k", model=HostileModel("m")))
+    assert shown == "<JevConfig (unrenderable)>"
 
 
 def test_repr_change_did_not_alter_equality_or_hashing() -> None:

@@ -122,25 +122,55 @@ class JevConfig:
 
         A ``__repr__`` must never raise: it runs inside exception rendering,
         where an exception of its own would replace the diagnostic it was
-        called to produce. :func:`redact_endpoint` already absorbs a malformed
-        URL, so the guard below is for a non-``str`` endpoint reaching an
-        untyped caller's ``JevConfig``, and it falls back to a placeholder --
-        never to the raw value.
+        called to produce. ``JevConfig`` is built in-process by callers and by
+        tests rather than parsed from a wire payload, so a field of the wrong
+        type is reachable without anything adversarial, and three guards keep
+        the invariant honest:
+
+        * The endpoint is handed to :func:`redact_endpoint` **only** when it is
+          an actual ``str``. ``urlsplit`` accepts ``bytes`` and the failure
+          mode then depends on CPython's internals -- today ``urlunsplit``
+          raises ``TypeError`` mixing ``str`` and ``bytes``, which the guard
+          would catch, but that is an accident of the current implementation,
+          not a promise. A non-``str`` is refused outright rather than passed
+          through, so no version of urllib can ever make the raw value the
+          thing that gets printed.
+        * ``bool(self.api_key)`` is guarded, because ``__bool__`` on a
+          caller-supplied object can raise -- and this is the last line of the
+          repr, so an exception there would discard the whole rendering.
+        * The assembly is wrapped as a whole, because ``!r`` on any other field
+          invokes *its* ``__repr__``. The fallback names the type and nothing
+          else: a repr that cannot be proven clean is not worth the leak.
+
+        Every fallback is a placeholder. None of them is the raw value.
         """
         try:
-            endpoint = redact_endpoint(self.endpoint)
-        except Exception:  # noqa: BLE001 - a repr must never raise, nor leak
-            endpoint = "<unrenderable endpoint>"
-        return (
-            f"{type(self).__name__}(mode={self.mode!r}, endpoint={endpoint!r}, "
-            f"model={self.model!r}, timeout_ms={self.timeout_ms!r}, "
-            f"threshold_percent={self.threshold_percent!r}, "
-            f"cooldown_turns={self.cooldown_turns!r}, "
-            f"max_candidate_tokens={self.max_candidate_tokens!r}, "
-            f"max_candidates={self.max_candidates!r}, "
-            f"max_state_tokens={self.max_state_tokens!r}, "
-            f"api_key_configured={bool(self.api_key)!r})"
-        )
+            if isinstance(self.endpoint, str):
+                try:
+                    endpoint = redact_endpoint(self.endpoint)
+                except Exception:  # noqa: BLE001 - never raise, never leak
+                    endpoint = "<unrenderable endpoint>"
+            else:
+                endpoint = "<non-str endpoint>"
+
+            key_configured: object
+            try:
+                key_configured = bool(self.api_key)
+            except Exception:  # noqa: BLE001 - a hostile __bool__ is not fatal
+                key_configured = "<unreadable>"
+
+            return (
+                f"{type(self).__name__}(mode={self.mode!r}, endpoint={endpoint!r}, "
+                f"model={self.model!r}, timeout_ms={self.timeout_ms!r}, "
+                f"threshold_percent={self.threshold_percent!r}, "
+                f"cooldown_turns={self.cooldown_turns!r}, "
+                f"max_candidate_tokens={self.max_candidate_tokens!r}, "
+                f"max_candidates={self.max_candidates!r}, "
+                f"max_state_tokens={self.max_state_tokens!r}, "
+                f"api_key_configured={key_configured!r})"
+            )
+        except Exception:  # noqa: BLE001 - a repr must never raise
+            return f"<{type(self).__name__} (unrenderable)>"
 
     @property
     def enabled(self) -> bool:

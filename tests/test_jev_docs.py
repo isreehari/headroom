@@ -24,6 +24,7 @@ A/B/C suites, not by string matching in a Markdown file.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import inspect
 import re
@@ -88,7 +89,12 @@ def _expected_env_names() -> set[str]:
 
 
 def _table_rows() -> dict[str, tuple[str, str]]:
-    """``{env name: (description cell, default cell)}`` from the section table."""
+    """``{env name: (description cell, default cell)}`` from the section table.
+
+    A duplicate row is an error rather than a silent overwrite: collapsing two
+    rows for one knob would let the caller's "one for one" comparison pass
+    while the table showed two contradictory defaults.
+    """
     rows: dict[str, tuple[str, str]] = {}
     for line in _jev_section().splitlines():
         if not line.startswith("|"):
@@ -98,6 +104,9 @@ def _table_rows() -> dict[str, tuple[str, str]]:
             continue
         match = re.fullmatch(r"`(HEADROOM_JEV_[A-Z_]+)`", cells[0])
         if match:
+            assert match.group(1) not in rows, (
+                f"{match.group(1)} has more than one row in the wiki table; one of them is stale"
+            )
             rows[match.group(1)] = (cells[1], cells[2])
     return rows
 
@@ -265,24 +274,41 @@ def test_the_savings_names_cited_in_the_section_match_jev_snapshot() -> None:
     )
 
 
-def test_the_stats_route_really_composes_jev_snapshot() -> None:
-    """``/stats`` builds its ``jev`` block from ``jev_snapshot()`` + ``redacted()``.
+def test_the_server_still_calls_jev_snapshot_and_the_redacted_config() -> None:
+    """``server.py`` calls both ``jev_snapshot()`` and ``<...>.jev.redacted()``.
 
-    A source-level wiring check on ``server.py``, which is what lets the
-    section talk about these figures as things an operator reads off
-    ``/stats``. It does NOT issue a request; ``tests/test_jev_stats_block.py``
-    exercises the route.
+    Parsed with :mod:`ast`, not matched as text, so it survives reformatting,
+    hoisting the block into a local, or moving it into a helper in the same
+    module -- a drift detector that cries wolf on a legitimate refactor gets
+    ignored, which costs the real coverage.
+
+    **This is deliberately weaker than its predecessor and weaker than its
+    name might suggest.** It proves only that both calls still exist somewhere
+    in ``server.py``. It does NOT prove they reach the ``/stats`` payload, that
+    they land under the ``jev`` key, or that the route serves them --
+    ``tests/test_jev_stats_block.py`` exercises the route end to end and is the
+    real guarantee. What this adds is a fast, local failure when either call is
+    renamed or deleted outright.
     """
-    server_source = (REPO_ROOT / "headroom" / "proxy" / "server.py").read_text(encoding="utf-8")
-    assert re.search(
-        r'"jev":\s*\{\s*\*\*proxy\.metrics\.jev_snapshot\(\),\s*'
-        r'"config":\s*proxy\.config\.jev\.redacted\(\),',
-        server_source,
+    tree = ast.parse((REPO_ROOT / "headroom" / "proxy" / "server.py").read_text(encoding="utf-8"))
+    calls = [
+        node.func
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    assert any(func.attr == "jev_snapshot" for func in calls), (
+        "server.py no longer calls jev_snapshot() anywhere; the wiki's claims "
+        "about the /stats savings figures need rechecking"
+    )
+    assert any(
+        func.attr == "redacted"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "jev"
+        for func in calls
     ), (
-        "the /stats payload no longer builds its 'jev' block from "
-        "jev_snapshot() plus JevConfig.redacted(); the wiki's claims about "
-        "the /stats figures and about the endpoint being redacted there need "
-        "rechecking"
+        "server.py no longer calls <...>.jev.redacted(); the wiki's claim that "
+        "/stats reports the Jev config with the key and endpoint redacted "
+        "needs rechecking"
     )
 
 

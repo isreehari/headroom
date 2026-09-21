@@ -275,7 +275,7 @@ is the `/v1/compress` boundary gate, which rejects a *malformed* opt-in request 
 | `HEADROOM_JEV_MODE` | `off`, `shadow` or `active`. `off`: no other `HEADROOM_JEV_*` variable is read at all. `shadow`: Jev is called and a projection is recorded, but the forwarded request is never modified. `active`: decisions are applied, and only at a declared compaction boundary -- `POST /v1/compress` with `config.jev_compaction_boundary=true` (Track B), or Codex's native WebSocket compaction (Track C). The two are exclusive: `active` does **not** also run the shadow projection. | `off` |
 | `HEADROOM_JEV_API_KEY` | API key. Required whenever the mode is not `off`: `JevConfig.validate()` raises from `ProxyConfig.__post_init__`, so the proxy refuses to start rather than silently no-opping. It travels only in the client's `Authorization` header; it is excluded from the `repr`, from `JevConfig.redacted()`, from the `/stats` payload and from the multi-worker config payload, and is **never logged**. | - |
 | `HEADROOM_JEV_ENDPOINT` | Jev API endpoint. Only its **prefix** is validated (it must start `http://` or `https://`); a typo in the host or path is not caught until the first request fails, which then fails open. Everywhere it is surfaced -- log lines, scrubbed exception text, the `repr`, `/stats` -- it passes through `redact_endpoint()` and is shown as scheme + host + path only, so userinfo (`user:pw@`) and any query string are replaced with `<redacted>`. | `https://api.typesafe.ai/v1/systemone` |
-| `HEADROOM_JEV_MODEL` | Jev model name, passed in the request payload. **Not validated** -- an empty or misspelled value is accepted at startup and shows up as a failed (fail-open) call at request time. | `jev-latest` |
+| `HEADROOM_JEV_MODEL` | Jev model name, passed in the request payload. **Not validated** -- a misspelled name such as `jev-lattest` is accepted at startup and only shows up as a failed (fail-open) call at request time. An unset or empty value falls back to the default, but a value of nothing but whitespace becomes the empty string, which no model matches. | `jev-latest` |
 | `HEADROOM_JEV_TIMEOUT_MS` | Hard bound (>= 1) on the whole Jev round trip, applied by all three tracks. This is added latency on the turns that actually call Jev, so keep it small. | `500` |
 | `HEADROOM_JEV_THRESHOLD_PERCENT` | 1..100. **Shadow mode only** (it is read nowhere else in the codebase): skip the call until post-Headroom tokens reach this percentage of the model's context window. | `80` |
 | `HEADROOM_JEV_COOLDOWN_TURNS` | >= 0. **Shadow mode only**: turns to wait before another call on the same `(session, branch)`. Only turns that reach the cooldown gate count against it. | `5` |
@@ -295,22 +295,35 @@ When the mode is not `off`, Headroom sends the Jev endpoint a request containing
 
 - the **content of the selected tool results** themselves -- an OpenAI Chat
   `role: "tool"` message, a Responses `function_call_output` /
-  `custom_tool_call_output` item, or an Anthropic `tool_result` block -- each
-  truncated to `HEADROOM_JEV_MAX_CANDIDATE_TOKENS` and, in shadow/Track B, further
-  trimmed to fit `HEADROOM_JEV_MAX_STATE_TOKENS`;
+  `custom_tool_call_output` item, or an Anthropic `tool_result` block. How much of
+  each one is sent depends on the track: shadow and Track B send a leading slice
+  bounded by `HEADROOM_JEV_MAX_CANDIDATE_TOKENS`, thinned further if the request
+  would otherwise exceed `HEADROOM_JEV_MAX_STATE_TOKENS`, and mark it
+  `content_truncated_for_view`. Track C sends the candidate whole, up to a fixed
+  20,000 characters -- and if the tool output is larger than
+  `HEADROOM_JEV_MAX_CANDIDATE_TOKENS x 4` bytes, **nothing is sent at all**: the
+  candidate is rejected before the request is built, so no part of an oversized
+  Track C tool result leaves the machine;
 - per-candidate metadata: candidate type, tool call id, estimated token count and the
   SHA-256 of the *full* content, plus -- in shadow and Track B -- the role,
   message/block index, distance from the end of the conversation and byte length;
-- conversation identifiers, none of them anonymized or rewritten by Headroom: the
-  session id this conversation is tracked under (on `/v1/compress` it is the one the
-  caller sent), the provider and upstream model names, the Jev model name, and a
-  branch id whose form differs by track --
-    - shadow: a SHA-256 of the session id and the protected prefix, plus a revision
-      hash over the candidate set,
-    - Track B: the **literal string `compress`** (the sidecar route has no branch
-      concept, so this keeps its turns in their own lane), plus the same revision hash,
-    - Track C: the raw Codex `previous_response_id`, plus the boundary's item count.
-      Track C sends **no revision hash**;
+- conversation identifiers, the provider and upstream model names, and the Jev model
+  name. Headroom does not anonymize the identifiers it forwards, but which identifier
+  each track forwards differs, and Track C's is Headroom's own:
+    - **shadow**: your session id as Headroom tracks it, a branch id that is a SHA-256
+      of that session id and the protected prefix, and a revision hash over the
+      candidate set,
+    - **Track B** (`/v1/compress`): the `config.session_id` **the caller sent**,
+      forwarded unchanged, the literal branch id `compress` (the sidecar route has no
+      branch concept, so this keeps its turns in their own lane), and the same
+      revision hash,
+    - **Track C** (Codex WebSocket): a `uuid4` **minted by Headroom for that
+      WebSocket connection** -- not your conversation id, and not derived from
+      anything the client sent -- plus the raw Codex `previous_response_id` as the
+      branch id and the boundary's item count. Track C sends **no revision hash**.
+      Because that id is per connection, a reconnect produces a new one and Jev
+      cannot correlate the two; the boundary's own replay protection is keyed on
+      `previous_response_id` for exactly that reason;
 - fixed English instructions and the keep/truncate/drop criteria.
 
 Candidates are only ever tool results. In shadow mode and Track B they must also lie
@@ -355,10 +368,16 @@ Two things that sound like the above but are not:
   / `ccr_failed` counters on `/stats` are what make a partial failure visible. Track C
   carries exactly one candidate, so there the distinction does not arise.
 
-Every exit that reaches the Jev hooks records an event on
-`headroom_jev_events_total{event}`, and the aggregate is on `/stats` under `jev` (with
-`config` reported through `JevConfig.redacted()`), so a deployment that silently never
-calls Jev shows up as a counter rather than as an absent log line.
+Each of the gates above records an event on `headroom_jev_events_total{event}` once a
+compaction boundary has actually been recognised, and the aggregate is on `/stats`
+under `jev` (with `config` reported through `JevConfig.redacted()`). The cheap
+pre-boundary exits are deliberately **not** counted: on Track C a frame that is
+disabled, not JSON, not a `response.create`, or simply not a compaction event returns
+silently, because those are the overwhelming majority of frames on a live connection
+and counting them would drown the signal. So the counters answer "what happened at the
+boundaries we saw", not "how many frames went past" -- a deployment where Jev is
+configured but never reaches a boundary shows up as an *absence* of
+`compaction_boundary_detected`, which is itself the diagnostic.
 
 ### Nothing is deleted in active mode
 
