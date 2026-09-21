@@ -6,6 +6,7 @@ import pytest
 
 from headroom.proxy.jev.config import (
     DEFAULT_JEV_ENDPOINT,
+    DEFAULT_JEV_MODEL,
     JevConfig,
     redact_endpoint,
 )
@@ -69,6 +70,145 @@ def test_from_env_shadow_reads_every_knob() -> None:
     assert config.max_candidate_tokens == 4096
     assert config.max_candidates == 8
     assert config.max_state_tokens == 6000
+
+
+def _enabled(**overrides: str) -> dict[str, str]:
+    env = {"HEADROOM_JEV_MODE": "shadow", "HEADROOM_JEV_API_KEY": "sk-test"}
+    env.update(overrides)
+    return env
+
+
+# --------------------------------------------------------------------------
+# HEADROOM_JEV_MODEL: the one knob a whitespace typo used to slip through.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["", " ", "   ", "\t", "\n", " \t\n "])
+def test_a_blank_or_whitespace_only_model_falls_back_to_the_default(raw: str) -> None:
+    """Whitespace must reach the default, not an empty model name.
+
+    The fallback used to be applied BEFORE ``.strip()``, so ``""`` became the
+    default but ``"   "`` was truthy, the ``or`` never fired, and ``.strip()``
+    handed back ``""`` -- an empty model that passed validation and was then
+    rejected on every single turn while the proxy silently failed open. Every
+    numeric knob raises on a malformed value; this was the one that did not.
+    """
+    assert JevConfig.from_env(_enabled(HEADROOM_JEV_MODEL=raw)).model == DEFAULT_JEV_MODEL
+
+
+def test_an_empty_model_is_rejected_by_validate() -> None:
+    """``from_env`` is not the only way in; ``ProxyConfig`` validates directly."""
+    with pytest.raises(ValueError, match="HEADROOM_JEV_MODEL must not be empty"):
+        JevConfig(mode="shadow", api_key="sk-test", model="").validate()
+    with pytest.raises(ValueError, match="HEADROOM_JEV_MODEL must not be empty"):
+        JevConfig(mode="shadow", api_key="sk-test", model="   ").validate()
+
+
+def test_a_surrounding_space_is_stripped_from_a_real_model_name() -> None:
+    assert JevConfig.from_env(_enabled(HEADROOM_JEV_MODEL="  jev-1.2.3 ")).model == "jev-1.2.3"
+
+
+def test_a_malformed_model_still_cannot_stop_an_unconfigured_proxy_booting() -> None:
+    """Mode ``off`` reads nothing, so a whitespace typo is inert."""
+    assert JevConfig.from_env({"HEADROOM_JEV_MODE": "off", "HEADROOM_JEV_MODEL": "   "}) == (
+        JevConfig()
+    )
+
+
+# --------------------------------------------------------------------------
+# HEADROOM_JEV_ENDPOINT: parsed, not merely prefix-matched.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        pytest.param("https://", id="scheme_only"),
+        pytest.param("https:///path", id="empty_authority"),
+        pytest.param("http://", id="http_scheme_only"),
+        pytest.param("https://jev.example:not-a-port/v1", id="non_numeric_port"),
+        pytest.param("https://jev.example:99999/v1", id="port_out_of_range"),
+        pytest.param("https://:8080/v1", id="port_without_host"),
+        pytest.param("https://user:pw@/v1", id="userinfo_without_host"),
+        pytest.param("ftp://jev.example/v1", id="wrong_scheme"),
+        pytest.param("jev.example/v1", id="no_scheme"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_a_well_formed_looking_but_unusable_endpoint_is_rejected_at_startup(
+    endpoint: str,
+) -> None:
+    """A prefix check accepted all of these and then failed open on every turn.
+
+    ``startswith(("http://", "https://"))`` cannot see an empty host or an
+    unparseable port, so the proxy booted happily and every single turn made a
+    doomed request that fell back to "no decision". A silent every-turn failure
+    is the operability trap that justifies parsing the URL instead.
+
+    The failure is a ``ValueError`` -- the only exception
+    ``ProxyConfig.__post_init__`` expects from here -- and the message shows the
+    endpoint only through ``redact_endpoint``.
+    """
+    with pytest.raises(ValueError, match="HEADROOM_JEV_ENDPOINT"):
+        JevConfig(mode="shadow", api_key="sk-test", endpoint=endpoint).validate()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://api.typesafe.ai/v1/systemone",
+        "http://localhost:8080/v1/systemone",
+        "http://127.0.0.1:9/v1",
+        "https://jev.example",
+        "https://user:pw@jev.example/v1/systemone?token=abc",
+        "https://[::1]:8443/v1",
+        # A typo'd but well-formed host is NOT detectable without DNS, and this
+        # validator deliberately makes no network probe: it stays a runtime
+        # fail-open.
+        "https://jev.exmaple.invalid/v1/systemone",
+    ],
+)
+def test_a_well_formed_endpoint_is_accepted(endpoint: str) -> None:
+    JevConfig(mode="shadow", api_key="sk-test", endpoint=endpoint).validate()
+
+
+def test_redact_endpoint_never_raises_on_anything_validate_rejects() -> None:
+    """The rejection message renders the endpoint, so redaction must survive it.
+
+    ``redact_endpoint`` is a logging helper: if it raised on exactly the values
+    the new validation rejects, the startup error would be replaced by an
+    unrelated traceback from inside the error path.
+    """
+    for endpoint in (
+        "https://",
+        "https:///path",
+        "https://jev.example:not-a-port/v1",
+        "https://jev.example:99999/v1",
+        "https://:8080/v1",
+        "https://user:pw@/v1",
+        "ftp://jev.example/v1",
+        "jev.example/v1",
+        "",
+    ):
+        assert isinstance(redact_endpoint(endpoint), str)
+
+
+def test_endpoint_validation_raises_only_value_error() -> None:
+    """``ProxyConfig.__post_init__`` catches nothing else, so nothing else may escape."""
+    for endpoint in ("https://jev.example:not-a-port/v1", "https://", "\x00://x", "http://[oops"):
+        with pytest.raises(ValueError):
+            JevConfig(mode="shadow", api_key="sk-test", endpoint=endpoint).validate()
+
+
+def test_from_env_rejects_an_unusable_endpoint() -> None:
+    with pytest.raises(ValueError, match="HEADROOM_JEV_ENDPOINT"):
+        JevConfig.from_env(_enabled(HEADROOM_JEV_ENDPOINT="https://"))
+
+
+def test_a_malformed_endpoint_still_cannot_stop_an_unconfigured_proxy_booting() -> None:
+    assert JevConfig.from_env(
+        {"HEADROOM_JEV_MODE": "off", "HEADROOM_JEV_ENDPOINT": "https://"}
+    ) == (JevConfig())
 
 
 def test_from_env_shadow_without_key_is_rejected() -> None:

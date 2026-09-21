@@ -40,6 +40,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.proxy.jev.encoding import encode_identity_text
+
 #: Nothing in the last N messages is ever a candidate.
 RECENT_TAIL_EXCLUSION = 6
 
@@ -101,7 +103,15 @@ class JevCandidate:
 
     @property
     def content_sha256(self) -> str:
-        return hashlib.sha256(self.content.encode("utf-8", "replace")).hexdigest()
+        """Content identity: rides on the Jev request and feeds ``fingerprint``.
+
+        Encoded through the package's single injective encoder, never
+        ``errors="replace"``: that collapses the whole lone-surrogate range onto
+        ``b"?"``, so a body that changed only across that class would keep its
+        fingerprint, the revision would not roll, and a decision computed
+        against the OLD conversation would be accepted as current.
+        """
+        return hashlib.sha256(encode_identity_text(self.content)).hexdigest()
 
     @property
     def fingerprint(self) -> str:

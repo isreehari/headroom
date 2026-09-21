@@ -451,27 +451,38 @@ def test_detection_does_not_mutate_the_frame_it_inspects() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_the_module_imports_only_stdlib_and_the_ccr_tool_name() -> None:
+def test_the_module_imports_only_stdlib_and_two_named_constants() -> None:
     """Import isolation, in the form Track B's ``compress_gate`` keeps it.
 
     The relay must be able to import this module on every WS connection without
-    dragging in the ``jev`` package, the rest of the proxy, or any third-party
-    dependency -- ``HEADROOM_JEV_MODE`` is unset by default and an unconfigured
-    proxy must pay nothing.
+    dragging in the rest of the proxy or any third-party dependency --
+    ``HEADROOM_JEV_MODE`` is unset by default and an unconfigured proxy must pay
+    nothing.
 
-    Exactly one crossing is allowed, and only for one name: ``CCR_TOOL_NAME``
-    from ``headroom.ccr``, which Task 22's ``has_recovery_tool`` matches
-    against. It adds no load -- ``headroom.ccr`` is already imported at module
-    level by ``headroom/proxy/server.py`` and
-    ``headroom/proxy/handlers/openai.py``, so it is resident before this module
-    can be reached -- and binding the constant is what stops a renamed recovery
-    tool from silently switching the gate off, which a copied string literal
-    would do. The rule is narrowed to that single name rather than widened to
-    ``headroom``, so the discipline still bites.
+    Exactly TWO crossings are allowed, each narrowed to a single name rather
+    than widened to ``headroom``, so the discipline still bites:
+
+    * ``CCR_TOOL_NAME`` from ``headroom.ccr``, which Task 22's
+      ``has_recovery_tool`` matches against. It adds no load -- ``headroom.ccr``
+      is already imported at module level by ``headroom/proxy/server.py`` and
+      ``headroom/proxy/handlers/openai.py``, so it is resident before this
+      module can be reached -- and binding the constant is what stops a renamed
+      recovery tool from silently switching the gate off, which a copied string
+      literal would do.
+    * ``encode_identity_text`` from ``headroom.proxy.jev.encoding``, the one
+      injective encoder this package hashes caller-controlled text with. That
+      module is a stdlib-only leaf with no imports of its own, so it adds no
+      load either. Binding it is what stops this track's content binding and
+      ``retention_ccr``'s CCR key from drifting onto different encodings -- the
+      exact defect that let ``errors="replace"`` collapse the whole
+      lone-surrogate range onto ``b"?"`` in one of them while the other was
+      already injective.
 
     `hashlib` and `json` joined the stdlib set with Task 21's content-bound
     replacement. Checked structurally on the source so the prose above, which
-    names ``headroom``, ``ccr`` and ``jev``, cannot satisfy or trip it.
+    names ``headroom``, ``ccr`` and ``jev``, cannot satisfy or trip it. The
+    ``encoding`` module's own leaf-ness is asserted separately below, because
+    this test only sees what ``compaction`` names, not what that name pulls in.
     """
     import headroom.proxy.jev.compaction as compaction_module
 
@@ -491,6 +502,12 @@ def test_the_module_imports_only_stdlib_and_the_ccr_tool_name() -> None:
                 )
                 assert all(alias.asname is None for alias in node.names)
                 continue
+            if module == "headroom.proxy.jev.encoding":
+                assert sorted(alias.name for alias in node.names) == ["encode_identity_text"], (
+                    ast.dump(node)
+                )
+                assert all(alias.asname is None for alias in node.names)
+                continue
             imported.add(module.split(".")[0])
     assert imported <= {
         "__future__",
@@ -499,3 +516,23 @@ def test_the_module_imports_only_stdlib_and_the_ccr_tool_name() -> None:
         "json",
         "typing",
     }, imported
+
+
+def test_the_shared_encoder_module_is_a_stdlib_only_leaf() -> None:
+    """The one crossing this track's leaf discipline newly allows costs nothing.
+
+    ``test_the_module_imports_only_stdlib_and_two_named_constants`` sees only
+    the NAME ``compaction`` imports, not what that name transitively pulls in,
+    so the claim that ``headroom.proxy.jev.encoding`` adds no load is made here
+    instead of asserted in prose. Checked structurally, on the source.
+    """
+    import headroom.proxy.jev.encoding as encoding_module
+
+    tree = ast.parse(inspect.getsource(encoding_module))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add("." if node.level else (node.module or "").split(".")[0])
+    assert imported <= {"__future__"}, imported

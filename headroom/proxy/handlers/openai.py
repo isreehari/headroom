@@ -86,7 +86,6 @@ from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.jev.compaction_hook import (
     REASON_DROPPED,
     apply_jev_compaction_boundary,
-    resolve_jev_client,
 )
 from headroom.proxy.jev.compaction_state import JevCompactionRevisionStore
 from headroom.proxy.outcome import RequestOutcome
@@ -7849,7 +7848,7 @@ class OpenAIHandlerMixin:
                 first_msg_raw, _jev_first_reason = await apply_jev_compaction_boundary(
                     first_msg_raw,
                     jev_config=getattr(self.config, "jev", None),
-                    client=resolve_jev_client(self),
+                    proxy=self,
                     session_id=session_id,
                     request_id=request_id,
                     revisions=_JEV_COMPACTION_REVISIONS,
@@ -8559,7 +8558,7 @@ class OpenAIHandlerMixin:
                                     msg, _jev_reason = await apply_jev_compaction_boundary(
                                         msg,
                                         jev_config=getattr(self.config, "jev", None),
-                                        client=resolve_jev_client(self),
+                                        proxy=self,
                                         session_id=session_id,
                                         request_id=request_id,
                                         revisions=_JEV_COMPACTION_REVISIONS,

@@ -71,6 +71,54 @@ def redact_endpoint(url: str) -> str:
     return shown or "<redacted endpoint>"
 
 
+#: The only schemes the Jev client can dial.
+_ENDPOINT_SCHEMES = ("http", "https")
+
+
+def _endpoint_defect(url: object) -> str | None:
+    """Why ``url`` is unusable as the Jev endpoint, or ``None`` when it is fine.
+
+    A prefix check (``startswith(("http://", "https://"))``) accepted
+    ``https://``, ``https:///path`` and a non-numeric port, so the proxy booted
+    and then failed open on *every* turn -- a silent, permanent degradation that
+    looks exactly like "Jev found nothing to drop". Parsing catches those at
+    startup, where an operator sees them once.
+
+    What it deliberately does NOT do is resolve anything. A typo'd but
+    well-formed hostname is not detectable without a network probe, and a
+    startup check that dials the endpoint would turn a transient outage into a
+    proxy that will not boot. That case stays a runtime fail-open.
+
+    Returns a reason rather than raising so the caller owns the exception type:
+    ``ProxyConfig.__post_init__`` expects ``ValueError`` and nothing else, and
+    ``urlsplit``/``.port`` have several ways to raise on their own.
+    """
+    if not isinstance(url, str):
+        return "must be a string"
+    if not url:
+        return "must be set to an http(s) URL"
+    try:
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        hostname = parts.hostname
+        # `.port` parses LAZILY: `urlsplit` accepts "host:not-a-port" happily
+        # and only raises when the port is read. Forcing it here is the whole
+        # point -- otherwise the first read is inside httpx, per request.
+        port = parts.port
+    except ValueError:
+        return "is not a parseable URL"
+    if scheme not in _ENDPOINT_SCHEMES:
+        return "must be an http(s) URL"
+    if not hostname:
+        return "must have a host"
+    if port is not None and not 0 < port < 65536:
+        # Unreachable via `.port` on CPython today (it range-checks and raises),
+        # kept so a future urllib that merely parses the digits cannot let an
+        # impossible port through.
+        return "has a port outside 1..65535"
+    return None
+
+
 def _env_int(src: Mapping[str, str], name: str, default: int, *, minimum: int) -> int:
     raw = src.get(name)
     if raw is None or not str(raw).strip():
@@ -192,11 +240,25 @@ class JevConfig:
             return
         if not self.api_key:
             raise ValueError(f"HEADROOM_JEV_API_KEY is required when HEADROOM_JEV_MODE={self.mode}")
-        if not self.endpoint.startswith(("http://", "https://")):
+        if not str(self.model).strip():
+            # The one knob where a whitespace typo used to pass where every
+            # numeric knob raises: an empty model name is accepted by nothing,
+            # so it would be rejected on every turn while the proxy silently
+            # failed open.
             raise ValueError(
-                "HEADROOM_JEV_ENDPOINT must be an http(s) URL; got "
-                f"{redact_endpoint(self.endpoint)}"
+                f"HEADROOM_JEV_MODEL must not be empty when HEADROOM_JEV_MODE={self.mode}"
             )
+        defect = _endpoint_defect(self.endpoint)
+        if defect is not None:
+            # The endpoint is credential-bearing, so the message shows it only
+            # through `redact_endpoint` -- and only when it is a `str`, since
+            # that helper is the same one used on logging paths.
+            shown = (
+                redact_endpoint(self.endpoint)
+                if isinstance(self.endpoint, str)
+                else f"<{type(self.endpoint).__name__}>"
+            )
+            raise ValueError(f"HEADROOM_JEV_ENDPOINT {defect}; got {shown}")
         if self.timeout_ms < 1:
             raise ValueError(f"HEADROOM_JEV_TIMEOUT_MS must be >= 1; got {self.timeout_ms}")
         if not 1 <= self.threshold_percent <= 100:
@@ -246,7 +308,10 @@ class JevConfig:
             mode=mode,
             api_key=(src.get("HEADROOM_JEV_API_KEY") or "").strip(),
             endpoint=(src.get("HEADROOM_JEV_ENDPOINT") or DEFAULT_JEV_ENDPOINT).strip(),
-            model=(src.get("HEADROOM_JEV_MODEL") or DEFAULT_JEV_MODEL).strip(),
+            # `.strip()` FIRST, then the fallback: applying the fallback first
+            # means "   " is truthy, the `or` never fires, and the strip yields
+            # "" -- an empty model name that no model matches.
+            model=(src.get("HEADROOM_JEV_MODEL") or "").strip() or DEFAULT_JEV_MODEL,
             timeout_ms=_env_int(src, "HEADROOM_JEV_TIMEOUT_MS", DEFAULT_JEV_TIMEOUT_MS, minimum=1),
             threshold_percent=_env_int(
                 src,

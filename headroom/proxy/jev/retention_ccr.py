@@ -31,6 +31,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from headroom.proxy.jev.encoding import encode_identity_text
+
 if TYPE_CHECKING:
     from headroom.cache.compression_store import CompressionStore
 
@@ -67,10 +69,19 @@ def candidate_retention_hash(session_id: str, branch_id: str, content: str) -> s
     ``("a", "b\\0c")`` would hash identically, so two different branches of one
     session could share an entry, and therefore a lease and a TTL. A length
     prefix has no such collision: the parse is unambiguous for every input.
+
+    The ENCODE step has to be injective too, or the length prefix buys nothing.
+    :func:`~headroom.proxy.jev.encoding.encode_identity_text` is the package's
+    single injective encoder and is shared with Track C's candidate binding, so
+    the two cannot drift apart. It is deliberately not ``errors="replace"``,
+    which collapses the whole lone-surrogate range onto ``b"?"`` and would let
+    two distinct candidates of one ``compress`` branch share one entry -- the
+    second overwriting the first's original, both markers then resolving to the
+    second's content.
     """
     digest = hashlib.sha256()
     for part in (_RETENTION_HASH_VERSION, session_id, branch_id, content):
-        encoded = part.encode("utf-8", "replace")
+        encoded = encode_identity_text(part)
         digest.update(f"{len(encoded)}:".encode("ascii"))
         digest.update(encoded)
     return digest.hexdigest()[:24]

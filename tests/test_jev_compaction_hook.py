@@ -126,10 +126,24 @@ def _frame(*, with_tool: bool = True) -> str:
     )
 
 
+class _Proxy:
+    """The one attachment point the orchestrator resolves a client from.
+
+    The orchestrator takes the PROXY, not a client: resolution is a gated step
+    it owns, so an unconfigured proxy pays nothing for the guarded attribute
+    lookups. Tests still speak in terms of a client, so ``_run`` wraps whatever
+    ``client=`` they pass in one of these.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self.jev_client = client
+
+
 async def _run(raw: str, **kwargs: Any) -> tuple[str, str]:
+    client = kwargs.pop("client", _Client())
     defaults: dict[str, Any] = {
         "jev_config": _Config(),
-        "client": _Client(),
+        "proxy": _Proxy(client),
         "session_id": "ws1",
         "request_id": "req1",
         "revisions": JevCompactionRevisionStore(),
@@ -702,6 +716,77 @@ async def test_metrics_name_each_gate() -> None:
         "jev_compaction_missing_recovery_tool"
     )
     assert "compaction_missing_recovery_tool" in metrics.events
+
+
+class _CountingProxy:
+    """Counts how many times the client attachment point is looked at."""
+
+    def __init__(self, client: Any = None) -> None:
+        self.probes = 0
+        self._attached = client
+
+    @property
+    def jev_client(self) -> Any:
+        self.probes += 1
+        return self._attached
+
+
+async def test_the_client_is_not_resolved_until_a_boundary_is_really_in_hand() -> None:
+    """The orchestrator owns the gating, so resolution happens INSIDE it.
+
+    Python evaluates a call's arguments before the callee runs, so
+    ``client=resolve_jev_client(self)`` at the WS call site made every single
+    ``response.create`` frame pay for the guarded proxy/client lookups -- even
+    with ``HEADROOM_JEV_MODE`` unset, where the orchestrator's first act is to
+    return on ``jev_compaction_disabled``.
+
+    Taking the proxy and resolving after the gates keeps the single-owner
+    contract intact: no second gate at the call site, and nothing is looked up
+    until a real boundary with a usable candidate is in hand.
+    """
+    boundary = _frame()
+
+    for label, kwargs in (
+        ("mode off", {"jev_config": _Config(mode="off"), "raw": boundary}),
+        ("not json", {"raw": "not json at all"}),
+        ("not a create frame", {"raw": json.dumps({"type": "response.cancel"})}),
+        ("no boundary", {"raw": json.dumps({"type": "response.create", "response": {}})}),
+        ("no session identity", {"raw": boundary, "session_id": ""}),
+        ("no recovery tool", {"raw": _frame(with_tool=False)}),
+        ("oversized candidate", {"raw": boundary, "jev_config": _Config(max_candidate_tokens=1)}),
+    ):
+        proxy = _CountingProxy(_Client())
+        raw = kwargs.pop("raw")
+        await _run(raw, proxy=proxy, **kwargs)
+        assert proxy.probes == 0, f"{label}: the proxy must not be probed at all"
+
+    # ...and on the path that really needs one, it is resolved exactly once.
+    proxy = _CountingProxy(_Client())
+    assert (await _run(boundary, proxy=proxy))[1] == "jev_compaction_dropped"
+    assert proxy.probes == 1
+
+
+async def test_a_proxy_with_no_client_attached_is_the_no_client_gate() -> None:
+    """Resolution moving inside must not change the reason vocabulary."""
+    proxy = _CountingProxy(None)
+    assert await _run(_frame(), proxy=proxy) == (_frame(), "jev_compaction_no_client")
+    assert proxy.probes == 1
+
+
+async def test_a_hostile_proxy_is_a_keep_rather_than_a_raise() -> None:
+    """``resolve_jev_client`` is guarded, and it is now called on the live path."""
+
+    class _Hostile:
+        @property
+        def jev_client(self) -> Any:
+            raise RuntimeError("attribute blew up")
+
+        @property
+        def jev_shadow(self) -> Any:
+            raise RuntimeError("attribute blew up")
+
+    raw = _frame()
+    assert await _run(raw, proxy=_Hostile()) == (raw, "jev_compaction_no_client")
 
 
 def test_resolve_jev_client_probes_both_attachment_points() -> None:

@@ -12,6 +12,7 @@ is exercised once, here.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -80,6 +81,79 @@ def test_hash_separator_cannot_be_forged_from_inside_a_field() -> None:
         "a", "b\x00c", "p"
     )
     assert candidate_retention_hash("s", "b", "1:x") != candidate_retention_hash("s", "b1", ":x")
+
+
+#: A lone surrogate, spelled the way a client can actually deliver one: JSON
+#: permits the escape and ``json.loads`` decodes it without complaint, so this is
+#: reachable content, not a synthetic string only a test can build.
+_LONE_SURROGATE = json.loads('"\\ud800"')
+_OTHER_LONE_SURROGATE = json.loads('"\\udc00"')
+
+
+def test_hash_encoding_is_injective_over_lone_surrogates() -> None:
+    """The encode step must not undo the length prefix's collision-freedom.
+
+    ``errors="replace"`` collapses EVERY unencodable scalar onto the single
+    byte ``b"?"``, so the whole lone-surrogate range hashes to whatever ``"?"``
+    hashes to. The length prefix above is carefully injective and this would
+    reintroduce collisions one line later.
+
+    All three fields are checked, because all three are caller-controlled: the
+    session id comes off a client header and the branch id off a client-supplied
+    ``previous_response_id`` on Track C.
+    """
+    assert candidate_retention_hash("s1", "compress", _LONE_SURROGATE) != (
+        candidate_retention_hash("s1", "compress", "?")
+    )
+    assert candidate_retention_hash("s1", "compress", _LONE_SURROGATE) != (
+        candidate_retention_hash("s1", "compress", _OTHER_LONE_SURROGATE)
+    )
+    assert candidate_retention_hash(_LONE_SURROGATE, "compress", "p") != (
+        candidate_retention_hash("?", "compress", "p")
+    )
+    assert candidate_retention_hash("s1", _LONE_SURROGATE, "p") != (
+        candidate_retention_hash("s1", "?", "p")
+    )
+
+
+def test_two_colliding_candidates_on_one_branch_keep_their_own_originals() -> None:
+    """The end-to-end consequence of a non-injective hash, on Track B's branch.
+
+    Track B stages EVERY candidate of a boundary turn under the single literal
+    branch id ``compress``, so two candidates that hash alike share one CCR
+    entry: the second ``store()`` overwrites the first original and both markers
+    then resolve to the second candidate's content. The caller gets plausible
+    but WRONG content back from ``/v1/retrieve``, which is precisely the failure
+    the write -> acknowledge -> lease sequence exists to prevent.
+    """
+    store = _store()
+    first, second = _LONE_SURROGATE, "?"
+
+    def _stage_one(candidate_id: str, content: str) -> RetentionLease | None:
+        return stage_retention(
+            store,
+            candidate_id=candidate_id,
+            session_id="s1",
+            branch_id="compress",
+            content=content,
+            tool_name="get_items",
+            tool_call_id=candidate_id,
+            original_tokens=4096,
+        )
+
+    lease_a = _stage_one("cand_0000", first)
+    lease_b = _stage_one("cand_0001", second)
+    assert lease_a is not None and lease_b is not None
+    assert lease_a.hash_key != lease_b.hash_key, (
+        "two distinct candidates on one branch must not share a CCR entry"
+    )
+    assert lease_a.marker != lease_b.marker
+
+    # Each marker resolves to ITS OWN original -- the property that matters.
+    entry_a = store.retrieve(lease_a.hash_key)
+    entry_b = store.retrieve(lease_b.hash_key)
+    assert entry_a is not None and entry_a.original_content == first
+    assert entry_b is not None and entry_b.original_content == second
 
 
 def test_hash_is_accepted_as_an_explicit_store_key() -> None:

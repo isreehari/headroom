@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.ccr import CCR_TOOL_NAME
+from headroom.proxy.jev.encoding import encode_identity_text
 
 COMPACTION_TRIGGER_ITEM_TYPE = "compaction_trigger"
 
@@ -198,36 +199,15 @@ def detect_compaction_boundary(inner: Any) -> JevCompactionBoundary | None:
 _CANDIDATE_TEXT_FIELDS = ("output", "content")
 
 
-def _encode_candidate_text(text: str) -> bytes:
-    """Encode a candidate body for the content binding -- injectively.
-
-    The ONE place candidate text becomes bytes: the hash, the byte ceiling and
-    the re-hash at replacement all go through here, so the three can never
-    disagree about what a body weighs or what it hashes to.
-
-    ``errors="surrogatepass"``, never ``"replace"``. ``replace`` is lossy and
-    not injective: it collapses every unencodable scalar onto the single byte
-    ``b"?"``, so a body of ``"\\ud800"`` and a body of ``"?"`` produce the same
-    ``content_sha256``. That is client-reachable -- ``json.loads`` accepts a
-    lone surrogate escape happily -- and it would let ``replace_candidate_output``
-    write its marker over content that is NOT what was staged in CCR, which is
-    exactly the irrecoverable data loss the binding exists to prevent.
-
-    ``surrogatepass`` gives each surrogate its own three-byte sequence, so
-    distinct strings stay distinct. It is total over ``str`` -- the surrogate
-    range is the only thing UTF-8 cannot encode strictly, and this handler
-    covers precisely that range -- so it never raises and never costs a
-    candidate its retention. Rejecting lone surrogates instead would also be
-    safe, but it would trade the savings away to buy a property this handler
-    gives for free.
-
-    Track B's ``_canonical_root`` meets the same lone-surrogate family with
-    ``ensure_ascii=True``; that works there because its input is always a
-    structure it serializes itself. Here the body may be a raw ``str`` that no
-    ``json.dumps`` flag can reach, so the fix belongs at the encode step and
-    then covers both the string and the structured path.
-    """
-    return text.encode("utf-8", "surrogatepass")
+#: The ONE place candidate text becomes bytes on this track: the hash, the byte
+#: ceiling and the re-hash at replacement all go through it, so the three can
+#: never disagree about what a body weighs or what it hashes to. It is the
+#: package-wide injective encoder rather than a local copy -- ``retention_ccr``
+#: hashes the same class of caller-controlled text and the two must not drift.
+#: See :mod:`headroom.proxy.jev.encoding` for why ``errors="replace"`` here
+#: would let ``replace_candidate_output`` write its marker over content that is
+#: NOT what was staged in CCR.
+_encode_candidate_text = encode_identity_text
 
 
 @dataclass(frozen=True)

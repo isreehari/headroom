@@ -274,8 +274,8 @@ is the `/v1/compress` boundary gate, which rejects a *malformed* opt-in request 
 |----------|-------------|---------|
 | `HEADROOM_JEV_MODE` | `off`, `shadow` or `active`. `off`: no other `HEADROOM_JEV_*` variable is read at all. `shadow`: Jev is called and a projection is recorded, but the forwarded request is never modified. `active`: decisions are applied, and only at a declared compaction boundary -- `POST /v1/compress` with `config.jev_compaction_boundary=true` (Track B), or Codex's native WebSocket compaction (Track C). The two are exclusive: `active` does **not** also run the shadow projection. | `off` |
 | `HEADROOM_JEV_API_KEY` | API key. Required whenever the mode is not `off`: `JevConfig.validate()` raises from `ProxyConfig.__post_init__`, so the proxy refuses to start rather than silently no-opping. It travels only in the client's `Authorization` header; it is excluded from the `repr`, from `JevConfig.redacted()`, from the `/stats` payload and from the multi-worker config payload, and is **never logged**. | - |
-| `HEADROOM_JEV_ENDPOINT` | Jev API endpoint. Only its **prefix** is validated (it must start `http://` or `https://`); a typo in the host or path is not caught until the first request fails, which then fails open. Everywhere it is surfaced -- log lines, scrubbed exception text, the `repr`, `/stats` -- it passes through `redact_endpoint()` and is shown as scheme + host + path only, so userinfo (`user:pw@`) and any query string are replaced with `<redacted>`. | `https://api.typesafe.ai/v1/systemone` |
-| `HEADROOM_JEV_MODEL` | Jev model name, passed in the request payload. **Not validated** -- a misspelled name such as `jev-lattest` is accepted at startup and only shows up as a failed (fail-open) call at request time. An unset or empty value falls back to the default, but a value of nothing but whitespace becomes the empty string, which no model matches. | `jev-latest` |
+| `HEADROOM_JEV_ENDPOINT` | Jev API endpoint. **Parsed** at startup, not merely prefix-matched: it must have an `http`/`https` scheme, a non-empty host, and a port that parses (so `https://`, `https:///path` and `https://host:not-a-port/v1` are all rejected before the proxy boots). Nothing is resolved or dialled -- a typo'd but well-formed host such as `https://jev.exmaple.invalid/v1` is not detectable without a network probe and stays a fail-open failure at request time. Everywhere it is surfaced -- log lines, scrubbed exception text, the `repr`, `/stats`, and the startup error above -- it passes through `redact_endpoint()` and is shown as scheme + host + path only, so userinfo (`user:pw@`) and any query string are replaced with `<redacted>`. | `https://api.typesafe.ai/v1/systemone` |
+| `HEADROOM_JEV_MODEL` | Jev model name, passed in the request payload. The **name is not checked** -- a misspelled model such as `jev-lattest` is accepted at startup and only shows up as a failed (fail-open) call at request time. It is required to be non-empty, though: an unset, empty or whitespace-only value falls back to the default rather than becoming the empty string, and an explicitly empty model fails startup. | `jev-latest` |
 | `HEADROOM_JEV_TIMEOUT_MS` | Hard bound (>= 1) on the whole Jev round trip, applied by all three tracks. This is added latency on the turns that actually call Jev, so keep it small. | `500` |
 | `HEADROOM_JEV_THRESHOLD_PERCENT` | 1..100. **Shadow mode only** (it is read nowhere else in the codebase): skip the call until post-Headroom tokens reach this percentage of the model's context window. | `80` |
 | `HEADROOM_JEV_COOLDOWN_TURNS` | >= 0. **Shadow mode only**: turns to wait before another call on the same `(session, branch)`. Only turns that reach the cooldown gate count against it. | `5` |
@@ -283,11 +283,13 @@ is the `/v1/compress` boundary gate, which rejects a *malformed* opt-in request 
 | `HEADROOM_JEV_MAX_CANDIDATES` | >= 1. Maximum candidates selected per call, oldest first. Applies in shadow mode and to Track B; Track C's boundary carries exactly one candidate, so it is not used there. | `12` |
 | `HEADROOM_JEV_MAX_STATE_TOKENS` | >= 1. Ceiling on the **measured** serialized request, in shadow mode and Track B. Jev rejects an oversized request outright -- the whole call is lost, not just the overflow -- so the request is trimmed (candidates dropped, then views thinned) until it really fits. Raise it together with `HEADROOM_JEV_MAX_CANDIDATES` if you want a bigger request at a boundary. Not used by Track C. | `8000` |
 
-`HEADROOM_JEV_MODE` is always validated. The numeric knobs and the endpoint *prefix*
-are validated at startup only when the mode is not `off`, and an out-of-range number
-fails the proxy's configuration check rather than being clamped. Nothing validates
-`HEADROOM_JEV_MODEL`, and nothing validates the endpoint beyond its scheme -- a wrong
-value in either is a fail-open call at request time, not a startup error.
+`HEADROOM_JEV_MODE` is always validated. The numeric knobs, the endpoint's *shape*
+and the model's non-emptiness are validated at startup only when the mode is not
+`off`, and an out-of-range number fails the proxy's configuration check rather than
+being clamped. What startup cannot check is whether either value is *correct*: a
+misspelled model name, or a well-formed endpoint pointing at the wrong host, is a
+fail-open call at request time, not a startup error. Nothing here performs DNS
+resolution or any network probe.
 
 ### What leaves this machine
 

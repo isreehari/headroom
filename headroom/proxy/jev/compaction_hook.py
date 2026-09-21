@@ -117,6 +117,10 @@ JEV_COMPACTION_REASONS = frozenset(
 def resolve_jev_client(proxy: Any) -> Any | None:
     """Find Track A's Jev client on the proxy, or None (which means keep).
 
+    Called by :func:`apply_jev_compaction_boundary` itself, from behind its
+    gates -- never in a caller's argument list, where it would run on every
+    ``response.create`` frame before the mode check could decline.
+
     Track A wires ``HeadroomProxy.jev_shadow: JevShadowRunner`` (Task 8) and
     that runner constructs ``JevClient(config.jev)`` unconditionally in its
     ``__init__``, keeps it on ``_client``, and closes it from
@@ -241,7 +245,7 @@ async def apply_jev_compaction_boundary(
     raw_msg: str,
     *,
     jev_config: Any,
-    client: Any | None,
+    proxy: Any,
     session_id: str,
     request_id: str,
     revisions: JevCompactionRevisionStore,
@@ -338,6 +342,21 @@ async def apply_jev_compaction_boundary(
             )
             return raw_msg, REASON_NO_CANDIDATE
 
+        # Resolution happens HERE, not at the call site. The WS relay calls this
+        # coroutine for every `response.create` frame, and Python evaluates a
+        # call's arguments before the callee runs -- so `client=resolve_jev_client(self)`
+        # in the argument list made every create frame pay for the guarded
+        # proxy/client attribute lookups, including with `HEADROOM_JEV_MODE`
+        # unset, where the very first thing below is a return. Taking the proxy
+        # and resolving at the point of use keeps this function the single
+        # owner of all gating: the alternative -- a `if mode == "active"` guard
+        # around the resolution at both call sites -- is a second gate, in two
+        # copies, that can disagree with this one.
+        #
+        # Placed after the candidate gate rather than immediately after the
+        # mode check, because that is the latest point at which the answer is
+        # needed and the gates above are strictly cheaper.
+        client = resolve_jev_client(proxy)
         if client is None:
             _record_jev_event(metrics, "compaction_no_client")
             logger.info(

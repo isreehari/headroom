@@ -3,6 +3,7 @@ recent tail, outside the frozen prefix, bounded in number."""
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -107,6 +108,27 @@ def test_fingerprint_tracks_content() -> None:
     c = JevCandidate("cand_0000", 1, None, "tool_result", "tool", "c", "other", 1)
     assert a.fingerprint == b.fingerprint
     assert a.fingerprint != c.fingerprint
+
+
+def test_content_sha256_is_injective_over_lone_surrogates() -> None:
+    """``content_sha256`` is identity, so its encode step must not be lossy.
+
+    It is the candidate's content identity on two paths: it rides on the Jev
+    request payload, and it is part of ``fingerprint``, which is what
+    ``revision_for`` hashes into the staleness check. ``errors="replace"``
+    collapses the whole lone-surrogate range onto ``b"?"``, so a candidate whose
+    body changed only across that class would keep its fingerprint, the revision
+    would not roll, and a response computed against the OLD conversation would
+    be accepted as current.
+
+    ``json.loads`` accepts a lone surrogate escape, so this content is
+    client-reachable rather than synthetic.
+    """
+    surrogate = json.loads('"\\ud800"')
+    a = JevCandidate("cand_0000", 1, None, "tool_result", "tool", "c", surrogate, 1)
+    b = JevCandidate("cand_0000", 1, None, "tool_result", "tool", "c", "?", 1)
+    assert a.content_sha256 != b.content_sha256
+    assert a.fingerprint != b.fingerprint
 
 
 def test_count_messages_corrected_prices_responses_output_payloads() -> None:

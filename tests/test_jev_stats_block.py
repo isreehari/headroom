@@ -600,10 +600,23 @@ def _compaction_frame() -> str:
     )
 
 
+class _CompactionProxy:
+    """The attachment point the orchestrator resolves a client from itself.
+
+    Track C's orchestrator takes the PROXY rather than a resolved client, so
+    that the guarded lookups happen behind its own gates instead of in the WS
+    call site's argument list. These tests still speak in terms of a client.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self.jev_client = client
+
+
 async def _run_compaction(metrics: PrometheusMetrics, **kwargs: Any) -> tuple[str, str]:
+    client = kwargs.pop("client", _CompactionClient())
     defaults: dict[str, Any] = {
         "jev_config": _CompactionConfig(),
-        "client": _CompactionClient(),
+        "proxy": _CompactionProxy(client),
         "session_id": "ws1",
         "request_id": "req1",
         "revisions": JevCompactionRevisionStore(),

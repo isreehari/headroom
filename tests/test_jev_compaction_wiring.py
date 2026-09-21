@@ -312,9 +312,32 @@ def test_relay_module_imports_the_hook_from_the_orchestrator() -> None:
         "the relay must import Track C's orchestrator at module scope, "
         "not lazily inside the request path"
     )
-    assert {HOOK, "resolve_jev_client"} <= module_level["headroom.proxy.jev.compaction_hook"]
+    assert HOOK in module_level["headroom.proxy.jev.compaction_hook"]
     assert "JevCompactionRevisionStore" in module_level.get(
         "headroom.proxy.jev.compaction_state", set()
+    )
+
+
+def test_neither_call_site_resolves_the_jev_client_itself() -> None:
+    """STRUCTURAL. Client resolution belongs to the orchestrator, not the relay.
+
+    Python evaluates arguments before the callee, so
+    ``client=resolve_jev_client(self)`` made every ``response.create`` frame pay
+    for the guarded proxy/client lookups even with Jev off -- the orchestrator's
+    mode check cannot run early enough to prevent that, because it has not been
+    entered yet. The orchestrator takes ``proxy=self`` and resolves after its
+    gates instead, which keeps it the single owner of all gating; a resolution
+    hoisted back to a call site would also be a second gate there.
+
+    Checked over the WHOLE handler module, in every reference form, so an
+    ``import`` that survived, an attribute lookup or a ``getattr`` string all
+    fail it.
+    """
+    tree = _module()
+    offending = [ast.unparse(node) for node in _references_in(tree, "resolve_jev_client")]
+    assert not offending, (
+        f"{OPENAI_HANDLER.name} still names resolve_jev_client ({offending}): "
+        "the orchestrator resolves the client itself, after its mode check"
     )
 
 
@@ -422,7 +445,9 @@ def test_hook_call_passes_the_session_identity_config_and_revisions() -> None:
     call = _sole_hook_call(_relay_function(_module()))
     keywords = {kw.arg: _normalized(kw.value) for kw in call.keywords if kw.arg}
     assert keywords.get("jev_config") == "getattr(self.config, 'jev', None)"
-    assert keywords.get("client") == "resolve_jev_client(self)"
+    # The PROXY, not a resolved client: resolution is a gated step the
+    # orchestrator owns (see `test_neither_call_site_resolves_the_jev_client_itself`).
+    assert keywords.get("proxy") == "self"
     assert keywords.get("session_id") == "session_id"
     assert keywords.get("request_id") == "request_id"
     assert keywords.get("revisions") == STORE
@@ -848,6 +873,10 @@ def _spy(seen: list[str], returns: str) -> Callable[..., Awaitable[tuple[str, st
     async def _hook(raw_msg: str, **kwargs: Any) -> tuple[str, str]:
         seen.append(raw_msg)
         assert kwargs["jev_config"] is None
+        # The handler itself, so the orchestrator can resolve a client after
+        # its own mode check rather than the call site paying for it per frame.
+        assert kwargs["proxy"] is not None
+        assert hasattr(kwargs["proxy"], "config")
         assert kwargs["session_id"]
         assert kwargs["request_id"]
         assert kwargs["revisions"] is openai_module._JEV_COMPACTION_REVISIONS

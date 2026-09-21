@@ -39,6 +39,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 from headroom.proxy.jev.candidates import JevCandidate
+from headroom.proxy.jev.encoding import encode_identity_text
 
 #: Floor for the per-candidate content bound. Below this a candidate's view is
 #: too thin for a retention decision to mean anything.
@@ -105,6 +106,11 @@ def build_retention_state(
     ``max_candidate_tokens``. ``estimated_tokens``, ``content_bytes`` and
     ``content_sha256`` always describe the *whole* candidate, and
     ``content_truncated_for_view`` says whether the two differ.
+
+    ``content_bytes`` is a measurement rather than an identity, but it goes
+    through the same :func:`~headroom.proxy.jev.encoding.encode_identity_text`
+    the hash beside it uses: one string encoded two different ways one line
+    apart is how the two drift.
     """
     max_chars = max(1, max_candidate_tokens) * _CHARS_PER_TOKEN
     return {
@@ -129,7 +135,7 @@ def build_retention_state(
                 "block_index": cand.block_index,
                 "order_from_end": total_messages - cand.message_index,
                 "estimated_tokens": cand.est_tokens,
-                "content_bytes": len(cand.content.encode("utf-8", "replace")),
+                "content_bytes": len(encode_identity_text(cand.content)),
                 "content_sha256": cand.content_sha256,
                 "content_truncated_for_view": len(cand.content) > max_chars,
                 "content": cand.content[:max_chars],
