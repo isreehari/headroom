@@ -199,6 +199,18 @@ class JevShadowRunner:
         self._inflight: set[tuple[str, str]] = set()
 
     @property
+    def config(self) -> JevConfig:
+        """The settings this runner was built with.
+
+        Public because ``hook.py`` has to scrub its own fail-open error text
+        against the same endpoint and key, and the runner is the only object
+        the handler-facing adapter is given. ``JevConfig`` is frozen and its
+        ``api_key`` field has ``repr=False``, so handing it out exposes
+        nothing a log line would print.
+        """
+        return self._config
+
+    @property
     def enabled(self) -> bool:
         return self._config.is_shadow
 
