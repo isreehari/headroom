@@ -16,10 +16,10 @@ is the same code shadow mode runs.
 Two error policies, deliberately different:
 
 * **A Jev answer that failed** is not an error of ours. ``JevClient.decide``
-  never raises and always returns a fully populated ``decisions`` map; an HTTP
-  failure, a timeout or an unparseable body simply arrives as ``keep`` for
-  every candidate with ``JevAnswer.error`` set. That error is reported on
-  :class:`JevActiveDecision.error` and the turn proceeds, having moved nothing.
+  never raises; an HTTP failure, a timeout or an unparseable body arrives as
+  ``JevAnswer.error``. Such an answer is reported on
+  :class:`JevActiveDecision.error`, every candidate stays ``keep``, and the
+  turn proceeds having moved nothing.
 * **A broken tokenizer, a failed tokenizer lookup or a selection failure
   propagates.** Task 16's orchestrator is the single fail-open guard for the
   active path and records ``active_fail_open``; swallowing the exception here
@@ -174,14 +174,21 @@ async def decide_active_retention(
         candidate_ids=candidate_ids,
     )
 
-    # Fail open to keep: an id Jev did not answer for, answered unparseably,
-    # or answered with a word outside the decision vocabulary is never a
-    # licence to remove content. ``JevClient`` already guarantees exactly this
-    # for the ids it was given; re-deriving it keeps the guarantee a property
-    # of this function rather than of whichever client was injected.
-    for cid in candidate_ids:
-        choice = answer.decisions.get(cid)
-        decisions[cid] = choice if choice in JEV_DECISIONS else "keep"
+    # Fail open to keep, enforced here rather than trusted from the client:
+    #
+    # * A failed call moves nothing at all. ``JevAnswer.ok`` is ``error is
+    #   None``, so that is the test used; a call that reports an error has no
+    #   usable answer, whatever it also put in ``decisions``.
+    # * Otherwise an id Jev did not answer for, answered unparseably, or
+    #   answered with a word outside the decision vocabulary stays ``keep``.
+    #
+    # ``JevClient`` already guarantees both, but ``client`` is injected and
+    # these decisions are what later steps act on to remove content, so the
+    # guarantee is a property of this function, not of the client it was given.
+    if answer.error is None:
+        for cid in candidate_ids:
+            choice = answer.decisions.get(cid)
+            decisions[cid] = choice if choice in JEV_DECISIONS else "keep"
 
     return JevActiveDecision(
         candidates=candidates,
