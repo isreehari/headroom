@@ -159,15 +159,16 @@ forwarded.
 }
 ```
 
-`jev_compaction_boundary` is optional and defaults to false; omitting it (or
-sending it as `false`) leaves the request exactly as it is today. Sending it as
-`true` is what pulls the other two fields in: `mode` must be `"ccr"`, because
-the replacement is a CCR marker and the other modes emit no markers and write
-nothing to the CCR store, and `session_id` must be a non-empty string, because
-every retained original is bound to `(session_id, branch_id, candidate hash)`.
-A boundary turn missing either of those is a 400, as is a
-`jev_compaction_boundary` that is anything other than JSON `true` or `false` —
-`1` and `"true"` are rejected rather than read as consent to drop tool output.
+`jev_compaction_boundary` is optional and defaults to false. Three values mean
+"no boundary declared" and leave the request exactly as it is today: the field
+absent, `false`, or `null` — `null` is accepted because a serializer emitting an
+unset optional must not be read as consent. Sending `true` is what pulls the
+other two fields in: `mode` must be `"ccr"`, because the replacement is a CCR
+marker and the other modes emit no markers and write nothing to the CCR store,
+and `session_id` must be a non-empty string, because every retained original is
+bound to `(session_id, branch_id, candidate hash)`. A boundary turn missing
+either of those is a 400. So is any OTHER value in the flag's slot — `1`,
+`"true"` and `[]` are rejected rather than read as consent to drop tool output.
 Those checks run on every request, so a malformed boundary is a 400 even on a
 proxy with Jev switched off.
 
