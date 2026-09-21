@@ -397,7 +397,7 @@ async def test_the_fail_open_error_and_log_are_scrubbed_of_credentials(caplog) -
         raise RuntimeError(f"boom {config.endpoint} {config.api_key}")
 
     runner = JevShadowRunner(config, client=FakeClient(), metrics=FakeMetrics())
-    with caplog.at_level(logging.WARNING, logger="headroom.proxy.jev.shadow"):
+    with caplog.at_level(logging.DEBUG, logger="headroom.proxy.jev.shadow"):
         result = await _run(runner, count_text=boom)
 
     assert result.reason == "fail_open"
@@ -405,7 +405,13 @@ async def test_the_fail_open_error_and_log_are_scrubbed_of_credentials(caplog) -
     assert "RuntimeError" in result.error
     for secret in (config.api_key, "token=leaky", "user:pw"):
         assert secret not in result.error
-        assert all(secret not in record.getMessage() for record in caplog.records)
+        for record in caplog.records:
+            assert secret not in record.getMessage()
+            # `exc_info=True` would have the formatter append the ORIGINAL
+            # traceback, whose last line is the unscrubbed `str(exc)`.
+            assert record.exc_info is None
+            assert secret not in (record.exc_text or "")
+            assert secret not in str(record.exc_info)
     assert "jev.example.com" in result.error  # still diagnosable
 
 

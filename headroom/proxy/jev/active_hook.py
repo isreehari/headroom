@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -66,6 +67,10 @@ logger = logging.getLogger(__name__)
 #: Same bound the client, the shadow runner and the shadow hook put on an error
 #: string before it reaches a log line.
 _MAX_ERROR_CHARS = 400
+
+#: Bound on the scrubbed traceback that replaces ``exc_info=True`` on the
+#: fail-open path. Wider than an error string because it has frames in it.
+_MAX_TRACEBACK_CHARS = 4000
 
 
 @dataclass(frozen=True)
@@ -116,8 +121,15 @@ def _active_config(proxy: Any) -> JevConfig | None:
         config = getattr(getattr(proxy, "config", None), "jev", None)
         if config is None or getattr(config, "mode", "off") != "active":
             return None
-    except Exception:  # noqa: BLE001 - an exotic config object is a no-op, not a 500
-        logger.warning("jev active retention: unreadable proxy config; skipping", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - an exotic config object is a no-op, not a 500
+        # No `exc_info`: there is no config to scrub the traceback against
+        # here, and a property raising with the endpoint or key in its message
+        # would then be logged verbatim. The type name is enough to diagnose a
+        # malformed proxy object.
+        logger.warning(
+            "jev active retention: unreadable proxy config (%s); skipping",
+            type(exc).__name__,
+        )
         return None
     return config  # type: ignore[no-any-return]
 
@@ -134,6 +146,24 @@ def _detail(exc: BaseException, config: JevConfig) -> str:
     """
     try:
         return scrub_secrets(f"{type(exc).__name__}: {exc}", config)[:_MAX_ERROR_CHARS]
+    except Exception:  # noqa: BLE001 - never trade a leak for a nicer log line
+        return type(exc).__name__
+
+
+def _trace(exc: BaseException, config: JevConfig) -> str:
+    """The traceback, scrubbed, for a DEBUG line.
+
+    ``logger.warning(..., exc_info=True)`` cannot be used anywhere on this
+    path: the formatter renders the ORIGINAL exception, so the raw ``str(exc)``
+    (and each chained ``__cause__``) lands in the log unscrubbed. Rendering the
+    traceback ourselves keeps the one invariant this branch holds -- every
+    exception text reaching a log goes through ``scrub_secrets`` first. The
+    TAIL is kept because that is where the frames closest to the failure, and
+    the exception line itself, live.
+    """
+    try:
+        text = "".join(traceback.format_exception(exc))
+        return scrub_secrets(text, config)[-_MAX_TRACEBACK_CHARS:]
     except Exception:  # noqa: BLE001 - never trade a leak for a nicer log line
         return type(exc).__name__
 
@@ -303,11 +333,17 @@ async def run_jev_active_retention(
         # Anything already staged is simply not used: the conversation the
         # caller forwards is its own untouched list, and the orphaned CCR
         # entries expire with their lease. Losing a saving is the cheap side.
+        # No `exc_info=True`: the logging formatter appends the ORIGINAL
+        # traceback, whose last line is the raw `str(exc)` (and every chained
+        # `__cause__` message with it), which would defeat `_detail`'s
+        # scrubbing for exactly the exceptions that carry the endpoint or the
+        # key. The scrubbed traceback goes to DEBUG instead.
         logger.warning(
             "jev active retention failed open (%s); forwarding Headroom's "
             "compressed output unchanged",
             _detail(exc, config),
-            exc_info=True,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("jev active retention traceback: %s", _trace(exc, config))
         _record(proxy, "active_fail_open")
         return _unchanged("fail_open")

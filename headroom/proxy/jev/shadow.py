@@ -279,8 +279,13 @@ class JevShadowRunner:
             # scrubber the client's error paths use runs here too. Scrub
             # first, then truncate -- a key straddling the cut would otherwise
             # survive as a prefix.
+            #
+            # No `exc_info=True`: the formatter would append the ORIGINAL
+            # traceback, whose last line is the raw `str(exc)` (plus every
+            # chained `__cause__`), putting back exactly what `detail` just
+            # scrubbed out. The type name is inside `detail`.
             detail = scrub_secrets(f"{type(exc).__name__}: {exc}", self._config)[:_MAX_ERROR_CHARS]
-            logger.warning("jev shadow failed open: %s", detail, exc_info=True)
+            logger.warning("jev shadow failed open: %s", detail)
             return self._skip("fail_open", event="shadow_fail_open", error=detail)
 
     async def _attempt(
