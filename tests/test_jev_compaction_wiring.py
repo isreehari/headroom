@@ -30,10 +30,22 @@ against the same fake client socket and fake upstream used by
   ``_maybe_compress_response_create_frame`` rewrites it (proved by the ChatGPT
   ``store=false`` rewrite, which compression performs and which the hook must
   therefore not see), and the frame the hook *returns* is what the rest of the
-  pipeline carries to the upstream.
+  pipeline carries to the upstream;
+* non-create frames -- cancel, session.update, and a frame that is not JSON at
+  all -- do NOT reach the hook, which is the guard's *polarity*: no AST check
+  can establish that, because an inverted test would satisfy it just as well.
+
+``test_the_boundary_fixture_is_really_a_boundary`` checks the fixture those
+behavioural tests lean on against Track C's real detector, so "a real Codex
+compaction boundary" is verified rather than asserted in prose.
 
 The orchestrator's own thirteen-reason fail-open matrix is covered by
 ``tests/test_jev_compaction_hook.py``; nothing here re-tests it.
+
+Every assertion below states, in its name and docstring, exactly what it covers
+and what it does not. Three rounds of review each found one assertion in this
+file that read as a guarantee while checking something smaller; the convention
+is deliberate.
 """
 
 from __future__ import annotations
@@ -51,6 +63,11 @@ import pytest
 
 import headroom.proxy.handlers.openai as openai_module
 from headroom.ccr import CCR_TOOL_NAME
+from headroom.proxy.jev.compaction import (
+    detect_compaction_boundary,
+    has_recovery_tool,
+    unwrap_response_create,
+)
 from headroom.proxy.jev.compaction_hook import REASON_DISABLED
 from tests.test_openai_codex_ws_lifecycle import (
     _DummyOpenAIHandler,
@@ -65,6 +82,8 @@ HOOK = "apply_jev_compaction_boundary"
 MEMORY_PREP = "_prepare_memory_frame"
 COMPRESS = "_maybe_compress_response_create_frame"
 RELAY = "_client_to_upstream"
+STORE = "_JEV_COMPACTION_REVISIONS"
+EXECUTOR = "_run_compression_in_executor"
 
 
 # ---------------------------------------------------------------------------
@@ -77,12 +96,50 @@ def _module() -> ast.Module:
 
 
 def _called_name(node: ast.Call) -> str | None:
+    """The name being invoked, collapsing ``a.b.name()`` to ``name``.
+
+    Deliberately ignores what the attribute hangs off, so ``self.f()`` and
+    ``f()`` both answer ``"f"``. That makes every caller WIDER than an exact
+    match, never narrower, so it cannot produce a false pass. Returns ``None``
+    for a call with no simple name (``f()()``, ``d["k"]()``).
+    """
     func = node.func
     if isinstance(func, ast.Name):
         return func.id
     if isinstance(func, ast.Attribute):
         return func.attr
     return None
+
+
+def _module_level_imports(tree: ast.Module) -> dict[str, set[str]]:
+    """Module-scope ``from X import a, b`` as ``{module: {names}}``.
+
+    Names are UNIONED across repeated ``from`` statements for the same module;
+    a dict comprehension would silently let a later statement shadow an earlier
+    one and drop names it did not list.
+    """
+    imports: dict[str, set[str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imports.setdefault(node.module, set()).update(alias.name for alias in node.names)
+    return imports
+
+
+def _rebindings_of(node: ast.AST, name: str) -> list[ast.AST]:
+    """Every place ``name`` is bound in the subtree, in any binding form.
+
+    Matches on ``ast.Name`` with a ``Store`` context, which is what CPython
+    emits for ALL of: plain assignment, annotated assignment, augmented
+    assignment, walrus, ``for`` targets, ``with ... as``, ``except ... as`` and
+    unpacking. Checking only ``ast.Assign`` -- as an earlier version of this
+    file did -- would have let ``_JEV_COMPACTION_REVISIONS: Store = ...`` or a
+    ``for`` target rebind the singleton unnoticed.
+    """
+    return [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and child.id == name and isinstance(child.ctx, ast.Store)
+    ]
 
 
 def _relay_function(tree: ast.Module) -> ast.AsyncFunctionDef:
@@ -166,12 +223,7 @@ def _normalized(node: ast.AST) -> str:
 
 def test_relay_module_imports_the_hook_from_the_orchestrator() -> None:
     """STRUCTURAL. The names come from Task 25's module, at module scope."""
-    tree = _module()
-    module_level = {
-        node.module: {alias.name for alias in node.names}
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom)
-    }
+    module_level = _module_level_imports(_module())
     assert "headroom.proxy.jev.compaction_hook" in module_level, (
         "the relay must import Track C's orchestrator at module scope, "
         "not lazily inside the request path"
@@ -193,30 +245,25 @@ def test_revision_store_is_a_process_wide_module_level_singleton() -> None:
     """
     tree = _module()
     module_level_assignments = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "_JEV_COMPACTION_REVISIONS"
-            for target in node.targets
-        )
+        node for node in tree.body if isinstance(node, ast.Assign) and _rebindings_of(node, STORE)
     ]
     assert len(module_level_assignments) == 1, (
-        "_JEV_COMPACTION_REVISIONS must be assigned exactly once, at module scope "
+        f"{STORE} must be assigned exactly once, at module scope "
         "(a store built per connection or per frame would never recognize a replay)"
     )
     value = module_level_assignments[0].value
     assert isinstance(value, ast.Call) and _called_name(value) == "JevCompactionRevisionStore"
 
-    # And nowhere else: no inner scope may rebind or rebuild it.
-    for node in ast.walk(tree):
-        if node in module_level_assignments:
-            continue
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                assert not (
-                    isinstance(target, ast.Name) and target.id == "_JEV_COMPACTION_REVISIONS"
-                ), "the revision store must not be rebound inside a function or class body"
+    # And nowhere else. `_rebindings_of` matches Store-context names, so this
+    # covers annotated, augmented, walrus, `for`-target and `with ... as`
+    # rebinding too -- not just plain `=`.
+    module_level_targets = set(_rebindings_of(module_level_assignments[0], STORE))
+    stray = [node for node in _rebindings_of(tree, STORE) if node not in module_level_targets]
+    assert not stray, (
+        f"{STORE} is rebound at line(s) "
+        f"{sorted(node.lineno for node in stray)}: it must be built exactly once, "
+        "at module scope, in any binding form"
+    )
 
     # The live singleton is importable and really is the store type.
     assert isinstance(
@@ -255,8 +302,15 @@ def test_hook_runs_after_memory_prep_and_before_compression() -> None:
     )
 
 
-def test_hook_call_sits_inside_the_response_create_guard() -> None:
-    """STRUCTURAL. Non-create frames must not pay for the hook at all."""
+def test_hook_call_sits_inside_an_if_mentioning_response_create() -> None:
+    """STRUCTURAL, and narrower than it may look.
+
+    It proves the hook call is lexically inside an ``ast.If`` whose test
+    mentions the constant ``"response.create"``. It does NOT prove the guard's
+    *polarity*: an inverted test would satisfy this just as well. The claim
+    that non-create frames really do skip the hook is behavioural, and is made
+    by ``test_relay_skips_the_hook_for_non_create_frames``.
+    """
     relay = _relay_function(_module())
     hook_call = _sole_hook_call(relay)
     guards = [
@@ -274,15 +328,20 @@ def test_hook_call_sits_inside_the_response_create_guard() -> None:
     ), f"{HOOK} must be guarded by the `response.create` frame-type check"
 
 
-def test_hook_call_passes_the_session_identity_config_and_store() -> None:
-    """STRUCTURAL. The orchestrator's whole contract depends on these six."""
+def test_hook_call_passes_the_session_identity_config_and_revisions() -> None:
+    """STRUCTURAL. The six keyword arguments the orchestrator's contract needs.
+
+    Named for what it checks: ``revisions``, not the orchestrator's optional
+    ``store=`` parameter, which this call site deliberately does not pass (it
+    lets the orchestrator reach for the shared compression store itself).
+    """
     call = _sole_hook_call(_relay_function(_module()))
     keywords = {kw.arg: _normalized(kw.value) for kw in call.keywords if kw.arg}
     assert keywords.get("jev_config") == "getattr(self.config, 'jev', None)"
     assert keywords.get("client") == "resolve_jev_client(self)"
     assert keywords.get("session_id") == "session_id"
     assert keywords.get("request_id") == "request_id"
-    assert keywords.get("revisions") == "_JEV_COMPACTION_REVISIONS"
+    assert keywords.get("revisions") == STORE
     assert keywords.get("metrics") == "getattr(self, 'metrics', None)"
     assert len(call.args) == 1, "the frame is the sole positional argument"
 
@@ -295,41 +354,42 @@ def test_jev_call_site_never_reaches_the_shared_compression_executor() -> None:
     off for unrelated traffic. No Jev step may add a new way to arm that -- the
     orchestrator owns its own bound.
 
-    The check is for any *reference*, not just a call: passing the executor as a
-    value, binding it to a local or reaching it through an attribute or a
-    ``getattr`` string would arm the same quarantine just as effectively as
-    calling it inline, so ``ast.Name``, ``ast.Attribute`` and ``ast.Constant``
-    are all matched.
+    **What is checked:** every ``_references_in`` node kind -- ``ast.Name``,
+    ``ast.Attribute`` and ``ast.Constant`` -- with nothing filtered back out.
+    A bare reference, an attribute lookup and the name spelled as a string for
+    ``getattr`` all reach the same object, so all three fail the test.
 
-    Scope, stated precisely: this covers the hook call's own subtree and the
-    whole ``if`` block Track C added to the relay. It cannot see an alias bound
-    elsewhere in the closure and handed in, which no single-subtree AST check
-    can; that residue is why the behavioural tests exist.
+    **Over what scope:** the innermost ``ast.If`` containing the hook call --
+    that is, the whole ``response.create`` branch Track C added. One assertion,
+    not two: this block strictly contains the hook call's own subtree, so a
+    separate subtree assertion would be a second claim covering a subset of the
+    same guarantee.
+
+    **What it does NOT prove:** an alias bound elsewhere in the enclosing
+    closure and handed into this block escapes it, as it would escape any
+    single-subtree AST check. The behavioural tests are what cover what runs.
+
+    **Accepted consequence:** because ``ast.Constant`` is included over a whole
+    block, a future *log line* inside this branch that merely names the executor
+    would fail this test. That is intended. A string naming the shared executor
+    in Track C's branch is a strong hint someone is reaching for it, and is
+    worth a deliberate look. No such string exists in the block today -- this
+    was checked before the filter was removed.
     """
     relay = _relay_function(_module())
     call = _sole_hook_call(relay)
-    executor = "_run_compression_in_executor"
 
-    assert not _references_in(call, executor), (
-        "Jev work must never reference the shared compression executor: its "
-        "timeout path quarantines compression for every later frame"
-    )
-
-    # Widen to the whole statement Track C added, so a line like
-    # `fn = self._run_compression_in_executor` sitting beside the await is
-    # caught too.
-    jev_block = [
+    guards = [
         node for node in ast.walk(relay) if isinstance(node, ast.If) and call in set(ast.walk(node))
     ]
-    assert jev_block, "the hook call must sit inside a guard (see the guard test)"
-    innermost = min(jev_block, key=lambda node: len(list(ast.walk(node))))
-    offending = [
-        ast.unparse(node)
-        for node in _references_in(innermost, executor)
-        if isinstance(node, ast.Name | ast.Attribute)
-    ]
+    assert guards, "the hook call must sit inside a guard (see the guard test)"
+    jev_block = min(guards, key=lambda node: len(list(ast.walk(node))))
+
+    offending = [ast.unparse(node) for node in _references_in(jev_block, EXECUTOR)]
     assert not offending, (
-        f"the relay branch carrying the Jev hook references {executor}: {offending}"
+        f"the relay branch carrying the Jev hook references {EXECUTOR} "
+        f"({offending}): its timeout path quarantines compression for every "
+        "later frame, so no Jev step may reach it in any form"
     )
 
 
@@ -361,8 +421,15 @@ def test_relay_branches_on_the_imported_reason_constant() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _boundary_frame(*, marker: str = "original stdout body") -> str:
-    """A real Codex native compaction boundary, as Phase 0b observed it."""
+ORIGINAL_OUTPUT = "original stdout body"
+
+
+def _boundary_frame(*, output: str = ORIGINAL_OUTPUT) -> str:
+    """A Codex native compaction boundary, in the shape Phase 0b observed.
+
+    ``test_the_boundary_fixture_is_really_a_boundary`` checks that claim
+    against the real detector rather than leaving it as prose.
+    """
     return json.dumps(
         {
             "type": "response.create",
@@ -374,7 +441,7 @@ def _boundary_frame(*, marker: str = "original stdout body") -> str:
                     {
                         "type": "custom_tool_call_output",
                         "call_id": "call_wiring",
-                        "output": marker,
+                        "output": output,
                     },
                     {"type": "compaction_trigger"},
                 ],
@@ -383,8 +450,30 @@ def _boundary_frame(*, marker: str = "original stdout body") -> str:
     )
 
 
+def test_the_boundary_fixture_is_really_a_boundary() -> None:
+    """The fixture every behavioural test leans on is what it says it is.
+
+    Without this, a fixture that quietly stopped matching Track C's detector
+    would leave the behavioural tests passing while exercising an ordinary
+    create frame -- proving the wiring on a frame Jev would never have acted on.
+    """
+    inner, wrapped = unwrap_response_create(json.loads(_boundary_frame()))
+    assert inner is not None and wrapped
+    boundary = detect_compaction_boundary(inner)
+    assert boundary is not None, "the fixture no longer matches the real detector"
+    assert boundary.previous_response_id == "resp_wiring_1"
+    assert has_recovery_tool(inner), (
+        "without the recovery tool the orchestrator declines every boundary, "
+        "so the fixture would exercise a gate the wiring tests do not mean to hit"
+    )
+
+
 def _handshake_frame() -> str:
     return json.dumps({"type": "response.create", "response": {"model": "gpt-5.6-sol"}})
+
+
+def _cancel_frame() -> str:
+    return json.dumps({"type": "response.cancel"})
 
 
 def _upstream_events() -> list[str]:
@@ -435,9 +524,11 @@ async def test_default_off_relay_forwards_a_boundary_frame_byte_identical() -> N
     """BEHAVIOURAL. With no ``config.jev`` the boundary crosses untouched.
 
     Not a mock: the frame goes through the real ``_client_to_upstream`` loop,
-    through the real hook call site, and out to the fake upstream. The
-    orchestrator short-circuits on ``jev_compaction_disabled`` before it parses
-    anything, so default-off costs nothing and changes nothing.
+    through the real orchestrator at the real call site, and out to the fake
+    upstream. What is asserted here is only the observable -- the bytes are
+    unchanged. That the orchestrator gets there by short-circuiting on
+    ``jev_compaction_disabled`` before it parses is Task 25's claim, checked in
+    ``tests/test_jev_compaction_hook.py``, not re-checked here.
     """
     boundary = _boundary_frame()
     upstream = _FakeUpstream(_upstream_events())
@@ -498,7 +589,7 @@ async def test_relay_hands_the_hook_the_frame_before_compression_rewrites_it() -
         "the hook must run BEFORE _maybe_compress_response_create_frame -- it saw "
         "a frame compression had already rewritten"
     )
-    assert inner["input"][0]["output"] == "original stdout body", (
+    assert inner["input"][0]["output"] == ORIGINAL_OUTPUT, (
         "Jev must be shown the ORIGINAL tool output, never a compressed marker"
     )
 
@@ -533,7 +624,7 @@ async def test_relay_hands_the_hook_the_frame_memory_prep_already_rewrote() -> N
     ):
         await handler.handle_openai_responses_ws(client_ws)
 
-    assert len(seen) == 1
+    assert len(seen) == 1, "the relay must reach the hook exactly once per create frame"
     inner = json.loads(seen[0])["response"]
     tool_names = {t.get("name") for t in inner.get("tools", []) if isinstance(t, dict)}
     assert MEMORY_SENTINEL_TOOL in tool_names, (
@@ -544,3 +635,40 @@ async def test_relay_hands_the_hook_the_frame_memory_prep_already_rewrote() -> N
         "the client's own recovery tool must survive memory injection, or the "
         "orchestrator's recovery-tool gate would decline every boundary"
     )
+
+
+@pytest.mark.asyncio
+async def test_relay_skips_the_hook_for_non_create_frames() -> None:
+    """BEHAVIOURAL. The guard's polarity, which the AST test cannot establish.
+
+    ``test_hook_call_sits_inside_an_if_mentioning_response_create`` proves only
+    that the call sits inside an ``if`` naming the constant -- an inverted test
+    would satisfy it too. This drives three non-create frames through the real
+    relay and shows the hook is not reached for any of them, while the one
+    create frame in the same session does reach it. That is what "non-create
+    frames must not pay for the hook" actually means.
+    """
+    seen: list[str] = []
+    boundary = _boundary_frame()
+    non_create = [
+        _cancel_frame(),
+        json.dumps({"type": "session.update", "session": {"model": "gpt-5.6-sol"}}),
+        "this frame is not JSON at all",
+    ]
+    upstream = _FakeUpstream(_upstream_events())
+    client_ws = _FakeWebSocket(frames=[_handshake_frame(), *non_create, boundary])
+    handler = _DummyOpenAIHandler()
+
+    with (
+        patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}),
+        patch.object(openai_module, HOOK, _spy(seen, boundary)),
+    ):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(seen) == 1, (
+        f"the hook must be reached only for response.create frames, but it saw "
+        f"{len(seen)} of the {len(non_create) + 1} relayed frames"
+    )
+    assert json.loads(seen[0])["type"] == "response.create"
+    # And the non-create frames still crossed, untouched.
+    assert upstream.sent[1:4] == non_create
