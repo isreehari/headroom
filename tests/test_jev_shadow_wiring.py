@@ -50,9 +50,38 @@ def test_openai_responses_calls_the_shadow_hook_on_the_input_items() -> None:
     # below-threshold gate. `responses_token_counts` recounts the real item
     # list (pricing `function_call_output` payloads) and reconstructs the
     # baseline from `tokens_saved`.
-    assert "responses_token_counts(" in source
+    assert "count_responses_tokens_offloaded(" in source
     assert "original_tokens=_jev_original" in source
     assert "optimized_tokens=_jev_optimized" in source
+
+
+def test_the_responses_recount_is_gated_on_shadow_being_enabled() -> None:
+    # Jev is off by default, and the recount walks the whole transcript, so an
+    # unconfigured proxy must not pay for it. Structural, not textual: the
+    # recount has to sit inside a branch that tests `jev_shadow_enabled`.
+    source = textwrap.dedent(inspect.getsource(OpenAIHandlerMixin.handle_openai_responses))
+    tree = ast.parse(source)
+    guarded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "jev_shadow_enabled" in ast.unparse(node.test)
+        and any(
+            isinstance(inner, ast.Call)
+            and getattr(inner.func, "id", None) == "count_responses_tokens_offloaded"
+            for stmt in node.body
+            for inner in ast.walk(stmt)
+        )
+    ]
+    assert len(guarded) == 1
+    # And it is never called outside that branch.
+    all_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "count_responses_tokens_offloaded"
+    ]
+    assert len(all_calls) == 1
 
 
 def test_no_call_site_assigns_from_the_hook() -> None:

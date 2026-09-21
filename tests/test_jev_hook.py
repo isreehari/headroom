@@ -543,3 +543,169 @@ async def test_a_list_input_responses_turn_actually_reaches_jev() -> None:
     assert client_b.calls == 1
     # Still shadow: the caller's list is untouched.
     assert items[1]["output"] == "D" * 8000
+
+
+# --- jev_shadow_enabled / offloading ---------------------------------------
+#
+# Jev is off by default, so the Responses recount must not cost an
+# unconfigured proxy anything, and when it IS on it must not run on the event
+# loop (GH #1701).
+
+
+class _CountingTokenizer(FakeTokenizer):
+    """Records every count so a test can prove none happened."""
+
+    def __init__(self) -> None:
+        self.text_calls = 0
+        self.message_calls = 0
+
+    def count_text(self, text: str) -> int:
+        self.text_calls += 1
+        return super().count_text(text)
+
+    def count_messages(self, messages: list[dict[str, Any]]) -> int:
+        self.message_calls += 1
+        return super().count_messages(messages)
+
+
+def test_jev_shadow_enabled_is_false_for_a_default_proxy() -> None:
+    from headroom.proxy.jev.hook import jev_shadow_enabled
+
+    class NoRunner:
+        pass
+
+    class OffRunner:
+        enabled = False
+
+    assert jev_shadow_enabled(NoRunner()) is False
+    assert jev_shadow_enabled(FakeProxy(None, FakeMetrics())) is False
+    assert jev_shadow_enabled(FakeProxy(OffRunner(), FakeMetrics())) is False
+    assert jev_shadow_enabled(JevShadowRunner(JevConfig())) is False
+
+
+def test_jev_shadow_enabled_is_true_only_for_a_live_shadow_runner() -> None:
+    from headroom.proxy.jev.hook import jev_shadow_enabled
+
+    class OnRunner:
+        enabled = True
+
+    assert jev_shadow_enabled(FakeProxy(OnRunner(), FakeMetrics())) is True
+
+
+def test_jev_shadow_enabled_never_raises() -> None:
+    from headroom.proxy.jev.hook import jev_shadow_enabled
+
+    class Exploding:
+        @property
+        def jev_shadow(self) -> Any:
+            raise RuntimeError("boom")
+
+    class ExplodingEnabled:
+        @property
+        def enabled(self) -> bool:
+            raise RuntimeError("boom")
+
+    assert jev_shadow_enabled(Exploding()) is False
+    assert jev_shadow_enabled(FakeProxy(ExplodingEnabled(), FakeMetrics())) is False
+
+
+async def test_the_off_path_does_no_tokenisation_at_all() -> None:
+    """The regression the gate exists for, as the call site expresses it.
+
+    Replays the Responses call site's guard verbatim over a list `input`. If
+    the gate stopped short-circuiting, the recount below would run and the
+    counting tokenizer would register it.
+    """
+    from headroom.proxy.jev.hook import count_responses_tokens_offloaded, jev_shadow_enabled
+
+    tokenizer = _CountingTokenizer()
+    # mode=off is the shipped default: `ProxyConfig().jev` builds this runner.
+    proxy = FakeProxy(JevShadowRunner(JevConfig()), FakeMetrics())
+    items = _responses_items()
+
+    if isinstance(items, list) and jev_shadow_enabled(proxy):
+        await count_responses_tokens_offloaded(proxy, items, tokenizer, 250)
+    assert tokenizer.text_calls == 0
+    assert tokenizer.message_calls == 0
+
+    # ...and the same guard with the runner on DOES count, so the assertion
+    # above is load-bearing rather than vacuous.
+    on = FakeProxy(JevShadowRunner(JevConfig(mode="shadow", api_key="sk-test")), FakeMetrics())
+    if isinstance(items, list) and jev_shadow_enabled(on):
+        await count_responses_tokens_offloaded(on, items, tokenizer, 250)
+    assert tokenizer.message_calls == 1
+
+
+class _RecordingOwner:
+    """Stands in for the handler: a bounded compression executor, like the real one."""
+
+    def __init__(self, fail: BaseException | None = None) -> None:
+        self.calls = 0
+        self.timeouts: list[float] = []
+        self.fail = fail
+
+    async def _run_compression_in_executor(self, fn: Any, *, timeout: float) -> Any:
+        self.calls += 1
+        self.timeouts.append(timeout)
+        if self.fail is not None:
+            raise self.fail
+        return fn()
+
+
+async def test_the_recount_goes_to_the_compression_executor() -> None:
+    from headroom.proxy.jev.hook import count_responses_tokens_offloaded, responses_token_counts
+
+    owner = _RecordingOwner()
+    items = _responses_items()
+    got = await count_responses_tokens_offloaded(owner, items, FakeTokenizer(), 250)
+    assert owner.calls == 1
+    assert owner.timeouts and owner.timeouts[0] > 0
+    # Same numbers as the pure helper: offloading changes where, not what.
+    assert got == responses_token_counts(items, FakeTokenizer(), 250)
+
+
+async def test_the_recount_counts_inline_when_the_owner_has_no_executor() -> None:
+    from headroom.proxy.jev.hook import count_responses_tokens_offloaded, responses_token_counts
+
+    items = _responses_items()
+    assert await count_responses_tokens_offloaded(
+        object(), items, FakeTokenizer(), 250
+    ) == responses_token_counts(items, FakeTokenizer(), 250)
+
+
+@pytest.mark.parametrize("failure", [TimeoutError(), RuntimeError("executor down")])
+async def test_a_failing_executor_fails_open_without_recounting_on_the_loop(
+    failure: BaseException,
+) -> None:
+    """(0, 0) hits the runner's below-threshold skip; it must NOT retry inline."""
+    from headroom.proxy.jev.hook import count_responses_tokens_offloaded
+
+    tokenizer = _CountingTokenizer()
+    owner = _RecordingOwner(fail=failure)
+    assert await count_responses_tokens_offloaded(owner, _responses_items(), tokenizer, 250) == (
+        0,
+        0,
+    )
+    assert tokenizer.text_calls == 0
+    assert tokenizer.message_calls == 0
+
+
+async def test_cancellation_is_not_swallowed_by_the_offload() -> None:
+    from headroom.proxy.jev.hook import count_responses_tokens_offloaded
+
+    owner = _RecordingOwner(fail=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await count_responses_tokens_offloaded(owner, _responses_items(), FakeTokenizer(), 250)
+
+
+@pytest.mark.parametrize("bogus", [None, "nope", (1,), (1, 2, 3), ("a", "b")])
+async def test_a_nonsense_executor_result_fails_open(bogus: Any) -> None:
+    from headroom.proxy.jev.hook import count_responses_tokens_offloaded
+
+    class BogusOwner:
+        async def _run_compression_in_executor(self, fn: Any, *, timeout: float) -> Any:
+            return bogus
+
+    assert await count_responses_tokens_offloaded(
+        BogusOwner(), _responses_items(), FakeTokenizer(), 250
+    ) == (0, 0)

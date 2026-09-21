@@ -77,6 +77,25 @@ def _config_for(proxy: Any, runner: Any) -> JevConfig:
     return JevConfig()
 
 
+def jev_shadow_enabled(proxy: Any) -> bool:
+    """Cheap, never-raising "is shadow mode on?" for handler-side gating.
+
+    Two attribute reads and no work. It exists so a handler can skip
+    *preparatory* work -- a token recount over a full transcript -- on the
+    default-off path, which is every request of an unconfigured proxy.
+
+    It is an optimisation gate only. :func:`run_jev_shadow_hook` re-checks the
+    same two attributes, owns the metrics and the fail-open path, and is still
+    called either way, so a wrong answer here costs at most a wasted count or
+    a less precise number -- never a behaviour change, and never a skipped
+    counter.
+    """
+    with contextlib.suppress(Exception):
+        runner = getattr(proxy, "jev_shadow", None)
+        return runner is not None and bool(getattr(runner, "enabled", False))
+    return False
+
+
 def responses_token_counts(items: Any, tokenizer: Any, tokens_saved: int) -> tuple[int, int]:
     """``(optimized_tokens, original_tokens)`` for a ``/v1/responses`` turn.
 
@@ -126,6 +145,52 @@ def responses_token_counts(items: Any, tokenizer: Any, tokens_saved: int) -> tup
     except Exception:  # noqa: BLE001 - fail open, same contract as the hook.
         return (0, 0)
     return (optimized, optimized + max(0, int(tokens_saved or 0)))
+
+
+async def count_responses_tokens_offloaded(
+    owner: Any, items: Any, tokenizer: Any, tokens_saved: int
+) -> tuple[int, int]:
+    """:func:`responses_token_counts`, off the event loop.
+
+    Counting a full Codex transcript is CPU-bound, and GH #1701 is the
+    standing rule in this codebase that such work does not run on the loop:
+    an unbounded on-loop load froze the whole server. It goes to the owner's
+    *bounded* compression executor -- the same one
+    ``headroom.proxy.token_counting`` uses for the handler's own counts --
+    rather than a raw ``asyncio.to_thread``, which is unbounded and would
+    compete with that executor for the same CPU on exactly the large
+    transcripts this matters for.
+
+    Call sites gate on :func:`jev_shadow_enabled` first, so an unconfigured
+    proxy never gets here at all.
+
+    Fails open to ``(0, 0)`` on a missing executor path failure, a timeout, or
+    any raise -- ``0`` lands on the runner's ``shadow_below_threshold`` gate,
+    i.e. the turn is skipped rather than mis-measured. Falling back to an
+    inline count on timeout is deliberately *not* done: that would put the
+    very work this offloads back on the loop. ``asyncio.CancelledError`` is a
+    ``BaseException`` and propagates, as it must.
+    """
+    runner = getattr(owner, "_run_compression_in_executor", None)
+    if not callable(runner):
+        # No executor on this owner (a bare test double, an embedded runtime):
+        # the count is the same pure function, just not offloaded.
+        return responses_token_counts(items, tokenizer, tokens_saved)
+    try:
+        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
+
+        result = await runner(
+            lambda: responses_token_counts(items, tokenizer, tokens_saved),
+            timeout=float(COMPRESSION_TIMEOUT_SECONDS),
+        )
+    except Exception:  # noqa: BLE001 - fail open, incl. asyncio.TimeoutError.
+        return (0, 0)
+    # ``runner`` is an attribute of an object this module does not own, so its
+    # return value is validated rather than trusted.
+    if isinstance(result, tuple) and len(result) == 2:
+        with contextlib.suppress(Exception):
+            return (max(0, int(result[0])), max(0, int(result[1])))
+    return (0, 0)
 
 
 def _resolve_context_limit(context_limit_source: Any, model: str) -> int:

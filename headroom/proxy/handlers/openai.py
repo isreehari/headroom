@@ -6102,7 +6102,11 @@ class OpenAIHandlerMixin:
         # goes through CompressionUnits and rewrites the body in place), not in
         # an `optimized_messages` variable, and this path keeps no frozen-prefix
         # bookkeeping — so the protected prefix is 0. Observational only.
-        from headroom.proxy.jev.hook import responses_token_counts, run_jev_shadow_hook
+        from headroom.proxy.jev.hook import (
+            count_responses_tokens_offloaded,
+            jev_shadow_enabled,
+            run_jev_shadow_hook,
+        )
 
         _jev_input = body.get("input")
         # This path's own `original_tokens`/`optimized_tokens` are counted from
@@ -6112,12 +6116,18 @@ class OpenAIHandlerMixin:
         # threshold gate would skip every turn, so count the real item list
         # instead. A string `input` IS covered by the handler's own numbers,
         # so they are kept there.
-        if isinstance(_jev_input, list):
-            _jev_optimized, _jev_original = responses_token_counts(
-                _jev_input, tokenizer, tokens_saved
+        #
+        # `jev_shadow_enabled` gates the recount, not the hook: the recount is
+        # CPU-bound over the whole transcript, and Jev is off by default, so an
+        # unconfigured proxy must not pay for it (and when it IS on, the count
+        # goes to the bounded compression executor, per GH #1701 — never on the
+        # loop). The hook itself is still awaited unconditionally so its
+        # fail-open metric keeps covering this path.
+        _jev_optimized, _jev_original = optimized_tokens, original_tokens
+        if isinstance(_jev_input, list) and jev_shadow_enabled(self):
+            _jev_optimized, _jev_original = await count_responses_tokens_offloaded(
+                self, _jev_input, tokenizer, tokens_saved
             )
-        else:
-            _jev_optimized, _jev_original = optimized_tokens, original_tokens
         await run_jev_shadow_hook(
             self,
             provider="openai",
