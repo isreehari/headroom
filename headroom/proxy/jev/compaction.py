@@ -82,25 +82,43 @@ class JevCompactionBoundary:
 def unwrap_response_create(frame: Any) -> tuple[dict[str, Any] | None, bool]:
     """Return ``(inner response payload, wrapped)`` for a Responses create frame.
 
-    Codex sends ``{"type": "response.create", "response": {...}}``; older shapes
-    send the payload directly. The second element says whether the payload was
-    nested, so a caller that rewrites it can re-wrap in the same shape. Mirrors
-    the acceptance rule the WS frame shaper already applies in
-    ``headroom/proxy/handlers/openai.py``
-    (``_shape_openai_response_create_frame``): a ``response.create`` frame whose
-    ``response`` is a dict is wrapped, otherwise the frame itself is the payload.
+    Codex sends ``{"type": "response.create", "response": {...}}``; older and
+    flattened shapes carry the payload fields directly. The second element says
+    whether the payload was nested, so a caller that rewrites it can re-wrap in
+    the same shape. Mirrors the acceptance rule the WS frame shaper already
+    applies in ``headroom/proxy/handlers/openai.py``
+    (``_shape_openai_response_create_frame``).
+
+    Three shapes are accepted, and nothing else:
+
+    * ``{"type": "response.create", "response": {...}}`` -> ``(response, True)``
+    * ``{"type": "response.create", "input": [...]}`` -- the flattened create
+      frame, ``response`` key absent -> ``(frame, False)``
+    * ``{"input": [...]}`` -- a bare payload, no ``type`` key at all ->
+      ``(frame, False)``
+
+    Everything else fails closed to ``(None, False)``, including a create frame
+    whose ``response`` key is *present* but not a dict. That is a malformed
+    envelope, not a payload, and returning the outer frame for it would hand a
+    consumer an envelope dressed as a payload. An explicit ``"type": null`` is
+    likewise not a missing ``type``: a frame that declares a null type is
+    malformed, so membership of the key is tested rather than its value.
     """
     if not isinstance(frame, dict):
         return None, False
+    if "type" not in frame:
+        # A bare payload: no frame envelope at all, just the Responses fields.
+        return (frame, False) if isinstance(frame.get("input"), list) else (None, False)
     frame_type = frame.get("type")
-    if frame_type == "response.create":
+    if frame_type != "response.create":
+        # Covers every other frame type, and also an explicit null or non-string
+        # `type`, neither of which is a wire frame type this module acts on.
+        return None, False
+    if "response" in frame:
         inner = frame.get("response")
-        if isinstance(inner, dict):
-            return inner, True
-        return frame, False
-    if frame_type is None and isinstance(frame.get("input"), list):
-        return frame, False
-    return None, False
+        return (inner, True) if isinstance(inner, dict) else (None, False)
+    # Flattened create frame: the payload fields sit beside `type`.
+    return (frame, False) if isinstance(frame.get("input"), list) else (None, False)
 
 
 def detect_compaction_boundary(inner: Any) -> JevCompactionBoundary | None:
@@ -125,6 +143,13 @@ def detect_compaction_boundary(inner: Any) -> JevCompactionBoundary | None:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
+        if not isinstance(item_type, str):
+            # Guards the set membership below. An item `type` decoded as a JSON
+            # array or object is unhashable, and `item_type in <frozenset>`
+            # raises `TypeError: unhashable type` on it -- inside the relay's
+            # hot path, on input the client controls. A non-string type is
+            # never one of ours, so skipping the item is both safe and correct.
+            continue
         if item_type == COMPACTION_TRIGGER_ITEM_TYPE:
             if trigger_index >= 0:
                 return None

@@ -216,6 +216,13 @@ _MALFORMED: list[Any] = [
     {"input": []},
     {"input": [None, 1, "x", []]},
     {"input": [{"type": None}]},
+    # An UNHASHABLE item `type`. A set-membership test on decoded JSON raises
+    # `TypeError: unhashable type` on these unless the value is type-guarded
+    # first -- the same defect class Task 5's `select_candidates` hit.
+    {"input": [{"type": []}], "previous_response_id": "resp_1"},
+    {"input": [{"type": {}}], "previous_response_id": "resp_1"},
+    {"input": [{"type": [["nested"]]}], "previous_response_id": "resp_1"},
+    {"input": [{"type": {"k": "v"}}], "previous_response_id": "resp_1"},
     {"previous_response_id": None, "input": [{"type": "compaction_trigger"}]},
     {"previous_response_id": 42, "input": [{"type": "compaction_trigger"}]},
     {"previous_response_id": "", "input": [{"type": "compaction_trigger"}]},
@@ -244,6 +251,72 @@ _MALFORMED: list[Any] = [
 ]
 
 
+#: Frames that are not a usable Responses create payload. The contract is the
+#: exact sentinel ``(None, False)`` -- not merely "did not raise". Asserting the
+#: result is what catches an envelope handed onward as though it were a payload.
+_NOT_A_RESPONSES_PAYLOAD: list[Any] = [
+    None,
+    "",
+    "not a dict",
+    b"bytes",
+    0,
+    1.5,
+    True,
+    [],
+    (),
+    {},
+    {"type": "response.cancel"},
+    {"type": "response.cancel", "input": []},
+    # An explicit JSON null `type` is not a missing `type`: a frame that
+    # declares a null type is malformed, not a bare payload.
+    {"type": None},
+    {"type": None, "input": []},
+    {"type": None, "input": [{"type": "compaction_trigger"}]},
+    # A non-string `type` is never a wire frame type.
+    {"type": 7, "input": []},
+    {"type": [], "input": []},
+    {"type": {}, "input": []},
+    {"type": True, "input": []},
+    # A create frame whose envelope is malformed: `response` is present but is
+    # not a dict, so there is no inner payload to return. Handing the OUTER
+    # frame back here would present an envelope as a payload.
+    {"type": "response.create", "response": None},
+    {"type": "response.create", "response": "nope"},
+    {"type": "response.create", "response": []},
+    {"type": "response.create", "response": 0},
+    {"type": "response.create", "response": None, "input": []},
+    # A create frame with neither a `response` envelope nor a payload `input`.
+    {"type": "response.create"},
+    {"type": "response.create", "input": None},
+    {"type": "response.create", "input": "not a list"},
+    # A bare payload must carry a list `input`.
+    {"input": None},
+    {"input": {}},
+    {"input": "not a list"},
+    {"previous_response_id": "resp_1"},
+]
+
+
+@pytest.mark.parametrize("frame", _NOT_A_RESPONSES_PAYLOAD)
+def test_unwrap_returns_the_fail_closed_sentinel_for_a_non_payload(frame: Any) -> None:
+    """Fail closed means the exact sentinel, not just the absence of a raise."""
+    assert unwrap_response_create(frame) == (None, False)
+
+
+def test_unwrap_accepts_a_flattened_create_frame() -> None:
+    """``response`` ABSENT on a create frame is the flattened shape, not a fault.
+
+    ``_shape_openai_response_create_frame`` in the WS handler falls back to the
+    outer frame exactly for this shape, so declining it would be stricter than
+    the path this module mirrors. ``response`` *present* but non-dict is a
+    different thing -- a malformed envelope -- and is declined above.
+    """
+    flat = {"type": "response.create", "previous_response_id": "resp_1", "input": []}
+    inner, wrapped = unwrap_response_create(flat)
+    assert wrapped is False
+    assert inner is flat
+
+
 @pytest.mark.parametrize("frame", _MALFORMED)
 def test_unwrap_never_raises_on_a_malformed_frame(frame: Any) -> None:
     """The relay hands this arbitrary decoded JSON; declining is the only option.
@@ -262,6 +335,38 @@ def test_detect_never_raises_on_a_malformed_payload(frame: Any) -> None:
     assert detect_compaction_boundary(frame) is None
     inner, _ = unwrap_response_create(frame)
     assert detect_compaction_boundary(inner) is None
+
+
+@pytest.mark.parametrize("bad_type", [[], {}, [["nested"]], {"k": "v"}, set()])
+def test_an_unhashable_item_type_does_not_crash_the_relay(bad_type: Any) -> None:
+    """A set-membership test on decoded JSON must type-guard its operand.
+
+    ``item_type in JEV_TOOL_OUTPUT_ITEM_TYPES`` raises ``TypeError: unhashable
+    type`` when an item's ``type`` arrives as a JSON array or object. This is
+    attacker-reachable -- the relay decodes whatever the client sends -- and it
+    is precisely the input class the never-raise guarantee exists for.
+    """
+    inner = {"previous_response_id": "resp_1", "input": [{"type": bad_type}]}
+    assert detect_compaction_boundary(inner) is None
+
+
+def test_an_unhashable_item_type_beside_a_real_boundary_is_skipped() -> None:
+    """The junk item must be ignored, not crash and not veto the boundary."""
+    inner = {
+        "previous_response_id": "resp_abc123",
+        "input": [
+            {"type": []},
+            {"type": {"nested": "object"}},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "a"},
+            {"type": "compaction_trigger"},
+        ],
+    }
+    assert detect_compaction_boundary(inner) == JevCompactionBoundary(
+        previous_response_id="resp_abc123",
+        trigger_index=3,
+        candidate_index=2,
+        item_count=4,
+    )
 
 
 def test_non_dict_items_beside_a_real_boundary_are_skipped_not_fatal() -> None:
