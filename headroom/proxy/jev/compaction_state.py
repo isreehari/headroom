@@ -88,7 +88,10 @@ class JevCompactionRevisionStore:
     reached from a worker thread (as :mod:`compaction_decision` uses for a
     blocking client). The lock is synchronous on purpose: ``claim`` must stay a
     plain method, and it holds the lock only for O(1) dict work, so it never
-    blocks the event loop meaningfully.
+    blocks the event loop meaningfully. The second half of the test-and-set is
+    :meth:`_insert_locked` rather than inline code so that a test can park one
+    caller inside the critical section and prove the mutual exclusion instead
+    of hoping the scheduler interleaves a few bytecodes.
 
     **Bad input never raises.** This runs inline in the relay path on
     provider-assigned values that nonetheless arrive over the wire, so
@@ -114,12 +117,20 @@ class JevCompactionRevisionStore:
         self._claimed: OrderedDict[str, None] = OrderedDict()
 
     def _usable(self, revision: str) -> bool:
-        """Whether ``revision`` is a value this store will ever remember."""
+        """Whether ``revision`` is a value this store will ever remember.
+
+        Reject before transform: the length test comes first so an oversized
+        wire value is declined without ``strip`` allocating a second copy of it.
+        The cap is measured on the RAW string, so this ordering is exactly
+        semantics-preserving -- a value whose length exceeds the cap only
+        because of surrounding whitespace was declined before the reorder and
+        is declined after it.
+        """
         if not isinstance(revision, str):
             return False
-        if not revision.strip():
+        if len(revision) > self.MAX_REVISION_LENGTH:
             return False
-        return len(revision) <= self.MAX_REVISION_LENGTH
+        return bool(revision.strip())
 
     def claim(self, revision: str) -> bool:
         """Claim ``revision``; True only the first time this process sees it.
@@ -136,10 +147,21 @@ class JevCompactionRevisionStore:
                 # the last thing evicted, not the first.
                 self._claimed.move_to_end(revision)
                 return False
-            self._claimed[revision] = None
-            while len(self._claimed) > self._max_entries:
-                self._claimed.popitem(last=False)
+            self._insert_locked(revision)
             return True
+
+    def _insert_locked(self, revision: str) -> None:
+        """Record ``revision`` and re-impose the bound. Caller holds the lock.
+
+        Split out of :meth:`claim` as the second half of its test-and-set, so a
+        test can subclass the store and park a caller *inside* the critical
+        section. Without that seam the interleaving window is a few bytecodes
+        wide and no test can open it reliably, which would leave this module's
+        core safety property defended only by chance.
+        """
+        self._claimed[revision] = None
+        while len(self._claimed) > self._max_entries:
+            self._claimed.popitem(last=False)
 
     def seen(self, revision: str) -> bool:
         """Whether this revision was already claimed (and not yet evicted).

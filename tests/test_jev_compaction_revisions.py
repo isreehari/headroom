@@ -186,6 +186,62 @@ def test_a_revision_at_the_length_limit_is_accepted() -> None:
     assert store.claim(at_limit) is False
 
 
+def test_the_length_cap_is_on_the_raw_string_not_the_stripped_one() -> None:
+    """The cap is deliberately measured before any trimming.
+
+    A value that only fits the cap once its surrounding whitespace is removed is
+    still rejected. Capping on the raw length is what lets the guard reject an
+    oversized value *before* transforming it, and it is the conservative
+    direction: rejection only ever costs a skipped retention opportunity.
+    """
+    store = JevCompactionRevisionStore()
+    over_by_whitespace = "r" * JevCompactionRevisionStore.MAX_REVISION_LENGTH + " "
+    assert len(over_by_whitespace.strip()) == JevCompactionRevisionStore.MAX_REVISION_LENGTH
+    assert store.claim(over_by_whitespace) is False
+    assert store.tracked_revisions == 0
+
+
+class _StripSpy(str):
+    """A ``str`` that records whether anything trimmed it."""
+
+    __slots__ = ("calls",)
+
+    def __new__(cls, value: str) -> _StripSpy:
+        spy = super().__new__(cls, value)
+        spy.calls = []
+        return spy
+
+    calls: list[str | None]
+
+    def strip(self, chars: str | None = None, /) -> str:
+        self.calls.append(chars)
+        return super().strip(chars)
+
+
+def test_an_oversized_revision_is_rejected_before_it_is_transformed() -> None:
+    """Reject-before-transform on the untrusted-input path.
+
+    ``strip`` allocates a second string proportional to its input. For a value
+    already past the cap that copy buys nothing -- the rejection was going to
+    happen either way -- so the length test must come first. The marginal cost
+    is one copy of an already-resident wire string rather than an unbounded new
+    exposure, but the ordering is free and it is the right shape for a guard on
+    attacker-influenced input.
+    """
+    store = JevCompactionRevisionStore()
+    oversized = _StripSpy("r" * (JevCompactionRevisionStore.MAX_REVISION_LENGTH + 1))
+    assert store.claim(oversized) is False
+    assert oversized.calls == []
+    assert store.tracked_revisions == 0
+
+    # A value within the cap is still trimmed-tested, so the guard is reordered,
+    # not removed: a whitespace-only id of an acceptable length is still declined.
+    blank = _StripSpy("   ")
+    assert store.claim(blank) is False
+    assert blank.calls != []
+    assert store.tracked_revisions == 0
+
+
 def test_revisions_are_compared_exactly() -> None:
     """No trimming, casefolding or normalisation: the id is an opaque token."""
     store = JevCompactionRevisionStore()
@@ -227,8 +283,81 @@ def test_a_false_already_claimed_only_ever_skips_a_decision() -> None:
 # --- test-and-set atomicity ------------------------------------------------
 
 
+class _PausingStore(JevCompactionRevisionStore):
+    """A store that parks the FIRST caller inside the critical section.
+
+    The pause sits between the membership test and the insertion -- exactly the
+    window the lock exists to close -- so a second caller arriving while the
+    first is parked either blocks on the lock (correct) or observes a map that
+    does not yet contain the revision and claims it too (the bug). No sleep,
+    no thread-scheduling luck: the handover is driven by two events.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._parked = False
+
+    def _insert_locked(self, revision: str) -> None:
+        if not self._parked:
+            self._parked = True
+            self.entered.set()
+            assert self.release.wait(timeout=10.0) is True
+        super()._insert_locked(revision)
+
+
+def test_claim_is_atomic_between_its_test_and_its_set() -> None:
+    """The core safety property, pinned deterministically.
+
+    ``claim`` is a test-and-set and a test-and-set whose halves can interleave
+    is not a claim at all. This test fails reliably -- not probabilistically --
+    against a variant with the lock removed, because the interleaving window is
+    forced open by the store itself rather than hoped for from the scheduler.
+    """
+    store = _PausingStore()
+    results: dict[str, bool] = {}
+
+    def first() -> None:
+        results["first"] = store.claim("resp_race")
+
+    def second() -> None:
+        results["second"] = store.claim("resp_race")
+
+    parked = threading.Thread(target=first)
+    contender = threading.Thread(target=second)
+    parked.start()
+    try:
+        # The first caller is now inside the critical section, past the
+        # membership test and before the insertion.
+        assert store.entered.wait(timeout=10.0) is True
+
+        contender.start()
+        contender.join(timeout=0.5)
+        # Mutual exclusion: the second caller cannot get past the lock, so it
+        # cannot have reached -- let alone answered -- its own membership test.
+        assert contender.is_alive() is True
+        assert "second" not in results
+    finally:
+        store.release.set()
+        parked.join(timeout=10.0)
+        if contender.ident is not None:
+            contender.join(timeout=10.0)
+
+    assert parked.is_alive() is False
+    assert contender.is_alive() is False
+    assert results["first"] is True
+    assert results["second"] is False
+    assert store.tracked_revisions == 1
+
+
 def test_concurrent_claims_authorise_exactly_one_caller() -> None:
-    """``claim`` is a test-and-set, so it is locked, not merely ordered.
+    """A smoke test on the real (unpaused) store under genuine contention.
+
+    This one is probabilistic by nature -- the natural window in an O(1) dict
+    operation is too narrow for the scheduler to interleave reliably -- so it
+    is a companion to ``test_claim_is_atomic_between_its_test_and_its_set``
+    above, which is the test that actually defends the guarantee.
 
     The relay is asyncio and single-worker, so this cannot happen there today;
     the lock is what keeps that an implementation detail of the caller rather
