@@ -9795,6 +9795,7 @@ class OpenAIHandlerMixin:
         # below this comment changes behaviour.
         from headroom.proxy.compress_turn import CompressTurnError, begin_compress_turn
         from headroom.proxy.gateway_responses import build_view as build_responses_view
+        from headroom.proxy.gateway_responses import carries_view as carries_responses_view
         from headroom.proxy.gateway_responses import is_responses_body
         from headroom.proxy.gateway_responses import mark_view as mark_responses_view
         from headroom.proxy.helpers import _read_request_json
@@ -10055,6 +10056,35 @@ class OpenAIHandlerMixin:
                         }
                     },
                 )
+            # Jev active retention (Track B) is opened by ONE request-level
+            # flag, on the turn the caller means it — never by configuration
+            # alone. Parsed here, next to the mode it depends on, and before
+            # any compression work so a malformed boundary costs nothing.
+            #
+            # Deliberately OUTSIDE any Jev-enabled guard: the gate is stdlib
+            # only and imports nothing from the rest of the jev package, so a
+            # malformed boundary is a 400 on every proxy, including the
+            # default one with HEADROOM_JEV_MODE=off. A request that asks for
+            # retention it cannot get must be told so, not silently served.
+            from headroom.proxy.jev.compress_gate import (
+                JEV_COMPRESS_BRANCH_ID,
+                JevGateError,
+                parse_compaction_boundary,
+            )
+
+            try:
+                jev_boundary = parse_compaction_boundary(compress_config, mode)
+            except JevGateError as jev_gate_error:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": jev_gate_error.message,
+                        }
+                    },
+                )
+
             if mode in ("lossy_inline", "lossless_then_lossy"):
                 pipeline = self._lossy_inline_pipeline()
             elif mode == "ccr":
@@ -10271,6 +10301,100 @@ class OpenAIHandlerMixin:
 
             ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
 
+            # Active retention runs AFTER Headroom's own compression and AFTER
+            # its CCR markers exist, on the messages the caller will actually
+            # forward: its savings are incremental on top of Headroom's,
+            # exactly as Phase 0a measured them, and never a substitute for
+            # them. A non-boundary turn does no work here at all — no import,
+            # no candidate selection, no extra tokenization.
+            jev_info: dict[str, Any] | None = None
+            if jev_boundary:
+                from headroom.proxy.jev.active_hook import run_jev_active_retention
+
+                # Jev is told the shape of the list it is actually shown. A
+                # Responses body reaches this point as its chat-shaped view
+                # (`build_responses_view` at the top of the handler), so it is
+                # named as such; otherwise the same model-name heuristic the
+                # session tracker's provider uses separates an Anthropic-shaped
+                # body from a Chat Completions one. Candidate selection itself
+                # is shape-agnostic, so this only has to be honest, never
+                # load-bearing.
+                if carries_responses_view(body):
+                    jev_message_shape = "openai_responses"
+                elif "claude" in model_name.lower() or "anthropic" in model_name.lower():
+                    jev_message_shape = "anthropic"
+                else:
+                    jev_message_shape = "openai"
+
+                jev_result = await run_jev_active_retention(
+                    proxy=self,
+                    messages=final_messages,
+                    model=model_name,
+                    session_id=session_id,
+                    branch_id=JEV_COMPRESS_BRANCH_ID,
+                    # A compaction boundary rebuilds the prompt cache by
+                    # definition, so the session-derived freeze does not pin
+                    # history here. An explicit config.frozen_message_count
+                    # still does: the caller may know more about the provider
+                    # cache than we do.
+                    frozen_prefix=(frozen_message_count or 0),
+                    message_shape=jev_message_shape,
+                )
+                jev_info = {
+                    "boundary": True,
+                    "called": jev_result.called,
+                    "candidates": jev_result.candidates,
+                    "applied": jev_result.applied,
+                    "reason": jev_result.reason,
+                    "hashes": list(jev_result.hashes),
+                }
+                # `tokens_after` on the result is measured on the RETAINED
+                # messages and is meaningful only when something was applied —
+                # it is 0 on every other path. Overwriting the handler's own
+                # count with that placeholder would report a free lunch on a
+                # turn that changed nothing.
+                if jev_result.applied:
+                    final_messages = jev_result.messages
+                    tokens_after = jev_result.tokens_after
+                    # Additive and de-duplicated, order preserved: Headroom's
+                    # own markers are still in the conversation and still
+                    # retrievable.
+                    ccr_hashes = list(dict.fromkeys([*ccr_hashes, *jev_result.hashes]))
+                    if comp_cache is not None and session_tracker is not None:
+                        _retained_messages = final_messages
+                        _retained_cache = comp_cache
+                        _retained_tracker = session_tracker
+
+                        def _rerecord_retained_session() -> None:
+                            # Without this the session state still holds the
+                            # PRE-retention bytes while the caller forwards the
+                            # retained ones: the next turn would replay the old
+                            # prefix over the new one and bust the provider
+                            # cache on the very first turn after a compaction.
+                            # TIMED acquire for the same reason the turn itself
+                            # uses one — an untimed wait parks an executor
+                            # worker behind a slow session — and the
+                            # TimeoutError lands on the session-mode
+                            # 503-and-retry path, which leaves replay state
+                            # consistent with what the caller was given.
+                            if not _retained_cache.session_turn_lock.acquire(
+                                timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
+                            ):
+                                raise TimeoutError(
+                                    f"session turn lock busy for {session_id!r} "
+                                    "(re-recording retained messages)"
+                                )
+                            try:
+                                _retained_cache.update_from_result(messages, _retained_messages)
+                                _retained_tracker.record_returned(messages, _retained_messages)
+                            finally:
+                                _retained_cache.session_turn_lock.release()
+
+                        await self._run_compression_in_executor(
+                            _rerecord_retained_session,
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        )
+
             tokens_saved = max(0, tokens_before - tokens_after)
             latency_ms = (time.time() - start_time) * 1000
             _transforms_applied = list(result.transforms_applied or ())
@@ -10342,6 +10466,10 @@ class OpenAIHandlerMixin:
             }
             if session_info is not None:
                 _payload["session"] = session_info
+            # Only on a declared boundary turn: every other response is
+            # byte-identical to what this route returned before Track B.
+            if jev_info is not None:
+                _payload["jev"] = jev_info
             if _finished is not None and _finished.fields:
                 _payload.update(_finished.fields)
             return JSONResponse(_payload)
