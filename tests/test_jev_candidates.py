@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from headroom.proxy.jev.candidates import (
     RECENT_TAIL_EXCLUSION,
     JevCandidate,
@@ -135,9 +137,28 @@ def test_text_of_never_raises_on_odd_values() -> None:
         assert isinstance(text_of(value), str)
 
     assert text_of("plain") == "plain"
-    # A missing payload is empty text, not the literal string "null": the
-    # content is what later phases project and price, and "null" is noise.
-    assert text_of(None) == ""
+    # Plain json.dumps semantics: an explicit null renders as "null". Task 14's
+    # write-back re-derives slot text the same way, so the two must agree.
+    assert text_of(None) == "null"
+    # A *missing* key is still empty text -- callers pass a "" default.
+    assert text_of("") == ""
+
+
+def test_explicit_null_output_keeps_json_semantics() -> None:
+    # An explicit `"output": null` must render as "null" -- the same text Task
+    # 14's write-back derives from the live slot -- while a *missing* output
+    # key stays empty.
+    messages: list[dict[str, Any]] = [
+        {"type": "function_call_output", "call_id": "x", "output": None},
+        {"type": "function_call_output", "call_id": "y"},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tu", "content": None}],
+        },
+        *_padding(RECENT_TAIL_EXCLUSION),
+    ]
+    found = select_candidates(messages, frozen_prefix=0, count_text=_count_text, max_candidates=10)
+    assert [c.content for c in found] == ["null", "", "null"]
 
 
 def test_non_string_item_type_never_raises() -> None:
@@ -243,7 +264,10 @@ def test_est_tokens_uses_the_caller_supplied_counter() -> None:
     assert calls == ["body"]
 
 
-def test_a_raising_counter_degrades_instead_of_failing_the_request() -> None:
+def test_a_raising_counter_propagates_rather_than_fabricating_an_estimate() -> None:
+    # A broken tokenizer must stay observable: the shadow hook aborts the whole
+    # attempt and records it. A local fallback would feed a made-up est_tokens
+    # into the request budget instead.
     def boom(text: str) -> int:
         raise RuntimeError("tokenizer exploded")
 
@@ -251,20 +275,18 @@ def test_a_raising_counter_degrades_instead_of_failing_the_request() -> None:
         {"role": "tool", "tool_call_id": "c1", "content": "x" * 40},
         *_padding(RECENT_TAIL_EXCLUSION),
     ]
-    found = select_candidates(messages, frozen_prefix=0, count_text=boom, max_candidates=10)
-    assert [c.est_tokens for c in found] == [10]
+    with pytest.raises(RuntimeError, match="tokenizer exploded"):
+        select_candidates(messages, frozen_prefix=0, count_text=boom, max_candidates=10)
 
     def boom_messages(msgs: list[dict[str, Any]]) -> int:
         raise RuntimeError("counter exploded")
 
-    assert (
+    with pytest.raises(RuntimeError, match="tokenizer exploded"):
         count_messages_corrected(
             [{"type": "function_call_output", "output": "y" * 40}],
             count_messages=boom_messages,
             count_text=boom,
         )
-        == 10
-    )
 
 
 def test_non_string_ids_are_coerced_to_text() -> None:

@@ -21,10 +21,15 @@ tokenizer the request already resolved (``OpenAICompatibleTokenCounter`` and
 every other ``headroom.tokenizers.TokenCounter`` expose ``count_text`` /
 ``count_messages``), rather than this module resolving a second tokenizer.
 
-Everything here is fail-open. The input is request-shaped data straight off the
+Selection is fail-open on *data*. The input is request-shaped straight off the
 wire: keys may be missing, list entries may not be dicts, and a ``type`` may be
-any JSON value. Selection degrades to "no candidate" rather than raising, since
-a Jev bookkeeping error must never take a proxied request down.
+any JSON value. Those degrade to "no candidate" rather than raising, since a
+Jev bookkeeping error must never take a proxied request down.
+
+A failing ``count_text`` is deliberately *not* absorbed here. The caller's
+shadow hook wraps the whole attempt in its own fail-open guard and records the
+abort, so a broken tokenizer stays observable; swallowing it locally would feed
+a fabricated ``est_tokens`` into the request budget instead.
 """
 
 from __future__ import annotations
@@ -51,14 +56,15 @@ def text_of(value: Any) -> str:
     caller that hands us something other than a freshly JSON-decoded body, so
     the serialiser is backstopped rather than trusted.
 
-    ``None`` is empty text on purpose: a missing payload has no content to
-    project or price, and the literal ``"null"`` would be four characters of
-    noise in both the fingerprint and the token estimate.
+    Plain ``json.dumps`` semantics are the contract, including ``None`` ->
+    ``"null"``. Task 14's active write-back re-derives a slot's text the same
+    way before applying a lease, so an explicit ``"output": null`` has to
+    render identically on both sides or the lease can never match. Callers here
+    distinguish *missing* from *explicitly null* themselves, via
+    ``msg.get("output", "")``.
     """
     if isinstance(value, str):
         return value
-    if value is None:
-        return ""
     try:
         return json.dumps(value, default=str)
     except Exception:
@@ -78,14 +84,6 @@ def _optional_id(value: Any) -> str | None:
         return str(value)
     except Exception:
         return None
-
-
-def _estimate(count_text: Callable[[str], int], text: str) -> int:
-    """``count_text`` with a crude fallback if the tokenizer misbehaves."""
-    try:
-        return int(count_text(text))
-    except Exception:
-        return max(1, len(text) // 4) if text else 0
 
 
 @dataclass(frozen=True)
@@ -163,7 +161,7 @@ def select_candidates(
                 role=role,
                 tool_call_id=_optional_id(tool_call_id),
                 content=body,
-                est_tokens=_estimate(count_text, body),
+                est_tokens=int(count_text(body)),
             )
         )
 
@@ -197,7 +195,7 @@ def select_candidates(
                 candidate_type=str(item_type),
                 role=role or "tool",
                 tool_call_id=msg.get("call_id") or msg.get("id"),
-                body=text_of(msg.get("output")),
+                body=text_of(msg.get("output", "")),
             )
             continue
 
@@ -215,7 +213,7 @@ def select_candidates(
                     candidate_type="tool_result",
                     role=role or "user",
                     tool_call_id=block.get("tool_use_id"),
-                    body=text_of(block.get("content")),
+                    body=text_of(block.get("content", "")),
                 )
 
     return found
@@ -248,12 +246,12 @@ def count_messages_corrected(
                 continue
             content = msg.get("content")
             if content is not None:
-                total += _estimate(count_text, text_of(content))
+                total += int(count_text(text_of(content)))
 
     for msg in messages:
         if not isinstance(msg, dict) or _item_type(msg) not in ELIGIBLE_OUTPUT_ITEM_TYPES:
             continue
         output = msg.get("output")
         if output is not None:
-            total += _estimate(count_text, text_of(output))
+            total += int(count_text(text_of(output)))
     return total
