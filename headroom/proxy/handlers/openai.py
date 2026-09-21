@@ -7822,6 +7822,52 @@ class OpenAIHandlerMixin:
                     if isinstance(first_response_body, dict)
                     else None
                 )
+                # Track C: a compaction boundary can also arrive as the FIRST
+                # frame of a connection, which is exactly the shape a reconnect
+                # replay produces -- the relay loop below never sees frame 1, so
+                # without this call site such a replay bypassed Track C
+                # entirely. Same orchestrator and the SAME process-wide
+                # `_JEV_COMPACTION_REVISIONS`: the store is keyed by
+                # `previous_response_id` and never by `session_id` (a fresh
+                # uuid4 per accepted socket), so a boundary replayed on a NEW
+                # connection is recognised as already claimed and comes back
+                # stale rather than being dropped a second time.
+                #
+                # Placed last in this branch to mirror the relay-loop site
+                # exactly: after `_prepare_memory_frame` so Jev sees the frame
+                # Headroom will really send, and before the first-frame
+                # compression block below so Jev stages the ORIGINAL tool output
+                # rather than an already-compressed marker. Returns
+                # `first_msg_raw` byte-identical unless an acknowledged CCR
+                # commit succeeded; owns its own gating, timeout, metrics and
+                # outcome logging for all thirteen reasons; never raises.
+                #
+                # `current_response_input` above is deliberately left on the
+                # pre-hook items, mirroring the relay loop, which also computes
+                # it from the inbound frame: both paths recompute it from the
+                # final outbound bytes further down.
+                first_msg_raw, _jev_first_reason = await apply_jev_compaction_boundary(
+                    first_msg_raw,
+                    jev_config=getattr(self.config, "jev", None),
+                    client=resolve_jev_client(self),
+                    session_id=session_id,
+                    request_id=request_id,
+                    revisions=_JEV_COMPACTION_REVISIONS,
+                    metrics=getattr(self, "metrics", None),
+                )
+                if _jev_first_reason == REASON_DROPPED:
+                    # NOT a second outcome log -- same rationale as the
+                    # relay-loop site. The orchestrator already reported the
+                    # drop with revision, candidate, CCR hash and token
+                    # estimate; this adds only the frame ordinal every other WS
+                    # line on this route is keyed by, which on this path is
+                    # always 1. No exception text, no server text, no
+                    # credentials.
+                    logger.info(
+                        "[%s] WS /v1/responses jev compaction drop frame=1 session_id=%s",
+                        request_id,
+                        session_id,
+                    )
             # Hot-fix follow-up to PR #406 — inline Rust compression on the
             # WS first frame before forwarding upstream. PR #406 enabled
             # the same call for HTTP /v1/responses; PR-C5's "WS-side
