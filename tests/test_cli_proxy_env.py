@@ -778,6 +778,56 @@ class TestCLIProxyEnvVars:
         assert captured["kwargs"].get("print_banner") is False
 
 
+class TestCLIProxyJevWiring:
+    """`headroom proxy` is the composition root for ProxyConfig.jev.
+
+    ProxyConfig.jev defaults to a bare, always-off JevConfig() via
+    field(default_factory=JevConfig) -- it does NOT read the environment on
+    its own. Only an explicit `jev=JevConfig.from_env()` at construction
+    time makes HEADROOM_JEV_* actually take effect. This regression covers
+    the composition root silently dropping that wiring, which left Jev
+    permanently inert regardless of HEADROOM_JEV_MODE.
+    """
+
+    def test_jev_mode_active_from_env_reaches_proxy_config(self, runner):
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={
+                    "HEADROOM_JEV_MODE": "active",
+                    "HEADROOM_JEV_API_KEY": "test-key",
+                },
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].jev.mode == "active"
+        assert captured_config["config"].jev.api_key == "test-key"
+
+    def test_jev_mode_off_by_default(self, runner):
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].jev.mode == "off"
+
+
 class TestCLIProxyBackend:
     """Test that litellm-* backends are accepted by the CLI."""
 
