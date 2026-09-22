@@ -218,6 +218,21 @@
                     </section>
                 </div>
 
+                <!-- Jev Retention: only shown once configured (mode !== 'off'), same
+                     gating pattern as the savings-profile badge above. -->
+                <template x-if="stats.jev && stats.jev.config && stats.jev.config.mode !== 'off'">
+                    <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-2">
+                        <section class="bg-surface rounded-lg p-4 border border-border">
+                            <h3 class="mb-3 text-sm font-medium text-gray-300">Jev Calls <span class="text-gray-500 font-normal" x-text="'(' + stats.jev.config.mode + ')'"></span></h3>
+                            <div class="grid grid-cols-2 gap-3 text-sm"><div>Attempted <span class="float-right tabular-nums" x-text="formatNumber(stats.jev.calls_attempted || 0)"></span></div><div>Completed <span class="float-right tabular-nums text-emerald-400" x-text="formatNumber(stats.jev.calls_completed || 0)"></span></div><div>Failed <span class="float-right tabular-nums text-red-400" x-text="formatNumber(stats.jev.calls_failed || 0)"></span></div><div>Timed Out <span class="float-right tabular-nums text-amber-400" x-text="formatNumber(stats.jev.calls_timed_out || 0)"></span></div></div>
+                        </section>
+                        <section class="bg-surface rounded-lg p-4 border border-border">
+                            <h3 class="mb-3 text-sm font-medium text-gray-300">Jev Decisions</h3>
+                            <div class="grid grid-cols-2 gap-3 text-sm"><div>Keep <span class="float-right tabular-nums" x-text="formatNumber(stats.jev.keep || 0)"></span></div><div>Truncate <span class="float-right tabular-nums text-amber-400" x-text="formatNumber(stats.jev.truncate || 0)"></span></div><div>Drop <span class="float-right tabular-nums text-red-400" x-text="formatNumber(stats.jev.drop || 0)"></span></div><div>Applied <span class="float-right tabular-nums text-cyan-400" x-text="formatNumber(stats.jev.applied || 0)"></span></div></div>
+                        </section>
+                    </div>
+                </template>
+
                 <!-- Session Optimization -->
                 <div class="grid grid-cols-1 gap-4 mb-6 md:grid-cols-2 lg:grid-cols-3">
                     <!-- Token Savings (%) -->
