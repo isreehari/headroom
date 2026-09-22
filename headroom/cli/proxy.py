@@ -1132,6 +1132,7 @@ def proxy(
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
+    from headroom.proxy.jev.config import JevConfig
     from headroom.proxy.server import (
         ProxyConfig,
         _parse_csv_tools,
@@ -1480,6 +1481,7 @@ def proxy(
             if anthropic_pre_upstream_memory_context_timeout_seconds is not None
             else 2.0
         ),
+        jev=JevConfig.from_env(),
     )
 
     memory_status = "DISABLED"
